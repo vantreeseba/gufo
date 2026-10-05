@@ -27,6 +27,15 @@ void LaunchMoeEpilogue(const float* expert_out, const float* weights,
                        float* out, std::uint32_t n_tokens, std::uint32_t n_used,
                        std::uint32_t dim, hipStream_t stream = nullptr);
 
+/// Whether the MMQ MoE vector kernels (qfn_mmq_moe_vec and, for a gate/up
+/// pair of one format, qfn_mmq_moe_gated_vec) decode `type` with whole weight
+/// blocks over `k` inputs.
+constexpr bool IsMmqMoeVecType(core::GgmlType type, std::size_t k) {
+  return (type == core::GgmlType::kQ8_0 && k % 32 == 0) ||
+         ((type == core::GgmlType::kQ4_K || type == core::GgmlType::kQ5_K) &&
+          k % 256 == 0);
+}
+
 /// Routed per-slot GEMV fallback for formats the MMQ MoE kernels do not cover
 /// (BF16/F32/Q6_K and friends, decoded via DecodeQuantSub16). For each slot s
 /// the expert index is ids[s]; out[s, :] = W_e * x_row. With x_per_slot the

@@ -22,12 +22,16 @@ MODEL=path/to/Qwen3.6-35B-A3B-MTP-UD-Q8_K_XL.gguf
 ```
 
 Text-only model; there is no matching `mmproj` projector in scope. In prefill,
-each routed-expert projection picks its route by format: Q8_0 / Q6_K take
-Flash-Next's routed F16 WMMA GEMM (gate and up paired for chunks of 1024+
-tokens when the down projection takes it too), BF16 the grouped WMMA GEMM, and
-anything else the per-slot GEMV. Decode runs the vendored llama.cpp-derived MMQ
-vector kernels; their device context is bound at model load when the config
-reports an MoE architecture.
+each routed-expert projection picks its route by format: Q8_0 / Q4_K / Q5_K /
+Q6_K take Flash-Next's routed F16 WMMA GEMM (gate and up paired for chunks of
+1024+ tokens when they share a format and the down projection takes it too),
+BF16 the grouped WMMA GEMM, and anything else the per-slot GEMV. Decode runs
+the vendored llama.cpp-derived MMQ vector kernels for Q8_0 / Q4_K / Q5_K
+experts and the per-slot GEMV for the rest (Q6_K, BF16); their device context
+is bound at model load when the config reports an MoE architecture. The
+Q4_K / Q5_K routes cover UD-Q4_K_XL (Q4_K gate/up, Q5_K down, with Q5_K
+gate/up in one layer and Q6_K down in three); they compile but have not yet
+been run or benchmarked on hardware.
 
 | Mode | Selection | Behavior |
 | --- | --- | --- |
@@ -104,7 +108,7 @@ Thinking/template controls and HTTP sampling defaults are described in
 
 ## Scope
 
-- Quantized MoE expert GEMM (Q8_0 / Q6_K) and the fused gate/up/down expert
+- Quantized MoE expert GEMM (Q8_0 / Q6_K / Q5_K / Q4_K) and the fused gate/up/down expert
   path; dense attention and GDN layers are shared with the other Qwen runners.
 - No vision, no audio. Speculative decoding is MTP or a converted DFlash2
   draft. `gufo serve` runs DFlash2; it rejects MTP for this architecture (it

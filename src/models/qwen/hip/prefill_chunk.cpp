@@ -60,16 +60,26 @@ RoutedHostState& GetRoutedHostState() {
 }
 
 /// The routed F16 GEMM's decode of an expert tensor, if it has one here:
-/// Q8_0 (whole 64-element blocks) and Q6_K (whole 256-element superblocks).
+/// Q8_0 (whole 64-element blocks) and Q4_K / Q5_K / Q6_K (whole 256-element
+/// superblocks).
 std::optional<routed::WeightType> RoutedWeightType(core::GgmlType type,
                                                    std::size_t k) {
   if (type == core::GgmlType::kQ8_0 && k % 64 == 0) {
     return routed::WeightType::kQ8_0;
   }
-  if (type == core::GgmlType::kQ6_K && k % 256 == 0) {
-    return routed::WeightType::kQ6_K;
+  if (k % 256 != 0) {
+    return std::nullopt;
   }
-  return std::nullopt;
+  switch (type) {
+    case core::GgmlType::kQ4_K:
+      return routed::WeightType::kQ4_K;
+    case core::GgmlType::kQ5_K:
+      return routed::WeightType::kQ5_K;
+    case core::GgmlType::kQ6_K:
+      return routed::WeightType::kQ6_K;
+    default:
+      return std::nullopt;
+  }
 }
 
 /// Token rows per routed tile: the wide tile once the mean bucket fills
@@ -88,7 +98,8 @@ constexpr std::size_t kBf16WmmaMinPrefillBatch = 128;
 
 /// Batched routed MoE FFN (qwen35moe) for one prefill chunk. The router and
 /// shared expert reuse the dense prefill GEMM routes. Each routed projection
-/// picks its own route: Q8_0 / Q6_K take Flash-Next's routed F16 WMMA GEMM,
+/// picks its own route: Q8_0 / Q4_K / Q5_K / Q6_K take Flash-Next's routed
+/// F16 WMMA GEMM,
 /// BF16 (kept by UD quants in a few layers) the grouped WMMA GEMM, and any
 /// other format the per-slot warp GEMV. Every expert row is its (token, slot)
 /// index, so the SwiGLU activation moves between routes as F32 (`gate_e`) or
