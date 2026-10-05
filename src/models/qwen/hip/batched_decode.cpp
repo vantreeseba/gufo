@@ -142,13 +142,15 @@ void LaunchMoeFfn(const models::QwenLayerWeights& layer,
 
   if (view.gate_exps.type == view.up_exps.type &&
       IsMmqMoeVecType(view.gate_exps.type, hidden)) {
-    // The gated vector kernel takes at most 8 token rows per launch in every
-    // format it covers (MMVQ_MAX_BATCH_SIZE), but concurrent verification
-    // stacks up to kMaxDecodeBatch rows per session. Rows are independent, so
+    // The gated vector kernel takes at most 8 token rows per launch
+    // (MMVQ_MAX_BATCH_SIZE), or 64 for Q4_K (MMVQ_MAX_ROUTED_BATCH), where it
+    // groups equal experts across the whole batch. Concurrent verification
+    // stacks up to kMaxDecodeBatch rows per session; rows are independent, so
     // launch row slices over the token-major activations, ids and outputs.
-    constexpr std::size_t kGatedVecMaxRows = 8;
-    for (std::size_t row = 0; row < batch_size; row += kGatedVecMaxRows) {
-      const std::size_t rows = std::min(kGatedVecMaxRows, batch_size - row);
+    const std::size_t max_gated_rows =
+        view.gate_exps.type == core::GgmlType::kQ4_K ? 64 : 8;
+    for (std::size_t row = 0; row < batch_size; row += max_gated_rows) {
+      const std::size_t rows = std::min(max_gated_rows, batch_size - row);
       if (qfn_mmq_moe_gated_vec(
               static_cast<int>(view.gate_exps.type), view.gate_exps.data,
               view.up_exps.data, scratch.decode.normed.data() + row * hidden,
