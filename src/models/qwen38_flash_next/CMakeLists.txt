@@ -46,7 +46,8 @@ if (ENGINE_ENABLE_HIP)
     $<$<COMPILE_LANGUAGE:HIP>:-O3;-ffast-math;-fno-finite-math-only;-Wno-unused-value;-Wno-unused-command-line-argument>)
   target_include_directories(gufo_qwen38_flash_next_mmq SYSTEM PUBLIC ${QFN_MMQ_DIR})
   target_link_libraries(gufo_qwen38_flash_next_mmq PUBLIC hip::host roc::hipblas)
-
+  # The device kernels need only the HIP runtime and the hipBLAS headers the
+  # shared Qwen kernel headers include, so they build as their
   # The device kernels depend only on the HIP runtime, so they build as their
   # own library: the Qwen runner reuses the routed-expert kernels for
   # qwen35moe without depending on this model package.
@@ -68,7 +69,8 @@ if (ENGINE_ENABLE_HIP)
     ${HIPCUB_INCLUDE_DIR}
     ${ROCPRIM_INCLUDE_DIR}
     ${ROCWMMA_INCLUDE_DIR})
-  target_link_libraries(gufo_qwen38_flash_next_kernels PUBLIC hip::host)
+  target_link_libraries(gufo_qwen38_flash_next_kernels PUBLIC hip::host
+    roc::hipblas)
 
   set(QFN_HIP_SOURCES
     ${QFN_ROCM_DIR}/blaslt.cpp
