@@ -29,10 +29,11 @@
 #include "tests/models/qwen/hip/support/comparisons.hpp"
 #include "tests/models/qwen/hip/support/device.hpp"
 
-void TestLongContextDecodeAttention(bool fp16) {
+// num_heads over one KV head selects the shared-KV decode kernel's ratio: six
+// for Qwen3.8 27B, eight for Qwen3.6 35B-A3B.
+void TestLongContextDecodeAttention(bool fp16, std::uint32_t num_heads) {
   constexpr std::uint32_t max_position = 32767;
   constexpr std::uint32_t max_context = max_position + 129;
-  constexpr std::uint32_t num_heads = 6;
   constexpr std::uint32_t num_kv_heads = 1;
   constexpr std::uint32_t head_dim = 256;
   constexpr std::uint32_t positions[] = {126,  127,  128,   511,         2047,
@@ -178,8 +179,8 @@ void TestLongContextDecodeAttention(bool fp16) {
       }
       has_nonzero = has_nonzero || std::abs(value) > 1e-8F;
     }
-    std::cout << (fp16 ? "FP16" : "FP32") << " decode attention context "
-              << (position + 1) << " max reference diff: " << max_reference_diff
+    std::cout << (fp16 ? "FP16" : "FP32") << " decode attention " << num_heads
+              << " heads context " << (position + 1) << " max reference diff: " << max_reference_diff
               << "\n";
     if (max_reference_diff >= 5e-4F) {
       std::cerr << "Long-context decode attention mismatch\n";
@@ -353,8 +354,10 @@ int main() {
     return device_status;
   }
 
-  TestLongContextDecodeAttention(false);
-  TestLongContextDecodeAttention(true);
+  for (const std::uint32_t num_heads : {6U, 8U}) {
+    TestLongContextDecodeAttention(false, num_heads);
+    TestLongContextDecodeAttention(true, num_heads);
+  }
   TestBaselineToTiledKvCacheTransition();
   std::cout << "Qwen long-context attention ops test passed on gfx1151.\n";
   return 0;
