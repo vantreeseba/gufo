@@ -693,6 +693,7 @@ private:
   QwenGpuArena arena_;
   const detail::HipGraphCaptureKey graph_key_;
   detail::HipGraphDecodeExecutor graph_executor_;
+  bool moe_decode_warmed_{false};
   models::qwen::vision::DeviceInput vision_input_;
   std::vector<float> h_logits_;
   PromptHiddenBuffer h_prompt_hidden_;

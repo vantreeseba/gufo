@@ -61,9 +61,12 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
   }
   graph_key.workload_identity = ExtendQwenGraphWorkloadIdentity(
       graph_key.workload_identity, arena_.RecurrentIoIdentity());
+  // The routed-expert MMQ kernels allocate their scratch arena on first use,
+  // which capture forbids, so a MoE step runs eagerly once before capturing.
   const QwenGraphRejection graph_rejections = ResolveQwenGraphRejections(
       compute_logits, use_split_k_decode,
-      graph_executor_.IsEnabled() && !config.IsMoE() &&
+      graph_executor_.IsEnabled() &&
+          (!config.IsMoE() || moe_decode_warmed_) &&
           pos >= vision_input_.layout().PrefixLength());
   detail::EmitQwenGraphEligibility(
       graph_key.execution_identity, graph_key.workload_identity,
@@ -99,6 +102,7 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
   } else {
     ExecuteDecodeStep(arena_, weights_, policy_, token_id, pos, compute_logits,
                       recurrent_state, &vision_input_);
+    moe_decode_warmed_ = config.IsMoE();
   }
 
   if (!compute_logits) {
