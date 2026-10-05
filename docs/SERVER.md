@@ -1070,6 +1070,10 @@ speculative mode and memory. `rss_mib` is process resident memory;
 `host_available_mib` is available system memory. At load completion,
 `gpu_device_used_mib` is device-wide HIP usage. These overlap on unified memory
 and must not be added together.
+Qwen GGUF weights default to a host copy registered with the device, which
+counts against host RAM. `GUFO_QWEN_WEIGHT_MEMORY=device` uploads them into
+device allocations instead and keeps no host copy; use it when a fixed
+dedicated GPU memory reservation leaves the host short. `host` is the default.
 With disk caching enabled, `phase=artifact_identity` identifies full-file
 SHA-256 work. Digests are cached against the open file's identity, size and
 modification/change timestamps; unchanged artifacts avoid another scan.
