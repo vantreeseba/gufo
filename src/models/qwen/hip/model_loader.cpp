@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -13,6 +14,7 @@
 #include <utility>
 
 #include "qfn_mmq.h"
+#include "src/core/hip/weight_upload.hpp"
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
@@ -26,6 +28,8 @@ void ReleaseWeightRegions(std::vector<QwenGpuWeightRegion>& regions) noexcept {
       (void)hipHostUnregister(region.host_copy);
       (void)munmap(region.host_copy, region.size);
     }
+    if (region.device_owned)
+      (void)hipFree(region.device_data);
     region = {};
   }
 }
@@ -97,6 +101,57 @@ void CopyMappedWeights(const core::GgufMappedRegion& source, void* copy) {
   return hipSuccess;
 }
 
+// GUFO_QWEN_WEIGHT_MEMORY selects where the immutable weights live: "host"
+// (the default) registers a host copy with the device, "device" uploads them
+// into device allocations and leaves no host copy.
+[[nodiscard]] bool UseDeviceWeightMemory(bool& device, std::string* error_msg) {
+  const char* value = std::getenv("GUFO_QWEN_WEIGHT_MEMORY");
+  const std::string_view mode = value != nullptr ? value : "host";
+  device = mode == "device";
+  if (!device && mode != "host") {
+    if (error_msg != nullptr) {
+      *error_msg = "GUFO_QWEN_WEIGHT_MEMORY must be \"host\" or \"device\"";
+    }
+    return false;
+  }
+  return true;
+}
+
+[[nodiscard]] bool UploadWeightRegions(
+    std::span<const core::GgufMappedRegion> source_regions,
+    std::vector<QwenGpuWeightRegion>& weight_regions, std::string* error_msg) {
+  // Streams each shard from disk through bounded pinned staging, so the host
+  // never holds the weights.
+  auto upload = WeightUpload::Create(source_regions, error_msg);
+  bool uploaded = upload != nullptr;
+  for (std::size_t i = 0; uploaded && i < source_regions.size(); ++i) {
+    const auto& source = source_regions[i];
+    void* device_data = nullptr;
+    const auto status = hipMalloc(&device_data, source.size);
+    if (status != hipSuccess) {
+      if (error_msg != nullptr) {
+        *error_msg = "Failed to allocate device memory for GGUF shard " +
+                     std::to_string(i) + ": " + hipGetErrorString(status);
+      }
+      uploaded = false;
+      break;
+    }
+    weight_regions[i] = {.host_data = source.data,
+                         .device_data = device_data,
+                         .host_copy = nullptr,
+                         .size = source.size,
+                         .device_owned = true};
+    uploaded = upload->Copy(static_cast<std::uint32_t>(i), 0, source.size,
+                            device_data, error_msg);
+  }
+  // Queued copies must drain before their destinations can be released.
+  if (upload != nullptr)
+    uploaded = upload->Finish(uploaded ? error_msg : nullptr) && uploaded;
+  if (!uploaded)
+    ReleaseWeightRegions(weight_regions);
+  return uploaded;
+}
+
 [[nodiscard]] bool CreateWeightRegions(
     const core::GgufReader& reader,
     std::vector<QwenGpuWeightRegion>& weight_regions, std::string* error_msg) {
@@ -108,7 +163,12 @@ void CopyMappedWeights(const core::GgufMappedRegion& source, void* copy) {
     return false;
   }
 
+  bool device = false;
+  if (!UseDeviceWeightMemory(device, error_msg))
+    return false;
   weight_regions.resize(source_regions.size());
+  if (device)
+    return UploadWeightRegions(source_regions, weight_regions, error_msg);
   for (std::size_t i = 0; i < source_regions.size(); ++i) {
     const auto& source = source_regions[i];
     auto& destination = weight_regions[i];
