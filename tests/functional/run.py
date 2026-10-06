@@ -29,8 +29,8 @@ from metrics import compare, comparison_status, join_server_timings, timing_meas
 
 TESTS = Path(__file__).resolve().parent
 SUITES = ("discovery", "responses", "stops", "conversation", "image-inputs", "structured", "structured-limits",
-          "tool-reasoning",
-          "tools", "auto-tools", "tool-edges", "tool-agent", "tool-agent-loop", "tool-history", "tool-untyped", "tool-mixed", "tool-schema-edges", "sampling-defaults", "sampling-ranges", "batch",
+          "tool-reasoning", "reasoning-separator",
+          "tools", "auto-tools", "tool-edges", "tool-agent", "tool-agent-loop", "tool-history", "tool-untyped", "tool-mixed", "tool-native-schemas", "tool-native-types", "tool-schema-edges", "sampling-defaults", "sampling-ranges", "batch",
           "long-context", "state-edges", "progress", "stream-start", "metrics", "cache-edits", "cache-growth", "cache-rotation", "cache-concurrency", "cache-shared-prefix", "cache")
 SAMPLING = {
     "--temperature": ("temperature", float), "--top-p": ("top_p", float),
@@ -49,7 +49,7 @@ COMPARISON_FIELDS = ("comparison_command", "sampling_preset", "sampling_override
 def provenance():
     source = hashlib.sha256()
     for name in ("run.py", "metrics.py", "progress.py", "stream_start.py", "server_metrics.py", "openai_sdk.py", "continuation.py",
-                 "tool_reasoning.py", "tool_agent.py", "discovery.py", "image_inputs.py", "cache_edits.py", "cache_growth.py", "cache_rotation.py", "cache_concurrency.py", "cache_shared_prefix.py",
+                 "tool_reasoning.py", "tool_agent.py", "tool_native.py", "discovery.py", "image_inputs.py", "cache_edits.py", "cache_growth.py", "cache_rotation.py", "cache_concurrency.py", "cache_shared_prefix.py",
                  "cache_disk_spacing.py"):
         source.update((TESTS / name).read_bytes())
     lock = TESTS.parents[1] / "flake.lock"
@@ -246,7 +246,7 @@ def main():
     if "all" in selected:
         if len(selected) != 1:
             parser.error("all cannot be combined with other suites")
-        selected = [suite for suite in SUITES if suite != "auto-tools"
+        selected = [suite for suite in SUITES if suite not in ("auto-tools", "tool-native-types")
                     and (suite != "image-inputs" or option(command, "--mmproj") is not None)]
     selected = list(dict.fromkeys(selected))
     disk_enabled = "cache" in selected
@@ -317,11 +317,16 @@ def main():
             if result.returncode:
                 raise RuntimeError(f"exit {result.returncode}; see {label}.log")
             payload = json.loads((output / (label + ".json")).read_text())
-            passed = (isinstance(payload, dict) and payload.get("status") == "passed"
-                      if script == "openai_sdk.py" else
-                      isinstance(payload, list) and bool(payload)
-                      and all(isinstance(row, dict) and row.get("exact") is True
-                              for row in payload))
+            if script == "openai_sdk.py":
+                passed = isinstance(payload, dict) and payload.get("status") == "passed"
+            elif script == "continuation.py":
+                passed = (isinstance(payload, list) and bool(payload)
+                          and all(isinstance(row, dict) and row.get("status") == "passed"
+                                  for row in payload))
+            else:
+                passed = (isinstance(payload, list) and bool(payload)
+                          and all(isinstance(row, dict) and row.get("exact") is True
+                                  for row in payload))
             if not passed:
                 raise RuntimeError(f"test did not report success: {label}.json")
             measurements = json.loads((output / (label + ".requests.json")).read_text())
