@@ -398,6 +398,7 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
   if (batch_size == 0) {
     return 0;
   }
+  arena_.InvalidateSnapshotKvFrom(start_pos);
   if (batch_size > arena_.GetMaxBatch()) {
     throw std::length_error("prompt chunk exceeds the GPU batch length");
   }

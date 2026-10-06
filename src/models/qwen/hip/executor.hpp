@@ -1,6 +1,7 @@
 #ifndef GUFO_MODELS_QWEN_HIP_EXECUTOR_HPP_
 #define GUFO_MODELS_QWEN_HIP_EXECUTOR_HPP_
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -124,6 +125,37 @@ private:
   std::shared_ptr<models::qwen::vision::Encoder> vision_;
 };
 
+/// Positions per snapshot KV block. Checkpoints of one prefix hold the blocks
+/// they both cover together, so each new one copies only the positions past
+/// the last block boundary it shares.
+inline constexpr std::uint32_t kQwenSnapshotKvBlockTokens = 2048;
+
+/// Immutable device copy of both attention KV planes for one span of positions.
+class QwenSnapshotKvBlock final {
+public:
+  /// Throws std::bad_alloc when the device cannot hold the block.
+  explicit QwenSnapshotKvBlock(std::size_t bytes);
+  ~QwenSnapshotKvBlock();
+
+  QwenSnapshotKvBlock(const QwenSnapshotKvBlock&) = delete;
+  QwenSnapshotKvBlock& operator=(const QwenSnapshotKvBlock&) = delete;
+  QwenSnapshotKvBlock(QwenSnapshotKvBlock&&) = delete;
+  QwenSnapshotKvBlock& operator=(QwenSnapshotKvBlock&&) = delete;
+
+  [[nodiscard]] void* data() const noexcept { return data_; }
+  [[nodiscard]] std::size_t bytes() const noexcept { return bytes_; }
+  /// Unique among all blocks of the process.
+  [[nodiscard]] std::uint64_t id() const noexcept { return id_; }
+
+private:
+  void* data_{nullptr};
+  std::size_t bytes_{0};
+  std::uint64_t id_{0};
+};
+
+using QwenSnapshotKvBlocks =
+    std::vector<std::shared_ptr<const QwenSnapshotKvBlock>>;
+
 class QwenGpuSnapshot final {
 public:
   ~QwenGpuSnapshot();
@@ -139,6 +171,14 @@ public:
   }
   [[nodiscard]] std::uint32_t ValidContext() const noexcept {
     return valid_context_;
+  }
+  /// Complete KV blocks, which other snapshots of the prefix may also hold.
+  /// The positions after them are in a block this snapshot holds alone.
+  [[nodiscard]] std::span<const std::shared_ptr<const QwenSnapshotKvBlock>>
+  SharedKvBlocks() const noexcept {
+    return std::span(kv_blocks_)
+        .first(std::min<std::size_t>(
+            kv_blocks_.size(), valid_context_ / kQwenSnapshotKvBlockTokens));
   }
   [[nodiscard]] QwenKvCacheStorage KvStorage() const noexcept {
     return kv_storage_;
@@ -156,8 +196,11 @@ public:
 private:
   QwenGpuSnapshot() = default;
 
-  void* d_kv_f32_{nullptr};
-  void* d_kv_f16_{nullptr};
+  // Block i holds positions from i * kQwenSnapshotKvBlockTokens, K plane then
+  // V plane, each kv_block_rows_ rows of kv_block_width_ elements a position.
+  QwenSnapshotKvBlocks kv_blocks_;
+  std::size_t kv_block_rows_{0};
+  std::size_t kv_block_width_{0};
   void* d_ssm_conv_{nullptr};
   void* d_ssm_deltanet_{nullptr};
   std::size_t kv_elements_per_plane_{0};
@@ -396,11 +439,24 @@ public:
   [[nodiscard]] std::size_t SnapshotPayloadBytes(
       std::uint32_t valid_context) const;
 
+  /// Reuses the blocks SharedSnapshotKv(valid_context) reports and copies the
+  /// rest. Allocation failure throws std::bad_alloc.
   [[nodiscard]] std::unique_ptr<QwenGpuSnapshot> SaveSnapshot(
       std::uint32_t valid_context);
   void RestoreSnapshot(const QwenGpuSnapshot& snapshot);
   void RestoreCompactSnapshot(std::span<const std::uint8_t> payload,
                               std::uint32_t expected_valid_context);
+  /// Live snapshot blocks whose positions this arena still holds unchanged,
+  /// which a snapshot of valid_context positions would share.
+  [[nodiscard]] QwenSnapshotKvBlocks SharedSnapshotKv(
+      std::uint32_t valid_context) const;
+  /// Call before writing KV at position or later. Blocks covering those
+  /// positions no longer describe this arena.
+  void InvalidateSnapshotKvFrom(std::uint32_t position) noexcept {
+    const std::size_t unchanged = position / kQwenSnapshotKvBlockTokens;
+    if (unchanged < snapshot_kv_lineage_.size())
+      snapshot_kv_lineage_.resize(unchanged);
+  }
   [[nodiscard]] QwenGpuScratchView GetScratchView(
       std::size_t batch_size = 1) noexcept;
   void SetTargetLayerCapture(std::span<const std::uint32_t> target_layer_ids);
@@ -432,6 +488,9 @@ private:
   std::size_t replay_captured_positions_{0};
   bool has_saved_state_{false};
   bool replay_capture_active_{false};
+  // Entry i is the snapshot block that equals this arena's KV for its
+  // positions. Weak: the arena shares blocks, it does not keep them alive.
+  std::vector<std::weak_ptr<const QwenSnapshotKvBlock>> snapshot_kv_lineage_;
 };
 
 /// End-to-end GPU model executor running directly on the gfx1151 RDNA 3.5 CUs.
@@ -586,6 +645,12 @@ public:
   }
   [[nodiscard]] std::size_t SnapshotPayloadBytes(
       std::uint32_t valid_context) const;
+  /// Blocks SaveSnapshot(valid_context) will share rather than copy, counted
+  /// within SnapshotPayloadBytes(valid_context).
+  [[nodiscard]] QwenSnapshotKvBlocks SharedSnapshotKv(
+      std::uint32_t valid_context) const {
+    return arena_.SharedSnapshotKv(valid_context);
+  }
   void ConfigureVision(
       std::shared_ptr<const models::qwen::vision::Prompt> prompt,
       std::shared_ptr<models::qwen::vision::Encoder> encoder);

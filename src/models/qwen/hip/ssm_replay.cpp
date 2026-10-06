@@ -71,6 +71,8 @@ void QwenGpuArena::RestoreState() {
   if (!has_saved_state_) {
     throw std::logic_error("GPU state has not been saved");
   }
+  // Positions from the saved one onwards are about to be rewritten.
+  InvalidateSnapshotKvFrom(saved_context_);
 
   CopyRecurrentState(
       d_ssm_conv_state, d_saved_ssm_conv_state_,

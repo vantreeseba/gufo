@@ -690,6 +690,16 @@ public:
   SaveVerifierSnapshot() const {
     return verifier_ != nullptr ? verifier_->Snapshot() : nullptr;
   }
+  [[nodiscard]] SnapshotSharing SharedSnapshotBlocks() const {
+    auto kv = std::make_shared<const hip::QwenSnapshotKvBlocks>(
+        executor_->SharedSnapshotKv(static_cast<std::uint32_t>(position_)));
+    SnapshotSharing sharing;
+    sharing.blocks.reserve(kv->size());
+    for (const auto& block : *kv)
+      sharing.blocks.push_back({.id = block->id(), .bytes = block->bytes()});
+    sharing.keepalive = std::move(kv);
+    return sharing;
+  }
   [[nodiscard]] std::size_t SnapshotPayloadBytes() const {
     std::size_t bytes = executor_->SnapshotPayloadBytes(position_);
     const auto checked_add = [&bytes](std::size_t value) {
@@ -786,7 +796,11 @@ public:
         frontier(frontier),
         frontier_logits(std::move(frontier_logits)),
         pending_tokens(std::move(pending_tokens)),
-        verifier_snapshot(std::move(verifier_snapshot)) {}
+        verifier_snapshot(std::move(verifier_snapshot)) {
+    if (this->snapshot != nullptr)
+      for (const auto& block : this->snapshot->SharedKvBlocks())
+        shared_blocks.push_back({.id = block->id(), .bytes = block->bytes()});
+  }
 
   [[nodiscard]] std::size_t PayloadBytes() const noexcept override {
     return (snapshot != nullptr ? snapshot->PayloadBytes() : 0) +
@@ -794,6 +808,10 @@ public:
            pending_tokens.size() * sizeof(TextRunnerToken) +
            (verifier_snapshot != nullptr ? verifier_snapshot->PayloadBytes()
                                          : 0);
+  }
+  [[nodiscard]] std::span<const SnapshotBlock> SharedBlocks()
+      const noexcept override {
+    return shared_blocks;
   }
 
   std::shared_ptr<const hip::QwenGpuModel> model;
@@ -803,6 +821,7 @@ public:
   std::vector<float> frontier_logits;
   std::vector<TextRunnerToken> pending_tokens;
   std::unique_ptr<speculative::SpeculativeVerifierSnapshot> verifier_snapshot;
+  std::vector<SnapshotBlock> shared_blocks;
 };
 
 QwenTextRunnerState& RequireQwenState(TextRunnerState& state) {
@@ -1262,6 +1281,11 @@ public:
   [[nodiscard]] std::size_t SnapshotPayloadBytes(
       const TextRunnerState& state) const override {
     return RequireQwenState(state).SnapshotPayloadBytes();
+  }
+
+  [[nodiscard]] SnapshotSharing SharedSnapshotBlocks(
+      const TextRunnerState& state) const override {
+    return RequireQwenState(state).SharedSnapshotBlocks();
   }
 
   [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Snapshot(

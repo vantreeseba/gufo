@@ -8,6 +8,7 @@
 #include <future>
 #include <limits>
 #include <mutex>
+#include <new>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
@@ -549,6 +550,11 @@ std::size_t TextModelRunner::SnapshotPayloadBytes(
   throw std::logic_error("text runner does not support snapshot sizing");
 }
 
+SnapshotSharing TextModelRunner::SharedSnapshotBlocks(
+    const TextRunnerState&) const {
+  return {};
+}
+
 void TextModelRunner::RestoreOrFork(TextRunnerState&,
                                     const TextRunnerSnapshot&) const {
   throw std::logic_error("text runner does not support snapshot restore/fork");
@@ -825,6 +831,7 @@ struct TextRunnerPool::Request::Impl {
       return;
     }
     snapshot_bytes = 0;
+    SnapshotSharing sharing;
     try {
       if (runner->CheckpointPosition(*state) != snapshot_tokens.size()) {
         lease.SkipSnapshot(SnapshotEventReason::kCaptureFailure, 0,
@@ -832,6 +839,7 @@ struct TextRunnerPool::Request::Impl {
         return;
       }
       snapshot_bytes = runner->SnapshotPayloadBytes(*state);
+      sharing = runner->SharedSnapshotBlocks(*state);
     } catch (...) {
       lease.SkipSnapshot(SnapshotEventReason::kCaptureFailure, 0,
                          snapshot_tokens.size());
@@ -839,15 +847,16 @@ struct TextRunnerPool::Request::Impl {
     }
 
     retain_snapshot = false;
+    snapshot_preserves_source =
+        retain_fallback &&
+        (fallback_position == 0 || snapshot_tokens.size() == prompt.size());
     try {
       retain_snapshot = lease.TryReserveSnapshot(
-          snapshot_bytes, snapshot_tokens.size(),
-          retain_fallback && (fallback_position == 0 ||
-                              snapshot_tokens.size() == prompt.size()),
+          snapshot_bytes, snapshot_tokens.size(), snapshot_preserves_source,
           retain_fallback && snapshot_tokens.size() == prompt.size()
               ? SnapshotPurpose::kRetry
               : SnapshotPurpose::kContinuation,
-          snapshot_tokens);
+          snapshot_tokens, std::move(sharing));
     } catch (...) {
       return;
     }
@@ -887,9 +896,31 @@ struct TextRunnerPool::Request::Impl {
     }
   }
 
+  /// The device could not hold the reserved checkpoint. Retained checkpoints
+  /// give way in the usual order before one more attempt; the lease is parked
+  /// until this returns, so the state still sits at the captured position.
+  [[nodiscard]] std::unique_ptr<TextRunnerSnapshot>
+  RetryPromptSnapshot() noexcept {
+    if (!retain_snapshot)
+      return nullptr;
+    try {
+      retain_snapshot = false;
+      retain_snapshot = lease.RetryReserveSnapshot(
+          snapshot_tokens.size(), snapshot_preserves_source, snapshot_tokens);
+      if (!retain_snapshot)
+        return nullptr;
+      return runner->Snapshot(
+          dynamic_cast<const TextRunnerState&>(lease.state()));
+    } catch (...) {
+      return nullptr;
+    }
+  }
+
   void FinishPromptSnapshot() noexcept {
     try {
       prompt_snapshot = snapshot_future.get();
+    } catch (const std::bad_alloc&) {
+      prompt_snapshot = RetryPromptSnapshot();
     } catch (...) {
       prompt_snapshot.reset();
     }
@@ -997,15 +1028,27 @@ struct TextRunnerPool::Request::Impl {
       // Copies other requests depend on compete like continuation
       // boundaries; the rest give way under pressure.
       if (history && !lease.HasSnapshotFor(prefix))
-        reserved = lease.TryReserveSnapshot(bytes, position, true, purpose);
+        reserved = lease.TryReserveSnapshot(
+            bytes, position, true, purpose, {},
+            runner->SharedSnapshotBlocks(state));
       std::unique_ptr<ContinuationDiskStore::CaptureReservation> persistence;
       if (shared && disk_store && !disk_store->Touch(*runner, prefix, identity))
         persistence =
             disk_store->ReserveCapture(*runner, position, bytes, identity);
       if (!reserved && !persistence)
         return;
-      std::shared_ptr<const TextRunnerSnapshot> snapshot =
-          runner->Snapshot(state);
+      std::shared_ptr<const TextRunnerSnapshot> snapshot;
+      try {
+        snapshot = runner->Snapshot(state);
+      } catch (const std::bad_alloc&) {
+        // Retained checkpoints give way before one more attempt.
+        if (!reserved)
+          throw;
+        reserved = lease.RetryReserveSnapshot(position, true);
+        if (!reserved)
+          throw;
+        snapshot = runner->Snapshot(state);
+      }
       failed = !snapshot;
       if (snapshot && reserved) {
         snapshot_metrics.snapshot_bytes += lease.PublishSnapshot(
@@ -1063,6 +1106,8 @@ struct TextRunnerPool::Request::Impl {
   sampling::SamplerState sampler;
   std::shared_ptr<const TextPromptContext> context;
   bool retain_fallback{false};
+  /// preserve_source of the pending prompt snapshot reservation.
+  bool snapshot_preserves_source{false};
   bool overlap_snapshots{false};
   std::size_t fallback_position{0};
   /// This turn's stable boundary when the reused frontier sits before it, so
@@ -1776,8 +1821,16 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
         if (runner.CheckpointPosition(state) != prefix.size())
           throw std::logic_error("live checkpoint position mismatch");
         bytes = runner.SnapshotPayloadBytes(state);
-        if (lease.TryReserveSnapshot(bytes, prefix.size(), true)) {
-          snapshot = runner.Snapshot(state);
+        if (lease.TryReserveSnapshot(bytes, prefix.size(), true,
+                                     SnapshotPurpose::kContinuation, {},
+                                     runner.SharedSnapshotBlocks(state))) {
+          try {
+            snapshot = runner.Snapshot(state);
+          } catch (const std::bad_alloc&) {
+            // Retained checkpoints give way before one more attempt.
+            if (lease.RetryReserveSnapshot(prefix.size(), true))
+              snapshot = runner.Snapshot(state);
+          }
           if (snapshot == nullptr)
             throw std::runtime_error("live checkpoint capture failed");
           if (lease.PublishSnapshot({prefix.begin(), prefix.end()}, snapshot) ==

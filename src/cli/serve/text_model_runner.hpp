@@ -354,6 +354,11 @@ public:
   /// advertise the corresponding capabilities.
   [[nodiscard]] virtual std::size_t SnapshotPayloadBytes(
       const TextRunnerState& state) const;
+  /// Storage the next Snapshot(state) will share with earlier snapshots of
+  /// the same prefix instead of allocating, counted within
+  /// SnapshotPayloadBytes(state). Runners that copy everything share nothing.
+  [[nodiscard]] virtual SnapshotSharing SharedSnapshotBlocks(
+      const TextRunnerState& state) const;
   /// May run on a capture worker while this state is frozen. Must not mutate
   /// shared execution scratch; other sessions may execute concurrently.
   [[nodiscard]] virtual std::unique_ptr<TextRunnerSnapshot> Snapshot(

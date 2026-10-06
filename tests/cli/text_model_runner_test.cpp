@@ -1638,6 +1638,166 @@ void TestSnapshotCaptureFailureReleasesReservationAndKeepsRequestSuccessful() {
   extension.Invalidate();
 }
 
+class ExhaustedDeviceSnapshotRunner final : public SnapshotRunner {
+public:
+  using SnapshotRunner::SnapshotRunner;
+
+  [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Snapshot(
+      const TextRunnerState& state) const override {
+    if (stats_->snapshot_captures + 1 == 2) {
+      ++stats_->snapshot_captures;
+      throw std::bad_alloc();
+    }
+    return SnapshotRunner::Snapshot(state);
+  }
+};
+
+/// The byte budget is sized at load. When the device later cannot hold a
+/// checkpoint the budget admitted, an older checkpoint gives way instead.
+void TestSnapshotAllocationFailureEvictsAndRetries() {
+  auto stats = std::make_shared<FakeStats>();
+  auto runner = std::make_shared<ExhaustedDeviceSnapshotRunner>(
+      stats, 64, 256, 2 * sizeof(FakeSnapshot));
+  TextRunnerPool pool(runner, 1);
+
+  {
+    auto first = pool.Acquire({1, 2, 3});
+    Expect(first.Prefill(3).decode_ready, "first request reaches checkpoint");
+    Expect(first.Commit().snapshot_bytes == sizeof(FakeSnapshot),
+           "first checkpoint is retained");
+  }
+  {
+    auto second = pool.Acquire({4, 5});
+    Expect(second.Prefill(2).decode_ready, "second request reaches checkpoint");
+    Expect(second.Commit().snapshot_bytes == sizeof(FakeSnapshot),
+           "the checkpoint is retained after the failed allocation");
+  }
+  Expect(stats->snapshot_captures == 3,
+         "the failed capture is attempted exactly once more");
+
+  {
+    auto extension = pool.Acquire({4, 5, 6});
+    Expect(extension.cache_hit() && extension.cached_prompt_tokens() == 2,
+           "the retried checkpoint is reusable");
+    extension.Invalidate();
+  }
+  auto evicted = pool.Acquire({1, 2, 3, 4});
+  Expect(!evicted.cache_hit(),
+         "the older checkpoint gave way to the retried allocation");
+  evicted.Invalidate();
+}
+
+/// Checkpoints of one prefix hold its storage together, as Qwen does with
+/// attention KV: all but kOwnBytes of every payload is the same block.
+class SharedPrefixSnapshot final : public TextRunnerSnapshot {
+public:
+  static constexpr std::size_t kBlockBytes = 4096;
+  static constexpr std::size_t kOwnBytes = 64;
+
+  SharedPrefixSnapshot(std::shared_ptr<const int> block, std::size_t position,
+                       std::size_t decode_count,
+                       std::optional<TextRunnerToken> frontier)
+      : block(std::move(block)),
+        position(position),
+        decode_count(decode_count),
+        frontier(frontier) {}
+
+  [[nodiscard]] std::size_t PayloadBytes() const noexcept override {
+    return kBlockBytes + kOwnBytes;
+  }
+  [[nodiscard]] std::span<const gufo::server::SnapshotBlock> SharedBlocks()
+      const noexcept override {
+    return {&shared, 1};
+  }
+
+  std::shared_ptr<const int> block;
+  gufo::server::SnapshotBlock shared{.id = 1, .bytes = kBlockBytes};
+  std::size_t position;
+  std::size_t decode_count;
+  std::optional<TextRunnerToken> frontier;
+};
+
+class SharedPrefixSnapshotRunner final : public SnapshotRunner {
+public:
+  using SnapshotRunner::SnapshotRunner;
+
+  [[nodiscard]] std::size_t SnapshotPayloadBytes(
+      const TextRunnerState&) const override {
+    return SharedPrefixSnapshot::kBlockBytes + SharedPrefixSnapshot::kOwnBytes;
+  }
+
+  [[nodiscard]] gufo::server::SnapshotSharing SharedSnapshotBlocks(
+      const TextRunnerState&) const override {
+    auto block = block_.lock();
+    if (!block)
+      return {};
+    return {.blocks = {{.id = 1, .bytes = SharedPrefixSnapshot::kBlockBytes}},
+            .keepalive = std::move(block)};
+  }
+
+  [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Snapshot(
+      const TextRunnerState& state) const override {
+    ++stats_->snapshot_captures;
+    auto block = block_.lock();
+    if (!block) {
+      block = std::make_shared<const int>(0);
+      block_ = block;
+    }
+    const auto& fake = RequireFakeState(state);
+    return std::make_unique<SharedPrefixSnapshot>(
+        std::move(block), fake.position, fake.decode_count, fake.frontier);
+  }
+
+  void RestoreOrFork(TextRunnerState& state,
+                     const TextRunnerSnapshot& snapshot) const override {
+    const auto& saved = dynamic_cast<const SharedPrefixSnapshot&>(snapshot);
+    auto& restored = RequireFakeState(state);
+    restored.position = saved.position;
+    restored.decode_count = saved.decode_count;
+    restored.frontier = saved.frontier;
+    ++stats_->snapshot_restores;
+  }
+
+private:
+  mutable std::weak_ptr<const int> block_;
+};
+
+/// The budget holds one complete payload and one more checkpoint's own bytes.
+/// Both checkpoints stay only because the shared block is charged once.
+void TestCheckpointsSharingStorageAreChargedForItOnce() {
+  auto stats = std::make_shared<FakeStats>();
+  const std::size_t payload =
+      SharedPrefixSnapshot::kBlockBytes + SharedPrefixSnapshot::kOwnBytes;
+  auto runner = std::make_shared<SharedPrefixSnapshotRunner>(
+      stats, 64, 256, payload + SharedPrefixSnapshot::kOwnBytes);
+  TextRunnerPool pool(runner, 1);
+
+  {
+    auto first = pool.Acquire({1, 2, 3});
+    Expect(first.Prefill(3).decode_ready, "first request reaches checkpoint");
+    Expect(first.Commit().snapshot_bytes == payload,
+           "first checkpoint reports its complete payload");
+  }
+  {
+    auto second = pool.Acquire({1, 2, 3, 4, 5});
+    Expect(second.cache_hit() && second.cached_prompt_tokens() == 3,
+           "the extension restores the first checkpoint");
+    Expect(second.Prefill(2).decode_ready, "extension reaches its checkpoint");
+    Expect(second.Commit().snapshot_bytes == payload,
+           "the extension is retained beside the checkpoint it shares with");
+  }
+  {
+    auto branch = pool.Acquire({1, 2, 3, 9});
+    Expect(branch.cache_hit() && branch.cached_prompt_tokens() == 3,
+           "the first checkpoint was not evicted for the second");
+    branch.Invalidate();
+  }
+  auto latest = pool.Acquire({1, 2, 3, 4, 5, 6});
+  Expect(latest.cache_hit() && latest.cached_prompt_tokens() == 5,
+         "the second checkpoint is reusable");
+  latest.Invalidate();
+}
+
 /// Evicting a retained prefix because the entry table is full is not routine:
 /// it means the server is configured below its workload and is doing avoidable
 /// full re-prefills. It must be visible, unlike exact replacement.
@@ -1988,6 +2148,8 @@ int main() {
   std::ostringstream failure_log;
   previous = std::clog.rdbuf(failure_log.rdbuf());
   TestSnapshotCaptureFailureReleasesReservationAndKeepsRequestSuccessful();
+  TestSnapshotAllocationFailureEvictsAndRetries();
+  TestCheckpointsSharingStorageAreChargedForItOnce();
   std::clog.rdbuf(previous);
   Expect(
       failure_log.str().find("[WARN] [cache]") != std::string::npos &&

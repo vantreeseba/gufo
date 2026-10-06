@@ -314,6 +314,23 @@ The RAM payload budget excludes weights, execution states, token metadata
 and disk staging. It also excludes temporary host buffers used to save
 checkpoints to disk; this is not a limit on total server memory.
 
+Qwen checkpoints of one history share attention KV. A checkpoint stores KV in
+blocks of 2,048 positions. A checkpoint captured from a state that was restored
+from, or already saved as, another checkpoint holds the same full blocks rather
+than copying them; only the positions past the last full block and the
+recurrent state are its own. A shared block counts once against the budget and
+is freed with the last checkpoint that holds it. `bytes=` in the log is still
+the complete payload of one checkpoint, so `retained_bytes` can be smaller than
+the sum over retained checkpoints. Rewinding or resetting a session ends
+sharing from that position on. Disk entries are always complete copies.
+
+The budget is an estimate made at load; device memory can shrink afterwards.
+When a Qwen checkpoint the budget admitted cannot be allocated, the budget
+drops to the bytes already retained and in flight (never below that one
+checkpoint), retained checkpoints give way in the usual eviction order, and
+the capture is attempted once more. The budget does not grow back during the
+run.
+
 The 32 GiB automatic cap limits default growth on a lightly loaded machine.
 It leaves room for several 27B histories: two 3.7 GB checkpoints per history
 would consume about 30 GB for four conversations, before optional copies.
@@ -421,6 +438,8 @@ still populate the cache.
 | `event=snapshot action=removed reason=entry_capacity` | a retained prefix was evicted because every entry was taken |
 | `event=snapshot action=skipped reason=entry_capacity` | no checkpoint record could be replaced safely for this capture |
 | `event=snapshot action=skipped reason=byte_capacity` | a checkpoint did not fit the RAM budget |
+| `event=snapshot_capacity_lowered reason=allocation_failure` | the device could not hold a checkpoint the RAM budget admitted; the budget dropped to what is retained |
+| `event=snapshot action=skipped reason=capture_failure` | a checkpoint could not be captured, including after that retry |
 | `event=disk_cache action=removed reason=lru` | a disk entry was evicted to stay inside `--cache-disk-bytes` |
 | `event=disk_cache action=skipped reason=staging_capacity` | a checkpoint exceeded `--cache-disk-staging-bytes` and was never written |
 | `event=disk_cache action=skipped reason=min_step` | a checkpoint was less than 2048 tokens past a stored prefix; RAM still retains it |

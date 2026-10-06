@@ -1,9 +1,11 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <new>
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
@@ -150,6 +152,27 @@ void ThrowOnHipError(hipError_t error, std::string_view operation) {
     throw std::runtime_error(std::string(operation) + ": " +
                              hipGetErrorString(error));
   }
+}
+
+/// Device memory pressure while capturing a checkpoint. Reported as
+/// std::bad_alloc so the serving cache can release retained checkpoints and
+/// retry, instead of treating it as a capture defect.
+class SnapshotAllocationError final : public std::bad_alloc {
+public:
+  explicit SnapshotAllocationError(const char* operation) noexcept
+      : operation_(operation) {}
+  [[nodiscard]] const char* what() const noexcept override {
+    return operation_;
+  }
+
+private:
+  const char* operation_;
+};
+
+void ThrowOnSnapshotAllocationError(hipError_t error, const char* operation) {
+  if (error == hipErrorOutOfMemory)
+    throw SnapshotAllocationError(operation);
+  ThrowOnHipError(error, operation);
 }
 
 template<typename T>
@@ -310,13 +333,20 @@ models::qwen::vision::RopeLayout QwenGpuSnapshot::ReadRopeLayout(
   return ParseCompactSnapshotLayout(payload).rope;
 }
 
+QwenSnapshotKvBlock::QwenSnapshotKvBlock(std::size_t bytes) : bytes_(bytes) {
+  static std::atomic<std::uint64_t> next_id{1};
+  ThrowOnSnapshotAllocationError(hipMalloc(&data_, bytes),
+                                 "failed to allocate Qwen snapshot KV");
+  id_ = next_id.fetch_add(1, std::memory_order_relaxed);
+}
+
+QwenSnapshotKvBlock::~QwenSnapshotKvBlock() {
+  if (data_ != nullptr) {
+    (void)hipFree(data_);
+  }
+}
+
 QwenGpuSnapshot::~QwenGpuSnapshot() {
-  if (d_kv_f32_ != nullptr) {
-    (void)hipFree(d_kv_f32_);
-  }
-  if (d_kv_f16_ != nullptr) {
-    (void)hipFree(d_kv_f16_);
-  }
   if (d_ssm_conv_ != nullptr) {
     (void)hipFree(d_ssm_conv_);
   }
@@ -387,26 +417,33 @@ std::size_t QwenGpuSnapshot::SerializeCompact(
     const std::size_t kv_element_bytes =
         kv_storage_ == QwenKvCacheStorage::kFp16 ? sizeof(std::uint16_t)
                                                  : sizeof(float);
-    const std::size_t source_pitch = CheckedMultiply(
-        CheckedMultiply(valid_context_, kv_width_), kv_element_bytes);
-    const void* source =
-        kv_storage_ == QwenKvCacheStorage::kFp16 ? d_kv_f16_ : d_kv_f32_;
-    if (source == nullptr) {
+    const std::size_t position_bytes =
+        CheckedMultiply(kv_block_width_, kv_element_bytes);
+    if (kv_block_rows_ == 0 ||
+        CheckedMultiply(CheckedMultiply(kv_block_rows_, valid_context_),
+                        position_bytes) != layout.live_kv_bytes_per_plane) {
       throw std::logic_error("Qwen compact snapshot has no KV storage");
     }
-    transfer.Copy2D(destination.data() + layout.k_offset,
-                    layout.live_kv_bytes_per_plane / attention_layers_, source,
-                    source_pitch,
-                    layout.live_kv_bytes_per_plane / attention_layers_,
-                    attention_layers_);
-    const auto* source_bytes = static_cast<const std::uint8_t*>(source);
-    const std::size_t full_plane_bytes =
-        CheckedMultiply(kv_elements_per_plane_, kv_element_bytes);
-    transfer.Copy2D(destination.data() + layout.v_offset,
-                    layout.live_kv_bytes_per_plane / attention_layers_,
-                    source_bytes + full_plane_bytes, source_pitch,
-                    layout.live_kv_bytes_per_plane / attention_layers_,
-                    attention_layers_);
+    // The payload keeps each row's positions contiguous; blocks hold a span
+    // of positions for every row.
+    const std::size_t destination_pitch =
+        layout.live_kv_bytes_per_plane / kv_block_rows_;
+    std::size_t first_position = 0;
+    for (const auto& block : kv_blocks_) {
+      const std::size_t plane_bytes = block->bytes() / 2;
+      const std::size_t pitch = plane_bytes / kv_block_rows_;
+      const std::size_t offset = first_position * position_bytes;
+      const auto* source = static_cast<const std::uint8_t*>(block->data());
+      transfer.Copy2D(destination.data() + layout.k_offset + offset,
+                      destination_pitch, source, pitch, pitch, kv_block_rows_);
+      transfer.Copy2D(destination.data() + layout.v_offset + offset,
+                      destination_pitch, source + plane_bytes, pitch, pitch,
+                      kv_block_rows_);
+      first_position += pitch / position_bytes;
+    }
+    if (first_position != valid_context_) {
+      throw std::logic_error("Qwen compact snapshot KV is incomplete");
+    }
   }
   if (layout.conv_bytes != 0) {
     transfer.Copy(destination.data() + layout.conv_offset, d_ssm_conv_,
@@ -589,19 +626,12 @@ std::unique_ptr<QwenGpuSnapshot> QwenGpuArena::SaveSnapshot(
   CheckedAdd(conv_bytes, &snapshot->payload_bytes_);
   CheckedAdd(deltanet_bytes, &snapshot->payload_bytes_);
 
-  if (kv_f32_bytes != 0) {
-    if (policy_.UsesFp16AttentionKv()) {
-      ThrowOnHipError(hipMalloc(&snapshot->d_kv_f16_, kv_f16_bytes),
-                      "failed to allocate Qwen FP16 snapshot KV");
-    } else {
-      ThrowOnHipError(hipMalloc(&snapshot->d_kv_f32_, kv_f32_bytes),
-                      "failed to allocate Qwen FP32 snapshot KV");
-    }
-  }
-  ThrowOnHipError(hipMalloc(&snapshot->d_ssm_conv_, conv_bytes),
-                  "failed to allocate Qwen convolution snapshot");
-  ThrowOnHipError(hipMalloc(&snapshot->d_ssm_deltanet_, deltanet_bytes),
-                  "failed to allocate Qwen DeltaNet snapshot");
+  ThrowOnSnapshotAllocationError(
+      hipMalloc(&snapshot->d_ssm_conv_, conv_bytes),
+      "failed to allocate Qwen convolution snapshot");
+  ThrowOnSnapshotAllocationError(
+      hipMalloc(&snapshot->d_ssm_deltanet_, deltanet_bytes),
+      "failed to allocate Qwen DeltaNet snapshot");
 
   SnapshotTransfer transfer;
   if (kv_f32_bytes != 0) {
@@ -613,22 +643,44 @@ std::unique_ptr<QwenGpuSnapshot> QwenGpuArena::SaveSnapshot(
     const auto rows =
         snapshot->attention_layers_ *
         (policy_.UsesFp16AttentionKv() ? 1U : config_.num_key_value_heads);
-    const auto source_pitch =
-        CheckedMultiply(CheckedMultiply(max_context_, width), element_bytes);
-    const auto target_pitch =
-        CheckedMultiply(CheckedMultiply(valid_context, width), element_bytes);
+    const std::size_t position_bytes = CheckedMultiply(width, element_bytes);
+    const auto source_pitch = CheckedMultiply(max_context_, position_bytes);
     const auto source_plane = CheckedMultiply(source_pitch, rows);
-    const auto target_plane = CheckedMultiply(target_pitch, rows);
     const auto* source = static_cast<const std::uint8_t*>(
         policy_.UsesFp16AttentionKv() ? d_attention_kv_f16
                                       : static_cast<void*>(d_kv_cache));
-    auto* destination = static_cast<std::uint8_t*>(policy_.UsesFp16AttentionKv()
-                                                       ? snapshot->d_kv_f16_
-                                                       : snapshot->d_kv_f32_);
-    for (std::size_t plane = 0; plane < 2; ++plane)
-      transfer.Copy2D(destination + plane * target_plane, target_pitch,
-                      source + plane * source_plane, source_pitch, target_pitch,
-                      rows, hipMemcpyDeviceToDevice);
+    snapshot->kv_block_rows_ = rows;
+    snapshot->kv_block_width_ = width;
+    const std::size_t shared_blocks =
+        valid_context / kQwenSnapshotKvBlockTokens;
+    for (std::size_t first = 0, index = 0; first < valid_context;
+         first += kQwenSnapshotKvBlockTokens, ++index) {
+      // A block the arena was restored from, or already saved, still equals
+      // these positions: nothing has written them since.
+      if (index < shared_blocks && index < snapshot_kv_lineage_.size()) {
+        if (auto block = snapshot_kv_lineage_[index].lock()) {
+          snapshot->kv_blocks_.push_back(std::move(block));
+          continue;
+        }
+      }
+      const std::size_t positions = std::min<std::size_t>(
+          kQwenSnapshotKvBlockTokens, valid_context - first);
+      const auto target_pitch = CheckedMultiply(positions, position_bytes);
+      const auto target_plane = CheckedMultiply(target_pitch, rows);
+      auto block = std::make_shared<const QwenSnapshotKvBlock>(
+          CheckedMultiply(target_plane, 2));
+      auto* destination = static_cast<std::uint8_t*>(block->data());
+      for (std::size_t plane = 0; plane < 2; ++plane)
+        transfer.Copy2D(
+            destination + plane * target_plane, target_pitch,
+            source + plane * source_plane + first * position_bytes,
+            source_pitch, target_pitch, rows, hipMemcpyDeviceToDevice);
+      snapshot->kv_blocks_.push_back(std::move(block));
+    }
+    if (snapshot_kv_lineage_.size() < shared_blocks)
+      snapshot_kv_lineage_.resize(shared_blocks);
+    for (std::size_t index = 0; index < shared_blocks; ++index)
+      snapshot_kv_lineage_[index] = snapshot->kv_blocks_[index];
   }
   transfer.Copy(snapshot->d_ssm_conv_, d_ssm_conv_state, conv_bytes,
                 hipMemcpyDeviceToDevice);
@@ -670,24 +722,31 @@ void QwenGpuArena::RestoreSnapshot(const QwenGpuSnapshot& snapshot) {
     const auto rows =
         attention_layers *
         (policy_.UsesFp16AttentionKv() ? 1U : config_.num_key_value_heads);
-    const auto source_pitch = CheckedMultiply(
-        CheckedMultiply(snapshot.valid_context_, width), element_bytes);
-    const auto target_pitch =
-        CheckedMultiply(CheckedMultiply(max_context_, width), element_bytes);
-    const auto source_plane = CheckedMultiply(source_pitch, rows);
+    if (snapshot.kv_block_rows_ != rows || snapshot.kv_block_width_ != width)
+      throw std::invalid_argument(
+          "Qwen snapshot is incompatible with the arena");
+    const std::size_t position_bytes = CheckedMultiply(width, element_bytes);
+    const auto target_pitch = CheckedMultiply(max_context_, position_bytes);
     const auto target_plane = CheckedMultiply(target_pitch, rows);
-    const auto* source = static_cast<const std::uint8_t*>(
-        policy_.UsesFp16AttentionKv() ? snapshot.d_kv_f16_
-                                      : snapshot.d_kv_f32_);
     auto* destination = static_cast<std::uint8_t*>(
         policy_.UsesFp16AttentionKv() ? d_attention_kv_f16
                                       : static_cast<void*>(d_kv_cache));
-    for (std::size_t plane = 0; plane < 2; ++plane)
-      ThrowOnHipError(
-          hipMemcpy2DAsync(destination + plane * target_plane, target_pitch,
-                           source + plane * source_plane, source_pitch,
-                           source_pitch, rows, hipMemcpyDeviceToDevice, stream),
-          "failed to restore Qwen KV snapshot");
+    std::size_t first = 0;
+    for (const auto& block : snapshot.kv_blocks_) {
+      const std::size_t source_plane = block->bytes() / 2;
+      const std::size_t source_pitch = source_plane / rows;
+      const auto* source = static_cast<const std::uint8_t*>(block->data());
+      for (std::size_t plane = 0; plane < 2; ++plane)
+        ThrowOnHipError(
+            hipMemcpy2DAsync(
+                destination + plane * target_plane + first * position_bytes,
+                target_pitch, source + plane * source_plane, source_pitch,
+                source_pitch, rows, hipMemcpyDeviceToDevice, stream),
+            "failed to restore Qwen KV snapshot");
+      first += source_pitch / position_bytes;
+    }
+    if (first != snapshot.valid_context_)
+      throw std::logic_error("Qwen snapshot KV is incomplete");
   }
   ThrowOnHipError(hipMemcpyAsync(d_ssm_conv_state, snapshot.d_ssm_conv_,
                                  snapshot.conv_elements_ * sizeof(float),
@@ -701,6 +760,21 @@ void QwenGpuArena::RestoreSnapshot(const QwenGpuSnapshot& snapshot) {
                   "failed to restore Qwen DeltaNet snapshot");
   ThrowOnHipError(hipStreamSynchronize(stream),
                   "failed to synchronize Qwen snapshot restore");
+  // The arena now equals the snapshot, so its next checkpoints share these.
+  const auto shared = snapshot.SharedKvBlocks();
+  snapshot_kv_lineage_.assign(shared.begin(), shared.end());
+}
+
+QwenSnapshotKvBlocks QwenGpuArena::SharedSnapshotKv(
+    std::uint32_t valid_context) const {
+  QwenSnapshotKvBlocks blocks;
+  const std::size_t count =
+      std::min<std::size_t>(snapshot_kv_lineage_.size(),
+                            valid_context / kQwenSnapshotKvBlockTokens);
+  for (std::size_t index = 0; index < count; ++index)
+    if (auto block = snapshot_kv_lineage_[index].lock())
+      blocks.push_back(std::move(block));
+  return blocks;
 }
 
 void QwenGpuArena::RestoreCompactSnapshot(
@@ -1189,6 +1263,7 @@ QwenGpuArena& QwenGpuArena::operator=(QwenGpuArena&& other) noexcept {
 }
 
 void QwenGpuArena::Reset() {
+  snapshot_kv_lineage_.clear();
   const std::size_t num_layers = config_.SsmLayerCount();
   const std::size_t total_conv =
       num_layers * config_.SsmQkvSize() * config_.ssm_conv_kernel;

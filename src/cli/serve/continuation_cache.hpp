@@ -49,6 +49,22 @@ public:
   virtual void Invalidate() noexcept = 0;
 };
 
+/// Storage that several snapshots of one prefix can hold together, such as a
+/// span of attention KV that later checkpoints extend without rewriting. Equal
+/// ids name the same bytes; the byte budget counts each block once.
+struct SnapshotBlock {
+  std::uint64_t id{0};
+  std::size_t bytes{0};
+};
+
+/// Blocks an upcoming capture will reuse instead of allocating. The keepalive
+/// holds them until the capture, even if their last retained owner is evicted
+/// to make room.
+struct SnapshotSharing {
+  std::vector<SnapshotBlock> blocks;
+  std::shared_ptr<const void> keepalive{};
+};
+
 /// Immutable model-private continuation payload.
 class ContinuationSnapshot {
 public:
@@ -60,7 +76,13 @@ public:
   ContinuationSnapshot(ContinuationSnapshot&&) = delete;
   ContinuationSnapshot& operator=(ContinuationSnapshot&&) = delete;
 
+  /// Complete payload, shared blocks included.
   [[nodiscard]] virtual std::size_t PayloadBytes() const noexcept = 0;
+  /// The part of the payload held together with other snapshots.
+  [[nodiscard]] virtual std::span<const SnapshotBlock> SharedBlocks()
+      const noexcept {
+    return {};
+  }
 };
 
 enum class SnapshotEventAction : std::uint8_t {
@@ -160,10 +182,23 @@ public:
     /// Byte-pressure evictions happen synchronously before this returns true.
     /// A verified replacement prefix can retire this family's old boundary
     /// before evicting another family's last copy, unless preserve_source.
+    /// Blocks named in sharing are charged once however many snapshots hold
+    /// them, so only the remainder of snapshot_bytes needs new room.
     [[nodiscard]] bool TryReserveSnapshot(
         std::size_t snapshot_bytes, std::size_t token_count,
         bool preserve_source = false,
         SnapshotPurpose purpose = SnapshotPurpose::kContinuation,
+        std::span<const ContinuationToken> replacement_prefix = {},
+        SnapshotSharing sharing = {});
+
+    /// Re-admits this lease's reservation after the model could not allocate
+    /// it. The device evidently holds less than the byte budget, so the budget
+    /// drops to what is retained and in flight (never below this checkpoint);
+    /// the usual eviction order then frees room for one more attempt. Pass the
+    /// arguments of the original reservation. On false the reservation is
+    /// released.
+    [[nodiscard]] bool RetryReserveSnapshot(
+        std::size_t token_count, bool preserve_source = false,
         std::span<const ContinuationToken> replacement_prefix = {});
 
     /// Releases an admitted reservation and records a sanitized skip reason.
@@ -208,6 +243,7 @@ public:
     double restore_ms_{0.0};
     bool restored_from_disk_{false};
     std::size_t reserved_snapshot_bytes_{0};
+    SnapshotSharing reserved_sharing_;
     SnapshotPurpose snapshot_purpose_{SnapshotPurpose::kContinuation};
     std::size_t prompt_tokens_{0};
     std::size_t stable_prefix_tokens_{0};
@@ -273,13 +309,21 @@ private:
       std::size_t source_index, std::size_t snapshot_bytes,
       std::size_t token_count, bool preserve_source, SnapshotPurpose purpose,
       std::span<const ContinuationToken> replacement_prefix,
-      std::span<const std::uint8_t> input_identity);
-  void SkipSnapshot(std::size_t reservation_bytes, SnapshotEventReason reason,
-                    std::size_t snapshot_bytes,
+      std::span<const std::uint8_t> input_identity,
+      std::span<const SnapshotBlock> shared_blocks);
+  void LowerSnapshotCapacity(
+      std::size_t reservation_bytes,
+      std::span<const SnapshotBlock> reservation_blocks) noexcept;
+  void ReleaseSnapshotBlocks(std::span<const SnapshotBlock> blocks) noexcept;
+  void SkipSnapshot(std::size_t reservation_bytes,
+                    std::span<const SnapshotBlock> reservation_blocks,
+                    SnapshotEventReason reason, std::size_t snapshot_bytes,
                     std::size_t token_count) noexcept;
   [[nodiscard]] std::size_t Commit(
       std::size_t index, std::size_t source_index,
-      std::size_t reservation_bytes, std::vector<ContinuationToken> tokens,
+      std::size_t reservation_bytes,
+      std::span<const SnapshotBlock> reservation_blocks,
+      std::vector<ContinuationToken> tokens,
       std::shared_ptr<const ContinuationSnapshot> snapshot,
       std::vector<std::uint8_t> input_identity,
       std::vector<ContinuationToken> live_tokens,
@@ -287,7 +331,8 @@ private:
       std::size_t* published_index = nullptr,
       std::size_t stable_prefix_tokens = 0,
       SnapshotPurpose purpose = SnapshotPurpose::kContinuation);
-  void Invalidate(std::size_t index, std::size_t reservation_bytes) noexcept;
+  void Invalidate(std::size_t index, std::size_t reservation_bytes,
+                  std::span<const SnapshotBlock> reservation_blocks) noexcept;
 
   struct Impl;
   std::unique_ptr<Impl> impl_;
