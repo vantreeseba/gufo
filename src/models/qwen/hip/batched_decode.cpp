@@ -562,7 +562,7 @@ QwenGpuExecutor::ForwardVerificationBatch(
         item.tokens.size() > executor->arena_.GetMaxContext() - item.position) {
       throw std::length_error("Qwen verification exceeds a session context");
     }
-    executor->arena_.InvalidateSnapshotKvFrom(item.position);
+    item.executor->arena_.InvalidateSnapshotKvFrom(item.position);
     offsets[index] = batch_size;
     batch_size += item.tokens.size();
   }
