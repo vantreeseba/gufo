@@ -30,8 +30,10 @@ the vendored llama.cpp-derived MMQ vector kernels for Q8_0 / Q4_K / Q5_K
 experts and the per-slot GEMV for the rest (Q6_K, BF16); their device context
 is bound at model load when the config reports an MoE architecture. The
 Q4_K / Q5_K routes cover UD-Q4_K_XL (Q4_K gate/up, Q5_K down, with Q5_K
-gate/up in one layer and Q6_K down in three); they compile but have not yet
-been run or benchmarked on hardware.
+gate/up in one layer and Q6_K down in three). On October 8, 2026 that file
+(21.3 GiB) ran at 3256 t/s for pp2048 and 60.2 t/s for tg128, and at 68.3 t/s
+with a DFlash2 draft; see [Benchmarks](BENCHMARKS.md#qwen36-35b-a3b-ud-q4_k_xl).
+Its MTP head has not been measured yet.
 
 | Mode | Selection | Behavior |
 | --- | --- | --- |
