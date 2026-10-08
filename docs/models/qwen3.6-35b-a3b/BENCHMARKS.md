@@ -104,6 +104,32 @@ The compiler matters on its own: the same source built with the ROCm 7.1
 compiler prefills about 2% slower (pp4096 2952 against 3004 t/s before the BF16
 route) and decodes at 54.2 against 55.5 t/s.
 
+## Qwen3.6 35B-A3B, UD-Q4_K_XL
+
+Measured October 8, 2026 on a development build of this branch with
+`GUFO_QWEN_WEIGHT_MEMORY=device`; the 21.28 GiB artifact loaded in about 10 s.
+The plain rows are a single repetition, the DFlash2 rows 3 repetitions. No
+llama.cpp run was made on this file.
+
+| Workload | t/s |
+| --- | ---: |
+| pp2048 | 3256.44 |
+| tg128 | 60.24 |
+
+With a DFlash2 draft (`Qwen3.6-35B-A3B-DFlash2-Q4_K_XL.gguf`,
+`--speculative dflash2`, default adaptive policy):
+
+| `--draft-tokens` | pp2048 (t/s) | tg128-dflash2 (t/s) | acceptance | gain over tg128 |
+| ---: | ---: | ---: | ---: | ---: |
+| 7 | 2986.41 ± 8.68 | 66.60 ± 0.04 | 0.326 | +10.6% |
+| 3 | 2982.47 ± 12.23 | 68.31 ± 0.03 | 0.438 | +13.4% |
+
+Prefill is about 8% slower with the draft loaded. Acceptance is on the
+benchmark's synthetic prompt, which drafts poorly, so these gains understate
+real text. MTP on this file has not been measured: its head failed to load
+(Q5_K `blk.40.ffn_down_exps`) until `657e451`, which has not been run on
+hardware.
+
 ## MTP decode
 
 | Quant, draft tokens | tg128-mtp (t/s) | tg128 without MTP (t/s) | gain |
