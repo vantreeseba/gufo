@@ -177,9 +177,12 @@ between active decode rounds without changing a lone request's kernel policy.
 
 `--cache-ram-bytes 0` (the default) selects an automatic snapshot budget capped
 at 32 GiB and half the available host RAM after model/state allocation, respecting
-container limits. 27B also checks HIP free memory. A positive value sets a byte
-cap that may exceed the automatic budget, up to the available host RAM minus
-4 GiB; the startup line reports both as `automatic_bytes` and `max_bytes`.
+container limits. Available RAM is `MemAvailable` minus `CmaFree`: free CMA
+pages, such as the kernel's KHO scratch area on Ubuntu 26.04, only hold
+movable pages, not GPU allocations. 27B also checks HIP free memory. A
+positive value sets a byte cap that may exceed the automatic budget, up to the
+available host RAM minus 4 GiB; the startup line reports both as
+`automatic_bytes` and `max_bytes`.
 Disk staging and temporary disk-save buffers are separate from this RAM budget.
 The 128 checkpoint records are independent of `--sessions`; more than one can
 belong to a conversation.
@@ -214,11 +217,11 @@ its changed suffix again.
 
 `SIGINT` and `SIGTERM` cancel active requests and drain accepted disk writes
 before exiting. `--cache-disk DIR` defaults to 8 GiB retained on disk.
-`--cache-disk-staging-bytes 0` (the default) selects the smallest of 1 GiB,
-one eighth of available host RAM after model/session loading (including cgroup
-limits), and the disk budget. This bounds queued captures/writes and each disk
-read separately; it allocates nothing upfront. Live model state and retained
-RAM snapshots have separate budgets.
+`--cache-disk-staging-bytes 0` (the default) selects the smaller of one eighth
+of available host RAM after model/session loading (including cgroup limits) and
+the disk budget. This bounds queued captures/writes and each disk read
+separately; it allocates nothing upfront. Live model state and retained RAM
+snapshots have separate budgets.
 
 Snapshots that exceed either limit are skipped with their required size and
 available budget logged; live conversation reuse remains available. Existing
@@ -554,7 +557,9 @@ it groups client-executed function tools for organization only, and its
 functions are flattened into the function list. Their `function_call` items
 keep the plain `name` and add the owning `namespace`, so clients can route
 them. Function names that collide across namespaces or with top-level
-functions are rejected. Standard Responses request fields with
+functions are rejected. Mid-conversation `system` and `developer` message
+items are accepted as in Chat Completions. Standard Responses request fields
+with
 no native effect are accepted and ignored so conforming clients interoperate
 (for example Codex): `include`, `reasoning.summary`, `text.verbosity`,
 `client_metadata` and `prompt_cache_key`.
@@ -590,12 +595,18 @@ The other compatibility routes are deliberately limited:
 | Route | Supported request | Output limit |
 | --- | --- | --- |
 | `/v1/completions` | One prompt string, buffered or SSE completion | `max_tokens` |
-| `/v1/messages` | Text messages and optional text system instructions | `max_tokens` |
+| `/v1/messages` | Text, thinking and tool blocks, optional text system instructions and custom tools; buffered or SSE | `max_tokens` |
 | `/completion` | One prompt string, non-streaming completion | `n_predict` |
 
 All four routes validate the loaded model, positive integer limits and shared
-sampling controls. Messages and `/completion` reject streaming; all reject
-multiple candidates. Responses and Messages honor the server's thinking defaults.
+sampling controls. `/completion` rejects streaming; all reject multiple
+candidates. Streamed Messages send Anthropic SSE events: `message_start`,
+`content_block_start`/`content_block_delta`/`content_block_stop` for
+`thinking` (`thinking_delta`), `text` (`text_delta`) and `tool_use`
+(`input_json_delta`) blocks, then `message_delta` with `stop_reason` and the
+complete usage, and `message_stop`. `message_start` reports zero usage because
+prompt accounting is final only at the end. A failure after the headers sends
+an `error` event. Responses and Messages honor the server's thinking defaults.
 Messages accepts `thinking.type` (`enabled`, `adaptive` or `disabled`);
 `adaptive` keeps the server's thinking default, and `budget_tokens` has no
 native equivalent, so the effort stays the server's unless
@@ -605,8 +616,13 @@ before the `text` block, with an empty `signature`, for every accepted
 `thinking` blocks unchanged so later turns reuse the cached prompt.
 `output_config.effort` (`low`, `medium`, `high`, `xhigh` or `max`) sets the
 reasoning effort used while thinking is on; it never enables thinking. Other
-`output_config` members are rejected. Messages rejects tools; use Chat
-Completions for tools. Completions routes accept `stop`;
+`output_config` members are rejected. Messages maps custom `tools`
+(`input_schema`) and `tool_choice` (`auto`, `any`, `tool`, `none`, with
+`disable_parallel_tool_use`) onto the Chat tool path, so framing, schema
+constraints and cache reuse match Chat Completions. Calls are returned as
+`tool_use` blocks with `stop_reason: "tool_use"`; replay them unchanged with
+the following `tool_result` blocks. Server tools such as `web_search` are
+rejected. Completions routes accept `stop`;
 Messages accepts `stop_sequences`. Responses has no stop-sequence field.
 `/infill` and `/v1/messages/count_tokens` return 501: suffix-conditioned infill
 and template-aware message counting are not implemented.
@@ -631,7 +647,13 @@ ordinary continuation.
 `POST /v1/chat/completions` accepts the common compatibility subset:
 
 - `model`
-- `messages`
+- `messages`: `system` and `developer` messages may appear at any position.
+  Agent clients such as Codex send them mid-conversation after context
+  compaction or when session settings change. DeepSeek renders them in place.
+  Qwen's template accepts only one leading system turn, so Qwen models hoist
+  them into it in their original relative order. That changes the prompt head:
+  the request that introduces such a message is prefilled again, and later
+  requests that keep it reuse the whole prompt
 - `max_tokens` or `max_completion_tokens`
 - `temperature`
 - `top_p`
@@ -871,6 +893,10 @@ as the bearer credential when it is set.
 
 ## Lifecycle and limits
 
+Qwen image inputs have no fixed image-count cap. Their expanded tokens must fit
+the model context; image-byte, pixel, request-body and read-time budgets still
+apply to the submitted history, including base64 images.
+
 The HTTP transport bounds connection count and request-body size. The scheduler
 bounds admission and output buffering and propagates client cancellation to
 model runners. An in-flight GPU operation may finish before its request retires.
@@ -1051,7 +1077,8 @@ lines (the ROCm model-cache and managed-KV lines, DSpark attachment, the shared
 batch workspace) are suppressed by `--log-level=warn`/`error` too.
 
 Prompt text, message bodies and API keys stay unlogged at every level, and debug
-lines use the same escaping and redaction as the rest of the log. Client
+lines use the same escaping and redaction as the rest of the log. Only the
+opt-in [content trace](#content-trace), a separate file, records content. Client
 identity is the exception: scheduler admission lines name a client by the peer
 address of its socket (`client_id=127.0.0.1` on the default loopback bind), so a
 public `--host` writes client IP addresses into the debug tier.
@@ -1063,6 +1090,50 @@ speed. Speculative requests also include accepted and proposed drafts. Progress
 lines are INFO-tier: `--log-level=warn` or `--log-level=error` would discard
 them, so the server rejects that combination at startup instead of ignoring the
 flag.
+
+### Content trace
+
+Some failures only show in the content itself, such as tool-call markup leaking
+into `content` or a history that the template renders differently. For those,
+start `gufo serve llm` with `--trace <PATH>`. The server appends one JSON
+object per line to `PATH` and logs `event=trace_enabled` at WARN. A new file is
+created readable and writable by its owner only; an existing file keeps its
+permissions. A path that cannot be opened fails startup before the model loads.
+
+Each request to `/v1/chat/completions`, `/v1/completions`, `/v1/responses`,
+`/v1/messages` or `/completion` writes three records. Every record has `time`,
+`event` and the `request` id shown in the `X-Request-ID` header and in the
+`request=rN` log lines:
+
+- `request`: `method`, `path` and the `body` as received.
+- `generation`, written by the scheduler shared by every text model: its
+  `generation` number (the `request=` value of scheduler debug and progress
+  lines), `max_tokens` after clamping to the context, the effective `sampling`,
+  `prompt_tokens`, `cache` (`memory`, `disk` or `miss`), `cached_tokens`, the
+  miss detail the completion log also reports, `generated_tokens`, `finish`,
+  `error` when generation failed, the `prompt` decoded from its tokens with
+  special tokens spelled out, and the raw `output` before reasoning and
+  tool-call parsing.
+- `response`: `status`, `outcome`, whether the reply was a `stream`, and the
+  `body` the client received. For a stream this is the event stream as
+  written, `: ping` keepalives included, so a difference between streaming and
+  non-streaming parsing shows up in the trace.
+
+A request that fails before generation, for example with invalid JSON, has
+no `generation` record. Requests refused before routing (malformed HTTP or an
+oversized body), unauthenticated requests and other routes are not traced.
+Malformed UTF-8 is replaced with U+FFFD. A record that cannot be written in
+full, for example on a full disk, is cut from the file and the first failure is
+logged as `event=trace_write_failed`; a file that cannot be cut back, such as a
+pipe, stops tracing with `event=trace_disabled`. To read one request:
+
+```sh
+jq 'select(.request == "r12")' trace.jsonl
+```
+
+The file holds prompts, tool results and generated text in full: treat it
+like the conversations themselves and delete it when done. It is never
+rotated or truncated.
 
 Text completion logs include stop/length/cancellation, queue and first-token
 latency, prefill/decode speed, execution width, memory/disk cache hits and reused

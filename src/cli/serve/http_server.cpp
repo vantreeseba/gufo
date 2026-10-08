@@ -41,6 +41,7 @@
 #include "src/cli/serve/openai_chat.hpp"
 #include "src/cli/serve/sampling_request.hpp"
 #include "src/cli/serve/stop_sequences.hpp"
+#include "src/cli/serve/trace.hpp"
 #include "src/cli/serve/tts_service.hpp"
 #include "src/cli/serve/video_api.hpp"
 #include "src/cli/serve/video_jobs.hpp"
@@ -296,6 +297,34 @@ bool HasHeader(const HttpResponse& response, std::string_view name) {
   });
 }
 
+// Text generation routes, whose bodies and replies `--trace` records. Media
+// routes carry audio, image and video payloads the trace does not explain.
+bool IsTracedRoute(const HttpRequest& req) {
+  return req.method == "POST" &&
+         (req.path == "/v1/completions" || req.path == "/v1/chat/completions" ||
+          req.path == "/v1/responses" || req.path == "/v1/messages" ||
+          req.path == "/completion");
+}
+
+void TraceRequest(const HttpRequest& req) {
+  auto record = Trace::Record("request", req.request_id);
+  record["method"] = req.method;
+  record["path"] = req.path;
+  record["body"] = Trace::Text(req.body);
+  Trace::Write(record);
+}
+
+void TraceResponse(std::string_view request_id, int status,
+                   std::string_view outcome, bool stream,
+                   std::string_view body) {
+  auto record = Trace::Record("response", request_id);
+  record["status"] = status;
+  record["outcome"] = std::string(outcome);
+  record["stream"] = stream;
+  record["body"] = Trace::Text(body);
+  Trace::Write(record);
+}
+
 bool IsEventStream(const HttpResponse& response) {
   return std::ranges::any_of(response.headers, [](const auto& header) {
     return ToLower(header.first) == "content-type" &&
@@ -484,7 +513,33 @@ bool ReadTextMessages(const json::Value* input,
   core::ImageReadBudget image_budget;
   if (input == nullptr || !input->is_array() || input->empty())
     return false;
+  // Responses replays one assistant turn as several reasoning, message and
+  // function_call items. A system/developer item between them would split
+  // that turn, so it waits until the next item that starts a new message.
+  std::vector<tokenization::ChatMessage> deferred;
+  const auto push = [&](tokenization::ChatMessage message) {
+    for (auto& system : deferred)
+      messages->push_back(std::move(system));
+    deferred.clear();
+    messages->push_back(std::move(message));
+  };
   for (const auto& item : input->items()) {
+    if (!responses && item.is_object() && item.find("content") &&
+        item.find("content")->is_array() &&
+        std::ranges::any_of(item.find("content")->items(),
+                            [](const auto& part) {
+                              return part.is_object() &&
+                                     (part.member_str("type") == "tool_use" ||
+                                      part.member_str("type") == "tool_result");
+                            })) {
+      std::string error;
+      if (!ParseAnthropicToolMessage(item, messages, &error)) {
+        if (parse_error && !error.empty())
+          *parse_error = std::move(error);
+        return false;
+      }
+      continue;
+    }
     if (responses && (item.member_str("type") == "function_call" ||
                       item.member_str("type") == "function_call_output")) {
       tokenization::ChatMessage message;
@@ -501,7 +556,7 @@ bool ReadTextMessages(const json::Value* input,
         calls.insert(calls.end(), message.tool_calls.begin(),
                      message.tool_calls.end());
       } else {
-        messages->push_back(std::move(message));
+        push(std::move(message));
       }
       continue;
     }
@@ -524,7 +579,7 @@ bool ReadTextMessages(const json::Value* input,
           return false;
         reasoning.thought += text->str();
       }
-      messages->push_back(std::move(reasoning));
+      push(std::move(reasoning));
       continue;
     }
     const auto role = item.member_str("role");
@@ -550,15 +605,25 @@ bool ReadTextMessages(const json::Value* input,
                        ? &message.thought
                        : nullptr))
       return false;
+    if (responses &&
+        (message.role == tokenization::ChatRole::kSystem ||
+         message.role == tokenization::ChatRole::kDeveloper) &&
+        !messages->empty() &&
+        messages->back().role == tokenization::ChatRole::kAssistant) {
+      deferred.push_back(std::move(message));
+      continue;
+    }
     if (responses && message.role == tokenization::ChatRole::kAssistant &&
         !messages->empty() &&
         messages->back().role == tokenization::ChatRole::kAssistant &&
         messages->back().content.empty() && !messages->back().thought.empty()) {
       messages->back().content = std::move(message.content);
     } else {
-      messages->push_back(std::move(message));
+      push(std::move(message));
     }
   }
+  for (auto& system : deferred)
+    messages->push_back(std::move(system));
   return true;
 }
 
@@ -578,6 +643,8 @@ struct CompatibilityAllowances {
   bool response_controls{false};
   bool thinking{false};
   bool output_config{false};
+  /// Messages tools and tool_choice; Responses uses response_controls.
+  bool tools{false};
 };
 
 // Validate the text subset before dispatch so a client never gets an answer
@@ -639,6 +706,7 @@ std::optional<HttpResponse> ReadCompatibilityOptions(
         !(field == "ignore_eos" && allowances.ignore_eos) &&
         !(field == "thinking" && allowances.thinking) &&
         !(field == "output_config" && allowances.output_config) &&
+        !((field == "tools" || field == "tool_choice") && allowances.tools) &&
         body.contains(field) &&
         !(allowances.response_controls &&
           (field == "text" || field == "reasoning" || field == "tools" ||
@@ -1122,10 +1190,14 @@ HttpResponse AnthropicMessages(const HttpRequest& req,
           ReadCompatibilityOptions(body, b, "max_tokens", &max_tokens,
                                    &sampling_config, chat.reasoning.enabled,
                                    {.stop_field = "stop_sequences",
+                                    .stream = true,
                                     .thinking = true,
-                                    .output_config = true})) {
+                                    .output_config = true,
+                                    .tools = true})) {
     return std::move(*error);
   }
+  if (auto error = ParseAnthropicToolControls(body, &chat))
+    return std::move(*error);
 
   std::vector<tokenization::ChatMessage> messages;
   if (const auto* system = body.find("system")) {
@@ -1136,10 +1208,12 @@ HttpResponse AnthropicMessages(const HttpRequest& req,
     messages.push_back(
         {tokenization::ChatRole::kSystem, std::move(text), "", ""});
   }
-  if (!ReadTextMessages(body.find("messages"), &messages)) {
-    return InvalidCompatibilityRequest(
-        "'messages' must contain text messages; use /v1/chat/completions "
-        "for images and tools");
+  std::string messages_error =
+      "'messages' must contain text, thinking, tool_use or tool_result "
+      "blocks; use /v1/chat/completions for images";
+  if (!ReadTextMessages(body.find("messages"), &messages, false,
+                        &messages_error)) {
+    return InvalidCompatibilityRequest(messages_error);
   }
 
   chat.messages = std::move(messages);
@@ -1148,50 +1222,9 @@ HttpResponse AnthropicMessages(const HttpRequest& req,
                                             StopSequenceFormat::kAnthropic,
                                             &chat.stop_sequences))
     return InvalidCompatibilityRequest(*error);
-  const auto initial = b.initial_output_state(chat);
-  const auto res = b.chat(chat, max_tokens, sampling_config, req.is_cancelled);
-  const auto generated =
-      SplitGeneratedText(core::Utf8Decoder{}.Push(res.text, true), initial);
-
-  json::Value resp = json::Value::object();
-  resp["id"] = "msg_" + RandomId();
-  resp["type"] = "message";
-  resp["role"] = "assistant";
-  resp["model"] = b.model_id();
-  json::Value content = json::Value::array();
-  if (!generated.reasoning.empty()) {
-    // Local reasoning is not signed; clients replay the block unchanged.
-    json::Value thinking = json::Value::object();
-    thinking["type"] = "thinking";
-    thinking["thinking"] = generated.reasoning;
-    thinking["signature"] = "";
-    content.push_back(std::move(thinking));
-  }
-  if (!generated.text.empty() || content.empty()) {
-    json::Value txt = json::Value::object();
-    txt["type"] = "text";
-    txt["text"] = generated.text;
-    content.push_back(std::move(txt));
-  }
-  resp["content"] = std::move(content);
-  resp["stop_reason"] =
-      res.finish_reason == TextGenerationBackend::FinishReason::kLength
-          ? "max_tokens"
-      : res.finish_reason == TextGenerationBackend::FinishReason::kStopSequence
-          ? "stop_sequence"
-          : "end_turn";
-  resp["stop_sequence"] =
-      res.finish_reason == TextGenerationBackend::FinishReason::kStopSequence
-          ? json::Value(res.stop_sequence)
-          : json::Value();
-  json::Value usage = json::Value::object();
-  usage["input_tokens"] = res.prompt_tokens;
-  usage["output_tokens"] = res.completion_tokens;
-  usage["cache_creation_input_tokens"] = 0;
-  usage["cache_read_input_tokens"] = res.cached_prompt_tokens;
-  resp["usage"] = std::move(usage);
-  resp["timings"] = GenerationTimings(res);
-  return WithTiming(Ok(resp), res);
+  return CreateAnthropicMessage(
+      req, b, chat, max_tokens, sampling_config,
+      body.find("stream") != nullptr && body.find("stream")->as_bool());
 } catch (const std::length_error& error) {
   return Err(400, "Bad Request", error.what(), "invalid_request_error",
              "context_length_exceeded");
@@ -1825,6 +1858,10 @@ void HttpServer::handle_connection(int client_fd) {
       ::inet_ntop(AF_INET, &peer.sin_addr, peer_address, sizeof(peer_address)))
     req.client_id = peer_address;
   req.request_id = "r" + std::to_string(next_request.fetch_add(1) + 1);
+  // Set for routes `--trace` records; `traced_stream` collects the body bytes
+  // a streaming reply delivered.
+  bool traced = false;
+  std::string traced_stream;
   bool response_started = false;
   bool http11 = false;
   int response_status = 0;
@@ -1833,6 +1870,17 @@ void HttpServer::handle_connection(int client_fd) {
                std::chrono::steady_clock::now() - start_time)
         .count();
   };
+  // A failure after a stream started keeps the bytes it already delivered.
+  const auto trace_failure = [&](const HttpResponse& error) {
+    if (traced)
+      TraceResponse(
+          req.request_id, response_started ? response_status : error.status,
+          response_started ? "stream_error" : "failed", response_started,
+          response_started ? traced_stream : error.body);
+  };
+  // Generation submitted on this thread, by the handler or by a stream body
+  // that defers it, names this request in its trace record.
+  const Trace::RequestScope trace_scope(req.request_id);
   try {
     bool ok = false;
     bool payload_too_large = false;
@@ -1960,6 +2008,12 @@ void HttpServer::handle_connection(int client_fd) {
     } else if (req.method == "OPTIONS") {
       resp = {.status = 204, .reason = "No Content"};
     } else {
+      // A client without the API key cannot write into the trace.
+      traced = Trace::Enabled() && IsTracedRoute(req) &&
+               IsAuthorized(req, api_key_hash_);
+      if (traced) {
+        TraceRequest(req);
+      }
       resp = handle_request(req);
     }
 
@@ -2001,6 +2055,8 @@ void HttpServer::handle_connection(int client_fd) {
           }
           if (connected && !chunk.empty()) {
             last_write = std::chrono::steady_clock::now();
+            if (traced)
+              traced_stream.append(chunk);
           }
           return connected;
         };
@@ -2027,6 +2083,8 @@ void HttpServer::handle_connection(int client_fd) {
                 connected = chunked ? SendChunk(client_fd, ": ping\n\n")
                                     : SendAll(client_fd, ": ping\n\n");
                 last_write = std::chrono::steady_clock::now();
+                if (traced && connected)
+                  traced_stream.append(": ping\n\n");
               }
             }
           });
@@ -2069,6 +2127,11 @@ void HttpServer::handle_connection(int client_fd) {
                          elapsed_ms(), resp.log_details, outcome,
                          request_level);
     }
+    if (traced) {
+      const bool stream = static_cast<bool>(resp.streaming_body);
+      TraceResponse(req.request_id, resp.status, outcome, stream,
+                    stream ? traced_stream : resp.body);
+    }
   } catch (const TextGenerationError& exception) {
     const auto duration_ms = std::chrono::duration<double, std::milli>(
                                  std::chrono::steady_clock::now() - start_time)
@@ -2090,6 +2153,7 @@ void HttpServer::handle_connection(int client_fd) {
                        duration_ms,
                        std::string("error_code=") + exception.stable_code(),
                        response_started ? "stream_error" : "failed");
+    trace_failure(resp);
     if (!response_started)
       (void)SendAll(client_fd, BuildResponse(resp));
   } catch (const std::exception& e) {
@@ -2104,6 +2168,7 @@ void HttpServer::handle_connection(int client_fd) {
                        response_started ? response_status : resp.status,
                        duration_ms, "error_code=server_exception",
                        response_started ? "stream_error" : "failed");
+    trace_failure(resp);
     if (!response_started)
       (void)SendAll(client_fd, BuildResponse(resp));
   } catch (...) {
@@ -2118,6 +2183,7 @@ void HttpServer::handle_connection(int client_fd) {
                        response_started ? response_status : resp.status,
                        duration_ms, "error_code=server_exception",
                        response_started ? "stream_error" : "failed");
+    trace_failure(resp);
     if (!response_started)
       (void)SendAll(client_fd, BuildResponse(resp));
   }

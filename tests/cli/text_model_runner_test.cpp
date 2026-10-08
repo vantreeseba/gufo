@@ -20,7 +20,11 @@
 #include <vector>
 
 #include "src/core/json.hpp"
+#include "src/models/qwen/control_tokens.hpp"
 #include "src/models/qwen/vision/prompt.hpp"
+
+using gufo::tokenization::kImEnd;
+using gufo::tokenization::kImStart;
 
 namespace {
 
@@ -474,6 +478,118 @@ public:
     ++stats_->snapshot_restores;
   }
 };
+
+class InPassRunner final : public SnapshotRunner {
+public:
+  using SnapshotRunner::SnapshotRunner;
+  bool fail_after_prefill{false};
+  TextRunnerDescriptor Descriptor() const override {
+    auto descriptor = SnapshotRunner::Descriptor();
+    descriptor.capabilities.in_pass_checkpoint = true;
+    return descriptor;
+  }
+  std::optional<std::size_t> PrefillCheckpointBytes(
+      const TextRunnerState&, std::span<const TextRunnerToken> prompt,
+      std::size_t offset, std::size_t budget,
+      std::size_t boundary) const override {
+    if (boundary <= offset ||
+        boundary >= std::min(prompt.size(), offset + budget))
+      return std::nullopt;
+    return sizeof(FakeSnapshot);
+  }
+  TextPrefillStep PrefillThrough(
+      TextRunnerState& state, std::span<const TextRunnerToken> prompt,
+      std::size_t offset, std::size_t budget, std::size_t boundary,
+      std::unique_ptr<TextRunnerSnapshot>* checkpoint) const override {
+    ++stats_->snapshot_captures;
+    *checkpoint = std::make_unique<FakeSnapshot>(boundary, 0, 90);
+    auto step = FakeRunner::Prefill(state, prompt, offset, budget);
+    if (fail_after_prefill) {
+      auto& fake = RequireFakeState(state);
+      fake.decode_count = 7;
+      fake.frontier = 777;
+      throw std::runtime_error("injected in-pass failure after state mutation");
+    }
+    step.checkpoint_ms = 2;
+    return step;
+  }
+};
+
+void TestInPassStableCheckpoint() {
+  auto stats = std::make_shared<FakeStats>();
+  TextRunnerPool pool(std::make_shared<InPassRunner>(stats), 1);
+  auto first = pool.Acquire({1, 2, 3, 40, 41}, {}, {}, {}, true, 3);
+  const auto step = first.Prefill(64);
+  Expect(step.consumed_tokens == 5 && step.decode_ready,
+         "in-pass checkpoint completes framing in the same forward");
+  Expect(stats->snapshot_captures == 1 &&
+             stats->prefill_spans == std::vector<std::size_t>{5},
+         "one prefill captures the stable boundary before mutation");
+  const auto commit = first.Commit();
+  Expect(commit.snapshot_ms >= 2,
+         "in-pass capture contributes to snapshot phase timing");
+  auto second = pool.Acquire({1, 2, 3, 50, 51, 7, 40, 41}, {}, {}, {}, true, 6);
+  Expect(second.cached_prompt_tokens() == 3,
+         "rewritten framing restores the in-pass boundary");
+  Expect(second.Prefill(64).decode_ready,
+         "warm rewritten turn captures its next boundary in one pass");
+  second.Commit();
+  auto third = pool.Acquire({1, 2, 3, 50, 51, 7, 60, 61}, {}, {}, {}, true, 6);
+  Expect(third.cached_prompt_tokens() == 6,
+         "the stable checkpoint advances on warm turns");
+  third.Invalidate();
+}
+
+void TestInPassFailureRetainsOnlyCompletedCheckpoints() {
+  auto stats = std::make_shared<FakeStats>();
+  // Both the old fallback and the next stable boundary fit, with no spare
+  // reservation. A leaked reservation would force the old fallback out.
+  auto runner =
+      std::make_shared<InPassRunner>(stats, 64, 256, 2 * sizeof(FakeSnapshot));
+  TextRunnerPool pool(runner, 1);
+  auto seed = pool.Acquire({1, 2, 3, 40, 41}, {}, {}, {}, true, 3);
+  Expect(seed.Prefill(64).decode_ready, "seed reaches its decode frontier");
+  seed.Cancel();  // Retain the stable checkpoint without a full-prompt copy.
+
+  auto failed = pool.Acquire({1, 2, 3, 50, 51, 7, 40, 41}, {}, {}, {}, true, 6);
+  Expect(failed.cached_prompt_tokens() == 3,
+         "rewritten framing starts from the immutable fallback");
+  runner->fail_after_prefill = true;
+  bool saw_failure = false;
+  try {
+    (void)failed.Prefill(64);
+  } catch (const std::runtime_error& error) {
+    saw_failure = std::string_view(error.what()) ==
+                  "injected in-pass failure after state mutation";
+  }
+  Expect(saw_failure, "in-pass prefill fails after changing the fake state");
+  failed.Cancel();
+  runner->fail_after_prefill = false;
+
+  auto retry = pool.Acquire({1, 2, 3, 50, 51, 7, 40, 41}, {}, {}, {}, true, 6);
+  Expect(retry.cached_prompt_tokens() == 3 &&
+             retry.cache_restore_bytes() == sizeof(FakeSnapshot),
+         "cancel restores the immutable fallback, not the failed frontier");
+  const auto step = retry.Prefill(64);
+  Expect(step.consumed_tokens == 5 && step.decode_ready,
+         "retry recomputes all work from the failed in-pass operation");
+  Expect(retry.SelectNext().token == 90,
+         "retry does not inherit the failed operation's decode state");
+  retry.Advance();
+  retry.Commit();
+
+  auto old_branch = pool.Acquire({1, 2, 3, 70, 71}, {}, {}, {}, true, 3);
+  Expect(old_branch.cached_prompt_tokens() == 3 &&
+             old_branch.cache_restore_bytes() == sizeof(FakeSnapshot),
+         "released reservation lets the old fallback survive the healthy turn");
+  old_branch.Invalidate();
+  auto new_branch =
+      pool.Acquire({1, 2, 3, 50, 51, 7, 60, 61}, {}, {}, {}, true, 6);
+  Expect(new_branch.cached_prompt_tokens() == 6 &&
+             new_branch.cache_restore_bytes() == sizeof(FakeSnapshot),
+         "healthy retry also retains its newly completed stable boundary");
+  new_branch.Invalidate();
+}
 
 class PersistentSnapshotRunner final : public SnapshotRunner {
 public:
@@ -1164,6 +1280,22 @@ void TestHistoryEditsRestoreIntermediateCheckpoints() {
   Expect(aligned_next.cached_prompt_tokens() == 4096,
          "an aligned stable boundary remains reusable after assistant changes");
   aligned_next.Invalidate();
+
+  auto tail_stats = std::make_shared<FakeStats>();
+  TextRunnerPool tail_pool(
+      std::make_shared<LongSnapshotRunner>(tail_stats, 64, 256, 4096), 1);
+  auto near_end = tail_pool.Acquire(std::vector<TextRunnerToken>(2100, 1));
+  Expect(near_end.Prefill(32768).decode_ready &&
+             tail_stats->prefill_spans == std::vector<std::size_t>{2100},
+         "a grid point near the prompt end does not split the final prefill");
+  near_end.Invalidate();
+  tail_stats->prefill_spans.clear();
+  auto past_tail = tail_pool.Acquire(std::vector<TextRunnerToken>(2300, 2));
+  while (!past_tail.prefill_complete())
+    (void)past_tail.Prefill(32768);
+  Expect(tail_stats->prefill_spans == std::vector<std::size_t>{2048, 252},
+         "a grid point farther from the prompt end is still retained");
+  past_tail.Invalidate();
 }
 
 /// A client that rewrites the assistant turn, as one that drops reasoning
@@ -1459,6 +1591,53 @@ void TestRamLearnsDivergenceBoundaries() {
              request.Prefill(4096).consumed_tokens == 600,
          "a late divergence does not stop prefill for another checkpoint");
   request.Invalidate();
+}
+
+void TestLearnedBoundarySurvivesExactRepublication() {
+  // A request for exactly the learned prefix publishes the same tokens again.
+  // Uncached, it replaces the learned checkpoint, in place or, with a full
+  // budget, after admission reclaims the old copy. Either way the copy must
+  // stay a branch point, or it ranks as redundant once the older branch is
+  // gone and the next new branch retires it.
+  for (const auto [full, reuse] :
+       {std::pair{false, true}, std::pair{false, false}, std::pair{true, true},
+        std::pair{true, false}}) {
+    auto stats = std::make_shared<FakeStats>();
+    // Room for five snapshots, so unrelated prompts force evictions, or for
+    // three, so republication itself must evict.
+    auto runner = std::make_shared<PersistentSnapshotRunner>(
+        stats, "republished-boundary", (full ? 3 : 5) * sizeof(FakeSnapshot),
+        4096);
+    TextRunnerPool pool(runner, 1);
+    const std::vector<TextRunnerToken> shared(1000, 100);
+    const auto run = [&](std::vector<TextRunnerToken> prompt,
+                         bool reuse_prompt = true) {
+      auto request = pool.Acquire(std::move(prompt), {}, {}, {}, reuse_prompt);
+      const auto cached = request.cached_prompt_tokens();
+      while (!request.prefill_complete())
+        (void)request.Prefill(4096);
+      (void)request.Commit();
+      return cached;
+    };
+    const auto branch = [&](TextRunnerToken tail) {
+      auto prompt = shared;
+      prompt.insert(prompt.end(), 600, tail);
+      return prompt;
+    };
+    (void)run(branch(10000));
+    (void)run(branch(20000));  // Learns the branch point after 1000 tokens.
+    if (full)
+      (void)run({9, 9, 9});  // Fills the budget and evicts the older branch.
+    (void)run(shared, reuse);
+    if (!full) {
+      for (const TextRunnerToken token : {9U, 8U, 7U, 6U})
+        (void)run({token, token, token});
+    }
+    Expect(run(branch(30000)) == 1000,
+           "republishing the learned prefix keeps it a branch point");
+    Expect(run(branch(40000)) == 1000,
+           "a new branch does not retire the republished branch point");
+  }
 }
 
 void TestCoincidentCacheBoundariesShareOneCopy() {
@@ -1880,6 +2059,25 @@ void TestSnapshotCacheCapacityIsReportedAtStartup() {
   }
 }
 
+void TestMeminfoAvailableExcludesFreeCma() {
+  using gufo::server::MeminfoAvailableBytes;
+  constexpr std::uint64_t kib = 1024;
+  // Ubuntu 26.04's KHO scratch reports free CMA pages with CmaTotal 0.
+  Expect(MeminfoAvailableBytes("MemTotal:       131072000 kB\n"
+                               "MemAvailable:   100000000 kB\n"
+                               "CmaTotal:               0 kB\n"
+                               "CmaFree:         13034628 kB\n") ==
+             (100000000 - 13034628) * kib,
+         "free CMA pages are not available for snapshots");
+  Expect(MeminfoAvailableBytes("MemAvailable:   8000000 kB\n") == 8000000 * kib,
+         "MemAvailable is used unchanged without a CmaFree line");
+  Expect(
+      MeminfoAvailableBytes("CmaFree:  9000 kB\nMemAvailable:  4000 kB\n") == 0,
+      "free CMA beyond MemAvailable saturates at zero");
+  Expect(!MeminfoAvailableBytes("MemTotal:  4000 kB\nCmaFree:  10 kB\n"),
+         "missing MemAvailable keeps the caller's fallback");
+}
+
 void TestSnapshotStartupReportsSelectedLimits() {
   class ChangingHeadroomRunner final : public SnapshotRunner {
   public:
@@ -1987,8 +2185,9 @@ void TestServerInstructionsAreFraming() {
   for (int i = 0; i < 256; ++i)
     vocab.emplace_back(1, static_cast<char>(i));
   std::unordered_map<std::string, TokenId> specials;
-  for (const auto* token : {"<|im_start|>", "<|im_end|>", "<think>", "</think>",
-                            "<tool_call>", "</tool_call>"}) {
+  for (std::string_view token : std::initializer_list<std::string_view>{
+           kImStart, kImEnd, "<think>", "</think>", "<tool_call>",
+           "</tool_call>"}) {
     specials.emplace(token, vocab.size());
     vocab.emplace_back(token);
   }
@@ -2183,6 +2382,8 @@ int main() {
   // The cache warning assertion in this binary matches the plain "[WARN]
   // [cache]" text captured from a redirected sink; a TTY stderr tints it.
   ::setenv("NO_COLOR", "1", 1);
+  TestInPassStableCheckpoint();
+  TestInPassFailureRetainsOnlyCompletedCheckpoints();
   TestNewImageGetsAStableCheckpoint();
   TestGeneratedFrontierForksBeforeMutation();
   TestGeneratedFrontierPersistsForForks();
@@ -2221,10 +2422,12 @@ int main() {
       "evicting a retained prefix for entry capacity is reported");
 
   TestSnapshotCacheCapacityIsReportedAtStartup();
+  TestMeminfoAvailableExcludesFreeCma();
   TestSnapshotStartupReportsSelectedLimits();
   TestPersistentSnapshotRestoresAcrossPools();
   TestSharedPrefixIsLearnedAndRestoredAcrossConversations();
   TestRamLearnsDivergenceBoundaries();
+  TestLearnedBoundarySurvivesExactRepublication();
   TestCoincidentCacheBoundariesShareOneCopy();
   TestMeasuredStateIsReconciledWithClaim();
   TestSnapshotBudgetRefusalDoesNotFailCompletedRequest();

@@ -10,6 +10,8 @@
 #include <chrono>
 #include <csignal>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -20,8 +22,10 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include "src/cli/serve/logging.hpp"
+#include "src/cli/serve/trace.hpp"
 
 namespace {
 
@@ -74,6 +78,7 @@ public:
     gufo::sampling::SamplingConfig sampling;
     std::string client_id;
     std::vector<std::string> stop_sequences;
+    std::string trace_request;
   };
   Call LastCall() {
     const std::lock_guard lock(mutex_);
@@ -168,7 +173,8 @@ public:
                .max_tokens = limit,
                .sampling = sampling,
                .client_id = std::string(client_id),
-               .stop_sequences = stop_sequences};
+               .stop_sequences = stop_sequences,
+               .trace_request = gufo::server::Trace::CurrentRequest()};
       result.text = output_;
     }
     result.prompt_tokens = 10;
@@ -473,6 +479,141 @@ void TestRequestLogging() {
   assert(debug.text.find("private-prompt") == std::string::npos);
   // Options are echoed by `gufo serve`, not by the HTTP layer itself.
   assert(debug.text.find("event=options") == std::string::npos);
+}
+
+std::string ResponseRequestId(const std::string& response) {
+  const auto header = response.find("X-Request-ID: ");
+  assert(header != std::string::npos);
+  const auto begin = header + std::string("X-Request-ID: ").size();
+  return response.substr(begin, response.find("\r\n", begin) - begin);
+}
+
+// The body of a chunked HTTP/1.1 response, as the client reassembles it.
+std::string ChunkedBody(const std::string& response) {
+  std::size_t cursor = response.find("\r\n\r\n");
+  assert(cursor != std::string::npos);
+  cursor += 4;
+  std::string body;
+  for (;;) {
+    const auto line_end = response.find("\r\n", cursor);
+    assert(line_end != std::string::npos);
+    const auto size =
+        std::stoul(response.substr(cursor, line_end - cursor), nullptr, 16);
+    if (size == 0) {
+      return body;
+    }
+    body += response.substr(line_end + 2, size);
+    cursor = line_end + 2 + size + 2;
+  }
+}
+
+// `--trace` keeps what a text request carried in and out under the id the
+// logs name. Polls, other routes and unauthenticated requests stay out.
+void TestContentTrace() {
+  namespace fs = std::filesystem;
+  using gufo::server::Trace;
+  const auto path =
+      fs::temp_directory_path() /
+      ("gufo-trace-test-" + std::to_string(::getpid()) + ".jsonl");
+  fs::remove(path);
+  assert(!Trace::Open(path.string()).has_value());
+  std::string plain_id;
+  std::string stream_id;
+  std::string stream_wire;
+  std::string invalid_id;
+  {
+    RunningServer server(
+        {.api_key = "test-secret",
+         .sse_heartbeat_interval = std::chrono::milliseconds(5)});
+    server.backend->SetOutput("<tool_call>leak");
+    const auto post = [&](std::string_view route, std::string_view body,
+                          bool authorized = true) {
+      return server.Send(
+          "POST " + std::string(route) + " HTTP/1.1\r\n" +
+          (authorized ? "Authorization: Bearer test-secret\r\n" : "") +
+          "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" +
+          std::string(body));
+    };
+    const auto plain = post("/v1/completions",
+                            R"({"prompt":"private-prompt","max_tokens":8})");
+    ExpectStatus(plain, 200);
+    plain_id = ResponseRequestId(plain);
+    // The id is bound where the backend generates, so the scheduler's record
+    // can name it.
+    assert(server.backend->LastCall().trace_request == plain_id);
+    // Admission commits the stream before a slow first token, so keepalives
+    // reach the client and must reach the trace too.
+    server.backend->admit = true;
+    server.backend->token_delay = std::chrono::milliseconds(40);
+    const auto streamed =
+        post("/v1/completions",
+             R"({"prompt":"streamed-prompt","max_tokens":8,"stream":true})");
+    ExpectStatus(streamed, 200);
+    stream_id = ResponseRequestId(streamed);
+    stream_wire = ChunkedBody(streamed);
+    assert(stream_wire.find(": ping\n\n") != std::string::npos);
+    assert(server.backend->LastCall().trace_request == stream_id);
+    const auto invalid = post("/v1/completions", "{");
+    ExpectStatus(invalid, 400);
+    invalid_id = ResponseRequestId(invalid);
+    ExpectStatus(
+        post("/v1/completions", R"({"prompt":"unauthorized-prompt"})", false),
+        401);
+    ExpectStatus(post("/echo", "echo-body"), 200);
+    ExpectStatus(server.Send("GET /health HTTP/1.1\r\nAuthorization: Bearer "
+                             "test-secret\r\n\r\n"),
+                 200);
+  }
+  Trace::Close();
+
+  assert((fs::status(path).permissions() & fs::perms::all) ==
+         (fs::perms::owner_read | fs::perms::owner_write));
+  std::vector<gufo::json::Value> records;
+  {
+    std::ifstream input(path);
+    for (std::string line; std::getline(input, line);) {
+      assert(line.find("unauthorized-prompt") == std::string::npos);
+      assert(line.find("echo-body") == std::string::npos);
+      records.push_back(gufo::json::parse(line));
+    }
+  }
+  fs::remove(path);
+  assert(records.size() == 6);
+  const auto record = [&](std::string_view event,
+                          const std::string& id) -> const gufo::json::Value& {
+    for (const auto& candidate : records) {
+      if (candidate.member_str("event") == event &&
+          candidate.member_str("request") == id) {
+        assert(!candidate.member_str("time").empty());
+        return candidate;
+      }
+    }
+    std::abort();
+  };
+
+  const auto& request = record("request", plain_id);
+  assert(request.member_str("method") == "POST");
+  assert(request.member_str("path") == "/v1/completions");
+  assert(request.member_str("body") ==
+         R"({"prompt":"private-prompt","max_tokens":8})");
+  const auto& reply = record("response", plain_id);
+  assert(reply.member_size("status") == 200);
+  assert(reply.member_str("outcome") == "completed");
+  assert(!reply.find("stream")->as_bool());
+  const auto body = gufo::json::parse(reply.member_str("body"));
+  assert(body.find("choices")->items()[0].member_str("text") ==
+         "<tool_call>leak");
+
+  assert(
+      record("request", stream_id).member_str("body").find("streamed-prompt") !=
+      std::string::npos);
+  const auto& streamed = record("response", stream_id);
+  assert(streamed.find("stream")->as_bool());
+  assert(streamed.member_str("body") == stream_wire);
+  assert(stream_wire.find("<tool_call>leak") != std::string::npos);
+
+  assert(record("request", invalid_id).member_str("body") == "{");
+  assert(record("response", invalid_id).member_size("status") == 400);
 }
 
 // The threshold covers the lifecycle lines too: `--log-level=warn|error` boots
@@ -863,7 +1004,8 @@ void TestCompatibilityRequests() {
           "output_config", "logit_bias", "ignore_eos"}) {
       const std::string_view path(endpoint.path);
       const std::string_view name(field);
-      if ((path == "/v1/responses" || path == "/v1/completions") &&
+      if ((path == "/v1/responses" || path == "/v1/completions" ||
+           path == "/v1/messages") &&
           name == "stream")
         continue;
       if (path == "/v1/completions" && name == "ignore_eos")
@@ -1008,6 +1150,66 @@ void TestCompatibilityRequests() {
         {"type":"reasoning","id":"rs_1",
          "summary":[],"encrypted_content":"gAAAA"}]})");
   ExpectStatus(opaque_replay, 400);
+
+  // Codex re-sends developer items mid-conversation. They stay in place, so
+  // the prompt before them is unchanged and reusable.
+  const auto in_place =
+      response_body(server.Post("/v1/responses",
+                                R"({"instructions":"Base rules.","input":[
+        {"role":"user","content":"first"},
+        {"type":"message","role":"assistant","content":[
+          {"type":"output_text","text":"noted","annotations":[]}]},
+        {"type":"message","role":"developer","content":[
+          {"type":"input_text","text":"Compacted state"}]},
+        {"role":"user","content":"second"}]})"));
+  assert(in_place.member_str("status") == "completed");
+  const auto in_place_messages = server.backend->LastCall().chat.messages;
+  assert(in_place_messages.size() == 5 &&
+         in_place_messages[0].role == gufo::tokenization::ChatRole::kSystem &&
+         in_place_messages[0].content == "Base rules." &&
+         in_place_messages[1].content == "first" &&
+         in_place_messages[2].content == "noted" &&
+         in_place_messages[3].role ==
+             gufo::tokenization::ChatRole::kDeveloper &&
+         in_place_messages[3].content == "Compacted state" &&
+         in_place_messages[4].content == "second");
+
+  // A developer item inside a replayed reasoning/function_call group waits
+  // for the group to end instead of splitting the assistant turn.
+  const auto replay_items = gufo::json::parse(R"([
+      {"role":"user","content":"Check state."},
+      {"type":"reasoning","summary":[
+        {"type":"summary_text","text":"I will inspect."}]},
+      {"type":"function_call","call_id":"call_1","name":"lookup",
+       "arguments":"{\"key\":\"state\"}"},
+      {"type":"function_call_output","call_id":"call_1","output":"OK"}])");
+  const auto developer =
+      gufo::json::parse(R"({"role":"developer","content":"Follow policy."})");
+  for (const std::size_t position : {2U, 3U}) {
+    auto input = gufo::json::Value::array();
+    for (std::size_t i = 0; i < replay_items.size(); ++i) {
+      if (i == position)
+        input.push_back(developer);
+      input.push_back(replay_items.items()[i]);
+    }
+    auto body = gufo::json::Value::object();
+    body["input"] = std::move(input);
+    const auto replay =
+        response_body(server.Post("/v1/responses", body.dump()));
+    assert(replay.member_str("status") == "completed");
+    const auto grouped = server.backend->LastCall().chat.messages;
+    assert(grouped.size() == 4);
+    assert(grouped[0].role == gufo::tokenization::ChatRole::kUser &&
+           grouped[1].role == gufo::tokenization::ChatRole::kAssistant &&
+           grouped[1].content.empty() &&
+           grouped[1].thought == "I will inspect." &&
+           grouped[1].tool_calls.size() == 1 &&
+           grouped[1].tool_calls[0].id == "call_1" &&
+           grouped[2].role == gufo::tokenization::ChatRole::kDeveloper &&
+           grouped[2].content == "Follow policy." &&
+           grouped[3].role == gufo::tokenization::ChatRole::kTool &&
+           grouped[3].tool_call_id == "call_1" && grouped[3].content == "OK");
+  }
 
   // The Responses API carries request-only fields with no native effect here
   // (hosted tool types, include, reasoning.summary, text.verbosity). Accept
@@ -1188,6 +1390,244 @@ void TestCompatibilityRequests() {
   assert(server.backend->LastCall().chat.reasoning.enabled == false);
   assert(server.backend->LastCall().chat.reasoning.effort ==
          gufo::ReasoningEffort::kLow);
+
+  // Messages tools map onto the Chat tool path: declarations, tool_choice,
+  // tool_use output and replayed tool_use/tool_result history.
+  const std::string weather_tool = R"([{"name":"get_weather",
+      "description":"Get weather","input_schema":{"type":"object",
+      "properties":{"city":{"type":"string"}},"required":["city"]}}])";
+  server.backend->SetOutput(
+      "<tool_call>\n<function=get_weather>\n<parameter=city>\nRome\n"
+      "</parameter>\n</function>\n</tool_call>");
+  const auto called = response_body(server.Post(
+      "/v1/messages", R"({"max_tokens":64,"tool_choice":{"type":"any"},
+          "messages":[{"role":"user","content":"weather in Rome?"}],
+          "tools":)" + weather_tool +
+                          "}"));
+  assert(called.member_str("stop_reason") == "tool_use");
+  const auto call_blocks = called.find("content")->items();
+  assert(call_blocks.size() == 1 &&
+         call_blocks[0].member_str("type") == "tool_use" &&
+         !call_blocks[0].member_str("id").empty() &&
+         call_blocks[0].member_str("name") == "get_weather" &&
+         call_blocks[0].find("input")->member_str("city") == "Rome");
+  const auto declared = server.backend->LastCall().chat;
+  assert(declared.tools.size() == 1 &&
+         declared.tools[0].name == "get_weather" &&
+         declared.tools[0].description == "Get weather" &&
+         declared.tool_choice ==
+             gufo::server::ChatRequest::ToolChoice::kRequired &&
+         declared.constrained_tools);
+  response_body(server.Post("/v1/messages",
+                            R"({"messages":[{"role":"user","content":"hi"}],
+          "tool_choice":{"type":"tool","name":"get_weather"},
+          "tools":)" + weather_tool +
+                                "}"));
+  assert(server.backend->LastCall().chat.forced_tool_name == "get_weather" &&
+         !server.backend->LastCall().chat.parallel_tool_calls);
+  response_body(server.Post("/v1/messages",
+                            R"({"messages":[{"role":"user","content":"hi"}],
+          "tool_choice":{"type":"auto","disable_parallel_tool_use":true},
+          "tools":)" + weather_tool +
+                                "}"));
+  assert(server.backend->LastCall().chat.tool_choice ==
+             gufo::server::ChatRequest::ToolChoice::kAuto &&
+         !server.backend->LastCall().chat.parallel_tool_calls);
+  response_body(server.Post("/v1/messages",
+                            R"({"messages":[{"role":"user","content":"hi"}],
+          "tool_choice":{"type":"none"},"tools":)" +
+                                weather_tool + "}"));
+  assert(server.backend->LastCall().chat.tool_choice ==
+             gufo::server::ChatRequest::ToolChoice::kNone &&
+         !server.backend->LastCall().chat.constrained_tools);
+
+  server.backend->SetOutput("It is sunny.");
+  const auto answered = response_body(server.Post("/v1/messages", R"({
+      "tools":)" + weather_tool + R"(,"messages":[
+        {"role":"user","content":"weather in Rome?"},
+        {"role":"assistant","content":[
+          {"type":"thinking","thinking":"look it up","signature":""},
+          {"type":"text","text":"Checking."},
+          {"type":"tool_use","id":"toolu_1","name":"get_weather",
+           "input":{"city":"Rome"}}]},
+        {"role":"user","content":[
+          {"type":"tool_result","tool_use_id":"toolu_1","content":"sunny"},
+          {"type":"tool_result","tool_use_id":"toolu_2","is_error":true,
+           "content":[{"type":"text","text":"timeout"}]},
+          {"type":"text","text":"thanks"}]}]})"));
+  assert(answered.member_str("stop_reason") == "end_turn" &&
+         answered.find("content")->items()[0].member_str("text") ==
+             "It is sunny.");
+  const auto history = server.backend->LastCall().chat.messages;
+  assert(history.size() == 5);
+  assert(history[1].role == gufo::tokenization::ChatRole::kAssistant &&
+         history[1].thought == "look it up" &&
+         history[1].content == "Checking." &&
+         history[1].tool_calls.size() == 1 &&
+         history[1].tool_calls[0].id == "toolu_1" &&
+         history[1].tool_calls[0].name == "get_weather" &&
+         history[1].tool_calls[0].arguments.size() == 1 &&
+         history[1].tool_calls[0].arguments[0].name == "city" &&
+         history[1].tool_calls[0].arguments[0].value == "Rome");
+  assert(history[2].role == gufo::tokenization::ChatRole::kTool &&
+         history[2].tool_call_id == "toolu_1" && history[2].content == "sunny");
+  assert(history[3].role == gufo::tokenization::ChatRole::kTool &&
+         history[3].tool_call_id == "toolu_2" &&
+         history[3].content == "timeout");
+  assert(history[4].role == gufo::tokenization::ChatRole::kUser &&
+         history[4].content == "thanks");
+
+  const auto calls_before = server.backend->calls.load();
+  for (const auto& invalid : std::vector<std::string>{
+           R"({"messages":[{"role":"user","content":"hi"}],"tools":{}})",
+           R"({"messages":[{"role":"user","content":"hi"}],
+               "tools":[{"type":"web_search_20250305","name":"web_search"}]})",
+           R"({"messages":[{"role":"user","content":"hi"}],
+               "tools":[{"name":"f"}]})",
+           R"({"messages":[{"role":"user","content":"hi"}],
+               "tool_choice":{"type":"any"}})",
+           R"({"messages":[{"role":"user","content":"hi"}],
+               "tool_choice":"auto","tools":)" +
+               weather_tool + "}",
+           R"({"messages":[{"role":"user","content":"hi"}],
+               "tool_choice":{"type":"auto","disable_parallel_tool_use":1},
+               "tools":)" +
+               weather_tool + "}",
+           R"({"messages":[{"role":"assistant","content":[{"type":"tool_use",
+               "id":"toolu_1","name":"f","input":"{}"}]}]})",
+           R"({"messages":[{"role":"assistant","content":[{"type":"tool_use",
+               "name":"f","input":{}}]}]})",
+           R"({"messages":[{"role":"user","content":[{"type":"tool_result",
+               "content":"x"}]}]})",
+           R"({"messages":[{"role":"user","content":[{"type":"tool_result",
+               "tool_use_id":"toolu_1","content":[{"type":"image"}]}]}]})",
+       })
+    ExpectStatus(server.Post("/v1/messages", invalid), 400);
+  assert(server.backend->calls == calls_before);
+  // A turn cut by max_tokens reports the cut, as Chat finish_reason does,
+  // even when a complete call precedes it.
+  server.backend->SetOutput(
+      "<tool_call>\n<function=get_weather>\n<parameter=city>\nRome\n"
+      "</parameter>\n</function>\n</tool_call>");
+  const auto truncated = response_body(server.Post(
+      "/v1/messages", R"({"max_tokens":1,"tool_choice":{"type":"auto"},
+          "messages":[{"role":"user","content":"weather in Rome?"}],
+          "tools":)" + weather_tool +
+                          "}"));
+  assert(truncated.member_str("stop_reason") == "max_tokens");
+  // Without declared tools, call markup stays visible text as before.
+  server.backend->SetOutput("<tool_call>leak");
+  const auto undeclared = response_body(server.Post(
+      "/v1/messages", R"({"messages":[{"role":"user","content":"hi"}]})"));
+  assert(undeclared.member_str("stop_reason") == "end_turn" &&
+         undeclared.find("content")->items().size() == 1 &&
+         undeclared.find("content")->items()[0].member_str("text") ==
+             "<tool_call>leak");
+
+  // Streamed Messages use Anthropic SSE events over the same filters.
+  const auto sse_events = [](const std::string& wire) {
+    std::vector<gufo::json::Value> events;
+    for (auto data = wire.find("data: "); data != std::string::npos;
+         data = wire.find("data: ", data + 6)) {
+      const auto end = wire.find("\n\n", data);
+      events.push_back(gufo::json::parse(
+          std::string_view(wire).substr(data + 6, end - data - 6)));
+    }
+    return events;
+  };
+  server.backend->SetOutput("<think>plan</think>answer");
+  const auto streamed_text =
+      server.Post("/v1/messages", R"({"stream":true,"max_tokens":64,
+          "thinking":{"type":"enabled","budget_tokens":1024},
+          "messages":[{"role":"user","content":"hi"}]})");
+  ExpectStatus(streamed_text, 200);
+  assert(streamed_text.find("text/event-stream") != std::string::npos &&
+         streamed_text.find("event: message_start\n") != std::string::npos);
+  std::vector<std::string> types;
+  std::string thought, answer;
+  const auto text_events = sse_events(streamed_text);
+  for (const auto& event : text_events) {
+    types.push_back(event.member_str("type"));
+    if (const auto* delta = event.find("delta");
+        delta && delta->member_str("type") == "thinking_delta")
+      thought += delta->member_str("thinking");
+    else if (delta && delta->member_str("type") == "text_delta")
+      answer += delta->member_str("text");
+  }
+  assert(thought == "plan" && answer == "answer");
+  // Thinking blocks keep the trimmed reasoning Messages reported before
+  // streaming, buffered and streamed alike.
+  server.backend->SetOutput("<think>\nplan\n\nmore\n</think>\n\nanswer");
+  for (const bool stream : {false, true}) {
+    const auto framed =
+        server.Post("/v1/messages",
+                    std::string(R"({"max_tokens":64,"stream":)") +
+                        (stream ? "true" : "false") +
+                        R"(,"thinking":{"type":"enabled","budget_tokens":1024},
+            "messages":[{"role":"user","content":"hi"}]})");
+    ExpectStatus(framed, 200);
+    std::string framed_thought;
+    if (stream) {
+      for (const auto& event : sse_events(framed))
+        if (const auto* delta = event.find("delta");
+            delta && delta->member_str("type") == "thinking_delta")
+          framed_thought += delta->member_str("thinking");
+    } else {
+      framed_thought =
+          response_body(framed).find("content")->items()[0].member_str(
+              "thinking");
+    }
+    assert(framed_thought == "plan\n\nmore");
+  }
+  assert(types.front() == "message_start" && types.back() == "message_stop");
+  assert(text_events[1].find("content_block")->member_str("type") ==
+             "thinking" &&
+         text_events[1].member_size("index") == 0);
+  const auto& text_done = text_events[text_events.size() - 2];
+  assert(text_done.member_str("type") == "message_delta" &&
+         text_done.find("delta")->member_str("stop_reason") == "end_turn" &&
+         text_done.find("usage")->member_size("input_tokens") == 10 &&
+         text_done.find("usage")->member_size("cache_read_input_tokens") == 8);
+  assert(std::ranges::count(types, "content_block_start") == 2 &&
+         std::ranges::count(types, "content_block_stop") == 2);
+
+  server.backend->SetOutput(
+      "<tool_call>\n<function=get_weather>\n<parameter=city>\nRome\n"
+      "</parameter>\n</function>\n</tool_call>");
+  const auto streamed_tool = server.Post(
+      "/v1/messages", R"({"stream":true,"tool_choice":{"type":"any"},
+          "messages":[{"role":"user","content":"weather in Rome?"}],
+          "tools":)" + weather_tool +
+                          "}");
+  ExpectStatus(streamed_tool, 200);
+  assert(streamed_tool.find("<tool_call>") == std::string::npos);
+  bool tool_started = false;
+  std::string partial_json, stop_reason;
+  for (const auto& event : sse_events(streamed_tool)) {
+    if (const auto* block = event.find("content_block"))
+      tool_started |= block->member_str("type") == "tool_use" &&
+                      block->member_str("name") == "get_weather";
+    if (const auto* delta = event.find("delta")) {
+      if (delta->member_str("type") == "input_json_delta")
+        partial_json += delta->member_str("partial_json");
+      if (event.member_str("type") == "message_delta")
+        stop_reason = delta->member_str("stop_reason");
+    }
+  }
+  assert(tool_started && stop_reason == "tool_use" &&
+         gufo::json::parse(partial_json).member_str("city") == "Rome");
+
+  server.backend->failure = 6;
+  const auto failed_messages = server.Post(
+      "/v1/messages",
+      R"({"stream":true,"messages":[{"role":"user","content":"hi"}]})");
+  ExpectStatus(failed_messages, 200);  // Fake backend fails after headers.
+  const auto failed_events = sse_events(failed_messages);
+  assert(failed_events.back().member_str("type") == "error" &&
+         failed_events.back().find("error")->member_str("type") ==
+             "api_error" &&
+         failed_messages.find("event: message_stop") == std::string::npos);
+  server.backend->failure = 0;
   server.backend->SetOutput("ok");
 }
 
@@ -1923,6 +2363,7 @@ int main() {
   // tint around the level tag.
   ::setenv("NO_COLOR", "1", 1);
   TestRequestLogging();
+  TestContentTrace();
   TestQuietTiersSuppressLifecycle();
   TestLogLevelFilter();
   TestLogLevelNames();

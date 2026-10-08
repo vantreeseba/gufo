@@ -7,6 +7,7 @@
 #include <string_view>
 
 #include "src/core/crypto/sha256.hpp"
+#include "src/models/qwen/control_tokens.hpp"
 
 namespace gufo::models::qwen::vision {
 namespace {
@@ -151,8 +152,9 @@ std::span<const std::uint8_t> Prompt::IdentityForPrefix(
 }
 
 void RopeLayout::Validate(std::uint32_t max_context) const {
-  if (images.size() > 256)
-    throw std::invalid_argument("too many image grids");
+  // Every non-overlapping image occupies at least one context position.
+  if (images.size() > max_context)
+    throw std::invalid_argument("image grids exceed model context");
   std::uint64_t previous_end = 0;
   for (const auto& image : images) {
     const std::uint64_t count = std::uint64_t{image.height} * image.width;
@@ -306,7 +308,7 @@ Prompt Prepare(const tokenization::QwenTokenizer& tokenizer,
       prompt.tokens.insert(prompt.tokens.end(), count, kImageToken);
       prompt.rope.images.push_back(grid);
       prompt.images.push_back({std::move(pixels), grid, identity.Digest()});
-      cursor = offsets[index++] + std::string_view("<|image_pad|>").size();
+      cursor = offsets[index++] + tokenization::kImagePad.size();
     }
   }
   append(cursor, rendered->size());
