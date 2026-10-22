@@ -172,10 +172,9 @@ void ExecuteMoePrefillChunk(QwenGpuArena& arena, const QwenMoeScratch& moe,
 
   // Tile map from the real bucket sizes: one entry per (expert, token tile)
   // of its 16-padded bucket, packed expert | tile << 16. Large chunks whose
-  // gate/up share a format pair them over a second map of 64 or 128 rows, the
-  // wider one when it launches at most three quarters as many tiles; the
-  // paired kernel writes F16 only, so a layer whose down projection reads F32
-  // rows keeps the unpaired launches.
+  // gate/up share a format pair them over a second map of 128-row tiles, the
+  // only width the paired kernel supports. It writes F16 only, so a layer
+  // whose down projection reads F32 rows keeps the unpaired launches.
   // Flash-Next pairs only its K-quant formats.
   const bool pair = routed_gate_up && routed_down &&
                     batch_size >= kRoutedPairMinTokens &&
@@ -185,7 +184,6 @@ void ExecuteMoePrefillChunk(QwenGpuArena& arena, const QwenMoeScratch& moe,
   std::uint32_t tile_rows = 16;
   std::uint32_t n_tiles = 0;
   std::uint32_t n_pair = 0;
-  std::uint32_t pair_rows = 64;
   if (routed_gate_up || routed_down) {
     HIP_CHECK(hipEventSynchronize(routed_host.counts_ready));
     tile_rows = RoutedTileRows(slots, n_experts);
@@ -196,17 +194,10 @@ void ExecuteMoePrefillChunk(QwenGpuArena& arena, const QwenMoeScratch& moe,
       }
     }
     if (pair) {
-      std::uint32_t tiles_64 = 0;
-      std::uint32_t tiles_128 = 0;
+      constexpr std::uint32_t kPairRows = 128;
       for (std::uint32_t e = 0; e < n_experts; ++e) {
         const std::uint32_t padded = (routed_host.counts[e] + 15U) / 16U * 16U;
-        tiles_64 += (padded + 63U) / 64U;
-        tiles_128 += (padded + 127U) / 128U;
-      }
-      pair_rows = tiles_128 * 4 <= tiles_64 * 3 ? 128U : 64U;
-      for (std::uint32_t e = 0; e < n_experts; ++e) {
-        const std::uint32_t padded = (routed_host.counts[e] + 15U) / 16U * 16U;
-        for (std::uint32_t j = 0; j * pair_rows < padded; ++j) {
+        for (std::uint32_t j = 0; j * kPairRows < padded; ++j) {
           routed_host.tiles[n_tiles + n_pair++] =
               static_cast<std::int32_t>(e | (j << 16));
         }
@@ -261,7 +252,7 @@ void ExecuteMoePrefillChunk(QwenGpuArena& arena, const QwenMoeScratch& moe,
         gate_ok &&
         (pair ? routed::RoutedGatedF16Gemm(
                     view.gate_exps.data, view.up_exps.data, *gate_type, x_half,
-                    moe.routed_tiles.data() + n_tiles, n_pair, pair_rows,
+                    moe.routed_tiles.data() + n_tiles, n_pair,
                     moe.routed_bounds.data(), moe.rows_token.data(),
                     moe.rows_slot.data(), act_half, expert_ff, hidden, stream)
          : routed_down
