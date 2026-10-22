@@ -5,10 +5,8 @@
 #include <cstdlib>
 #include <iostream>
 #include <memory>
-#include <span>
 #include <sstream>
 #include <string_view>
-#include <utility>
 #include <vector>
 
 #include "src/cli/serve/logging.hpp"
@@ -81,6 +79,76 @@ void TestBorrowedSnapshotPrefersAvailableOwner() {
          "a busy owner does not block a branch into another state");
   first.Invalidate();
   second.Invalidate();
+}
+
+void TestBorrowedSnapshotKeepsOwnersLiveFrontier() {
+  using Tokens = std::vector<gufo::server::ContinuationToken>;
+  std::vector<std::size_t> invalidations(2);
+  std::size_t next_id = 0;
+  gufo::server::ContinuationCache cache(
+      2, [&] { return std::make_unique<FakeState>(next_id++, &invalidations); },
+      {.restore =
+           [](gufo::server::ContinuationState& state,
+              const gufo::server::ContinuationSnapshot& snapshot) {
+             dynamic_cast<FakeState&>(state).value =
+                 dynamic_cast<const FakeSnapshot&>(snapshot).value;
+           },
+       .capacity_bytes = [] { return 1024; },
+       .on_event = {}});
+  // A conversation leaves its prompt checkpoint and, in the state that owns
+  // the checkpoint's rows, its live frontier: prompt plus reply.
+  auto conversation = cache.Acquire(Tokens{1, 2, 3});
+  auto* owner = &conversation.state();
+  dynamic_cast<FakeState&>(*owner).value = 9;
+  Expect(conversation.TryReserveSnapshot(sizeof(std::size_t), 3),
+         "reserve the prompt checkpoint");
+  conversation.Commit(
+      {1, 2, 3}, std::make_unique<FakeSnapshot>(7, sizeof(std::size_t), owner),
+      {1, 2, 3, 4, 5});
+  // A branch from the checkpoint takes the other, free state.
+  auto branch = cache.Acquire(Tokens{1, 2, 3, 6});
+  Expect(branch.cache_hit() && &branch.state() != owner &&
+             dynamic_cast<FakeState&>(branch.state()).value == 7,
+         "a branch restores into a free state, not the owner's live frontier");
+  branch.Invalidate();
+  // The conversation's next turn still continues from its live frontier.
+  auto next = cache.Acquire(Tokens{1, 2, 3, 4, 5, 8});
+  Expect(next.cache_hit() && next.cached_tokens() == 5 &&
+             &next.state() == owner &&
+             dynamic_cast<FakeState&>(next.state()).value == 9,
+         "the next turn reuses the generated reply");
+  next.Invalidate();
+}
+
+void TestBorrowedSnapshotRetryReplacesOwnersReply() {
+  using Tokens = std::vector<gufo::server::ContinuationToken>;
+  std::vector<std::size_t> invalidations(2);
+  std::size_t next_id = 0;
+  gufo::server::ContinuationCache cache(
+      2, [&] { return std::make_unique<FakeState>(next_id++, &invalidations); },
+      {.restore =
+           [](gufo::server::ContinuationState& state,
+              const gufo::server::ContinuationSnapshot& snapshot) {
+             dynamic_cast<FakeState&>(state).value =
+                 dynamic_cast<const FakeSnapshot&>(snapshot).value;
+           },
+       .capacity_bytes = [] { return 1024; },
+       .on_event = {}});
+  auto conversation = cache.Acquire(Tokens{1, 2, 3});
+  auto* owner = &conversation.state();
+  dynamic_cast<FakeState&>(*owner).value = 9;
+  Expect(conversation.TryReserveSnapshot(sizeof(std::size_t), 3),
+         "reserve the prompt checkpoint");
+  conversation.Commit(
+      {1, 2, 3}, std::make_unique<FakeSnapshot>(7, sizeof(std::size_t), owner),
+      {1, 2, 3, 4, 5});
+  // Retrying the prompt replaces the reply, so the owner's rows are reused
+  // and the other state, which may hold another conversation, is kept.
+  auto retry = cache.Acquire(Tokens{1, 2, 3});
+  Expect(retry.cache_hit() && &retry.state() == owner &&
+             dynamic_cast<FakeState&>(retry.state()).value == 7,
+         "a retry restores into the owner whose reply it replaces");
+  retry.Invalidate();
 }
 
 void TestColdMissThenExactExtensionHit() {
@@ -357,6 +425,70 @@ void TestDeeperLearnedBranchPointSupersedesShallower() {
          "only the deepest learned branch point of a family stays protected");
 }
 
+void TestRestoredSharedPrefixOutlivesFrozenFrontiers() {
+  using Tokens = std::vector<gufo::server::ContinuationToken>;
+  using gufo::server::SnapshotPurpose;
+  // Conversations share a system prompt whose grid checkpoint is history.
+  // Once a second conversation restores it and diverges, it is a branch point:
+  // freezing a continued frontier under byte pressure must evict an older
+  // turn's checkpoint, not the prefix every new conversation restores.
+  for (const bool restored : {false, true}) {
+    std::vector<std::size_t> invalidations(2);
+    std::size_t next_id = 0;
+    gufo::server::ContinuationCache cache(
+        2,
+        [&] { return std::make_unique<FakeState>(next_id++, &invalidations); },
+        {.restore = [](gufo::server::ContinuationState&,
+                       const gufo::server::ContinuationSnapshot&) {},
+         .capacity_bytes = [] { return 4 * sizeof(std::size_t); },
+         .on_event = {}},
+        8);
+    const Tokens unrelated{9, 9, 9};
+    auto other = cache.Acquire(unrelated);
+    Expect(other.TryReserveSnapshot(sizeof(std::size_t), unrelated.size()),
+           "the unrelated checkpoint fits");
+    other.Commit(unrelated, std::make_unique<FakeSnapshot>(9));
+
+    const Tokens shared{1, 2, 3};
+    const Tokens first{1, 2, 3, 4, 4};
+    auto a = cache.Acquire(first);
+    Expect(a.TryReserveSnapshot(sizeof(std::size_t), shared.size(), true,
+                                SnapshotPurpose::kHistory),
+           "the shared grid checkpoint fits");
+    a.PublishSnapshot(shared, std::make_unique<FakeSnapshot>(3), true);
+    Expect(a.TryReserveSnapshot(sizeof(std::size_t), first.size(), false,
+                                SnapshotPurpose::kContinuation, first),
+           "the first prompt checkpoint fits");
+    a.Commit(first, std::make_unique<FakeSnapshot>(5), {1, 2, 3, 4, 4, 8, 8});
+
+    const Tokens second{1, 2, 3, 5, 5};
+    auto b = cache.Acquire(second, {}, {}, {}, restored);
+    Expect(b.cached_tokens() == (restored ? shared.size() : 0),
+           "the second conversation restores the shared prefix when allowed");
+    Expect(b.TryReserveSnapshot(sizeof(std::size_t), second.size(), false,
+                                SnapshotPurpose::kContinuation, second),
+           "the second prompt checkpoint fits");
+    b.Commit(second, std::make_unique<FakeSnapshot>(6), {1, 2, 3, 5, 5, 8});
+
+    // The first conversation continues from its live frontier and freezes it.
+    const Tokens next{1, 2, 3, 4, 4, 8, 8, 6};
+    auto turn = cache.Acquire(next);
+    Expect(turn.cached_tokens() == 7, "the next turn continues the frontier");
+    Expect(turn.TryReserveSnapshot(sizeof(std::size_t), next.size(), false,
+                                   SnapshotPurpose::kContinuation, next),
+           "the frozen frontier evicts one checkpoint");
+    turn.Commit(next, std::make_unique<FakeSnapshot>(8));
+
+    Expect(
+        cache.CachedPrefixTokens(Tokens{1, 2, 3, 7, 7}) ==
+            (restored ? shared.size() : 0),
+        "a restored shared prefix outlives a frozen frontier under pressure");
+    Expect(cache.CachedPrefixTokens(first) ==
+               (restored ? shared.size() : first.size()),
+           "the continued conversation's older checkpoint yields instead");
+  }
+}
+
 void TestSnapshotCanBranchIntoTwoIndependentStateSlots() {
   std::vector<std::size_t> invalidations(2);
   std::size_t next_id = 0;
@@ -467,177 +599,6 @@ void TestByteCapacityEvictsBeforeSnapshotAllocation() {
   Expect(cache.retained_snapshot_bytes() == 12 &&
              cache.reserved_snapshot_bytes() == 0,
          "commit converts the reservation into exact retained bytes");
-}
-
-void TestAllocationFailureLowersBudgetAndEvictsBeforeRetry() {
-  using gufo::server::SnapshotEventAction;
-  using gufo::server::SnapshotEventReason;
-
-  std::vector<std::size_t> invalidations(2);
-  std::size_t next_id = 0;
-  std::vector<gufo::server::SnapshotEvent> events;
-  gufo::server::ContinuationCache cache(
-      2, [&] { return std::make_unique<FakeState>(next_id++, &invalidations); },
-      {
-          .restore = [](gufo::server::ContinuationState&,
-                        const gufo::server::ContinuationSnapshot&) {},
-          .capacity_bytes = [] { return 24; },
-          .on_event =
-              [&](const gufo::server::SnapshotEvent& event) {
-                events.push_back(event);
-              },
-      });
-
-  {
-    auto root =
-        cache.Acquire(std::vector<gufo::server::ContinuationToken>{1, 2, 3});
-    Expect(root.TryReserveSnapshot(8, 3), "first snapshot fits the budget");
-    Expect(root.Commit({1, 2, 3}, std::make_unique<FakeSnapshot>(7, 8)) == 8,
-           "first snapshot is retained");
-  }
-
-  auto peer =
-      cache.Acquire(std::vector<gufo::server::ContinuationToken>{9, 8, 7});
-  Expect(peer.TryReserveSnapshot(8, 3) && events.empty(),
-         "second snapshot fits the configured budget without eviction");
-  // The model could not allocate the reserved bytes.
-  Expect(peer.RetryReserveSnapshot(3),
-         "a failed allocation is admitted again after eviction");
-  Expect(cache.snapshot_capacity_bytes() == 8,
-         "budget drops to the bytes the device is known to hold");
-  Expect(cache.retained_snapshot_bytes() == 0 &&
-             cache.reserved_snapshot_bytes() == 8,
-         "the retained snapshot gives way to the retried reservation");
-  Expect(events.size() == 1 &&
-             events.front().action == SnapshotEventAction::kRemoved &&
-             events.front().reason == SnapshotEventReason::kByteCapacity &&
-             events.front().snapshot_bytes == 8,
-         "the eviction is reported as byte pressure");
-  Expect(peer.Commit({9, 8, 7}, std::make_unique<FakeSnapshot>(9, 8)) == 8,
-         "the retried snapshot is retained");
-
-  auto empty =
-      cache.Acquire(std::vector<gufo::server::ContinuationToken>{4, 5, 6});
-  Expect(!empty.RetryReserveSnapshot(3) &&
-             cache.snapshot_capacity_bytes() == 8 &&
-             cache.retained_snapshot_bytes() == 8,
-         "a lease without a reservation has nothing to retry");
-  {
-    auto last = cache.Acquire(std::vector<gufo::server::ContinuationToken>{4});
-  }
-}
-
-struct SharingSnapshot final : gufo::server::ContinuationSnapshot {
-  SharingSnapshot(std::size_t payload_bytes,
-                  std::vector<gufo::server::SnapshotBlock> blocks)
-      : payload_bytes(payload_bytes), blocks(std::move(blocks)) {}
-
-  [[nodiscard]] std::size_t PayloadBytes() const noexcept override {
-    return payload_bytes;
-  }
-  [[nodiscard]] std::span<const gufo::server::SnapshotBlock> SharedBlocks()
-      const noexcept override {
-    return blocks;
-  }
-
-  std::size_t payload_bytes;
-  std::vector<gufo::server::SnapshotBlock> blocks;
-};
-
-void TestSharedBlocksCountOnceAndOutliveTheirFirstOwner() {
-  using gufo::server::SnapshotBlock;
-  using gufo::server::SnapshotEventAction;
-  using gufo::server::SnapshotPurpose;
-  using Tokens = std::vector<gufo::server::ContinuationToken>;
-
-  std::vector<std::size_t> invalidations(2);
-  std::size_t next_id = 0;
-  std::vector<gufo::server::SnapshotEvent> events;
-  gufo::server::ContinuationCache cache(
-      2, [&] { return std::make_unique<FakeState>(next_id++, &invalidations); },
-      {
-          .restore = [](gufo::server::ContinuationState&,
-                        const gufo::server::ContinuationSnapshot&) {},
-          .capacity_bytes = [] { return 40; },
-          .on_event =
-              [&](const gufo::server::SnapshotEvent& event) {
-                events.push_back(event);
-              },
-      },
-      4);
-  const SnapshotBlock first{.id = 1, .bytes = 16};
-  const SnapshotBlock second{.id = 2, .bytes = 8};
-
-  {
-    auto root = cache.Acquire(Tokens{1, 2, 3});
-    Expect(root.TryReserveSnapshot(24, 3), "root checkpoint fits");
-    Expect(root.Commit({1, 2, 3}, std::make_unique<SharingSnapshot>(
-                                      24, std::vector{first})) == 24,
-           "root checkpoint reports its complete payload");
-    Expect(cache.retained_snapshot_bytes() == 24,
-           "a block with one holder counts in full");
-  }
-  {
-    const Tokens tokens{1, 2, 3, 4, 5};
-    auto extension = cache.Acquire(tokens);
-    Expect(extension.cached_tokens() == 3, "extension restores the root");
-    Expect(extension.TryReserveSnapshot(32, 5, true,
-                                        SnapshotPurpose::kContinuation, {},
-                                        {.blocks = {first}}) &&
-               events.empty() && cache.reserved_snapshot_bytes() == 16,
-           "a reservation is charged only for what it does not share");
-    Expect(extension.Commit(tokens, std::make_unique<SharingSnapshot>(
-                                        32, std::vector{first, second})) == 32,
-           "extension reports its complete payload");
-    Expect(cache.retained_snapshot_bytes() == 40 &&
-               cache.reserved_snapshot_bytes() == 0 && events.empty(),
-           "56 payload bytes over one shared block retain 40");
-  }
-  {
-    const Tokens tokens{1, 2, 3, 4, 5, 6};
-    auto latest = cache.Acquire(tokens);
-    Expect(latest.cached_tokens() == 5, "latest restores the extension");
-    Expect(latest.TryReserveSnapshot(40, 6, false,
-                                     SnapshotPurpose::kContinuation, tokens,
-                                     {.blocks = {first, second}}),
-           "evicting both owners makes room without freeing held blocks");
-    Expect(events.size() == 2 &&
-               events[0].action == SnapshotEventAction::kRemoved &&
-               events[1].action == SnapshotEventAction::kRemoved &&
-               cache.retained_snapshot_bytes() == 24 &&
-               cache.reserved_snapshot_bytes() == 16,
-           "blocks a reservation holds stay counted after their owners go");
-    Expect(latest.RetryReserveSnapshot(6, false, tokens) &&
-               cache.snapshot_capacity_bytes() == 40 &&
-               cache.retained_snapshot_bytes() == 24 &&
-               cache.reserved_snapshot_bytes() == 16,
-           "a retry keeps the same blocks held and charges them once");
-    Expect(latest.Commit(tokens, std::make_unique<SharingSnapshot>(
-                                     40, std::vector{first, second})) == 40 &&
-               cache.retained_snapshot_bytes() == 40 &&
-               cache.reserved_snapshot_bytes() == 0,
-           "the published snapshot takes over the reservation's blocks");
-  }
-
-  auto peer = cache.Acquire(Tokens{9});
-  Expect(peer.TryReserveSnapshot(40, 1) &&
-             cache.retained_snapshot_bytes() == 0 &&
-             cache.reserved_snapshot_bytes() == 40,
-         "the last holder releases its shared blocks");
-  peer.SkipSnapshot(gufo::server::SnapshotEventReason::kCaptureFailure, 40, 1);
-  Expect(cache.reserved_snapshot_bytes() == 0, "skip releases the charge");
-
-  auto undeclared = cache.Acquire(Tokens{7});
-  Expect(undeclared.TryReserveSnapshot(24, 1, false,
-                                       SnapshotPurpose::kContinuation, {},
-                                       {.blocks = {first}}) &&
-             cache.retained_snapshot_bytes() == 16 &&
-             cache.reserved_snapshot_bytes() == 8,
-         "a block held only by a reservation still counts");
-  undeclared.Invalidate();
-  Expect(cache.retained_snapshot_bytes() == 0 &&
-             cache.reserved_snapshot_bytes() == 0,
-         "invalidation releases the reservation and its blocks");
 }
 
 void TestConcurrentReservationsCannotOvercommitBudget() {
@@ -1412,14 +1373,15 @@ int main() {
   TestWaitingAcquireCanBeCancelled();
   TestSnapshotCanBranchIntoTwoIndependentStateSlots();
   TestBorrowedSnapshotPrefersAvailableOwner();
+  TestBorrowedSnapshotKeepsOwnersLiveFrontier();
+  TestBorrowedSnapshotRetryReplacesOwnersReply();
   TestCachedPrefixTokensPeeksWithoutLeasing();
   TestBranchPointOutlivesOlderTurnsUnderPressure();
   TestNewBranchPreservesSharedSourceUnderBytePressure();
   TestLearnedBranchPointOutlivesItsOlderBranch();
   TestDeeperLearnedBranchPointSupersedesShallower();
+  TestRestoredSharedPrefixOutlivesFrozenFrontiers();
   TestByteCapacityEvictsBeforeSnapshotAllocation();
-  TestAllocationFailureLowersBudgetAndEvictsBeforeRetry();
-  TestSharedBlocksCountOnceAndOutliveTheirFirstOwner();
   TestConcurrentReservationsCannotOvercommitBudget();
   TestImpossibleReservationPreservesRetainedEntries();
   TestAbandonedReservationIsReleased();

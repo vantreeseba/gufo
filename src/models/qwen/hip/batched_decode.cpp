@@ -252,7 +252,6 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
       throw std::length_error(
           "token position exceeds a batched Qwen session context");
     }
-    executor->arena_.InvalidateSnapshotKvFrom(items[index].position);
     for (std::size_t previous = 0; previous < index; ++previous) {
       if (items[previous].executor == executor) {
         throw std::invalid_argument(
@@ -266,6 +265,12 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
   }
 
   bool capture_replay = false;
+  std::array<models::qwen::ContinuationWrite, kMaxDecodeBatch> writes;
+  for (std::size_t i = 0; i < items.size(); ++i)
+    if (auto* hooks = items[i].executor->continuation_hooks_)
+      hooks->BeforeWrite(items[i].position, items[i].position + 1);
+  for (std::size_t i = 0; i < items.size(); ++i)
+    writes[i].Arm(items[i].executor->continuation_hooks_);
   for (const auto& item : items) {
     auto& executor = *item.executor;
     if (executor.replaying_ssm_state_) {
@@ -307,8 +312,7 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
     auto& state_arena = items[row].executor->arena_;
     auto replay = state_arena.GetSsmReplayCapture();
     replay.position = scratch.decode.prompt_tokens.data() + row;
-    ssm_sequences[row] = {state_arena.d_ssm_conv_state,
-                          state_arena.d_ssm_deltanet_state, replay,
+    ssm_sequences[row] = {state_arena.BeginRecurrentWrite(), replay,
                           static_cast<std::uint32_t>(row), 1};
   }
   HIP_CHECK(hipMemcpyAsync(
@@ -502,6 +506,8 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
 
   for (std::size_t row = 0; row < batch_size; ++row)
     (void)CheckedSampleToken(host_frontiers[row], vocab_size);
+  for (std::size_t i = 0; i < items.size(); ++i)
+    writes[i].Commit(items[i].position + 1, true);
   return {host_frontiers.begin(),
           host_frontiers.begin() + static_cast<std::ptrdiff_t>(batch_size)};
 }
@@ -562,7 +568,6 @@ QwenGpuExecutor::ForwardVerificationBatch(
         item.tokens.size() > executor->arena_.GetMaxContext() - item.position) {
       throw std::length_error("Qwen verification exceeds a session context");
     }
-    item.executor->arena_.InvalidateSnapshotKvFrom(item.position);
     offsets[index] = batch_size;
     batch_size += item.tokens.size();
   }
@@ -570,6 +575,14 @@ QwenGpuExecutor::ForwardVerificationBatch(
     throw std::length_error(
         "Qwen verification exceeds coordinator scratch capacity");
   }
+  std::array<models::qwen::ContinuationWrite, kMaxDecodeBatch> writes;
+  for (std::size_t i = 0; i < items.size(); ++i)
+    if (auto* hooks = items[i].executor->continuation_hooks_)
+      hooks->BeforeWrite(items[i].position,
+                         items[i].position + static_cast<std::uint32_t>(
+                                                 items[i].tokens.size()));
+  for (std::size_t i = 0; i < items.size(); ++i)
+    writes[i].Arm(items[i].executor->continuation_hooks_);
   for (const auto& item : items) {
     auto& executor = *item.executor;
     if (&executor != &coordinator)
@@ -622,8 +635,7 @@ QwenGpuExecutor::ForwardVerificationBatch(
     auto& state_arena = item.executor->arena_;
     auto replay = state_arena.GetSsmReplayCapture();
     replay.position = scratch.decode.prompt_tokens.data() + offsets[index];
-    ssm_sequences[index] = {state_arena.d_ssm_conv_state,
-                            state_arena.d_ssm_deltanet_state, replay,
+    ssm_sequences[index] = {state_arena.BeginRecurrentWrite(), replay,
                             static_cast<std::uint32_t>(offsets[index]),
                             static_cast<std::uint32_t>(item.tokens.size())};
     for (std::size_t row = 0; row < item.tokens.size(); ++row) {
@@ -925,6 +937,10 @@ QwenGpuExecutor::ForwardVerificationBatch(
         host_predictions.begin() + offsets[index],
         host_predictions.begin() + offsets[index] + item.tokens.size());
   }
+  for (std::size_t i = 0; i < items.size(); ++i)
+    writes[i].Commit(
+        items[i].position + static_cast<std::uint32_t>(items[i].tokens.size()),
+        false);
   return predictions;
 }
 

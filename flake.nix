@@ -150,15 +150,33 @@
               pkgs.${system}.sox
               pkgs.${system}.rocmPackages.rocprofiler-sdk
               pkgs.${system}.sqlite
+              # Debugging and repository work. The test presets build
+              # RelWithDebInfo with assertions, and contributors commit with
+              pkgs.${system}.gdb
+              pkgs.${system}.git
+              pkgs.${system}.ripgrep
+              pkgs.${system}.radeontop
+              # Compiler cache for the local loop; CMake attaches it as the C
+              # and C++ launcher when it is on PATH, as the CPU checks do.
+              pkgs.${system}.ccache
               audio-cpp.packages.${system}.rocm-gfx1151
             ];
             env = {
               TORCH_HOME = "${alexnetTorchHome system}";
               LD_LIBRARY_PATH = pkgs.${system}.lib.makeLibraryPath [
+                self.packages.${system}.default.rocmRuntime
                 pkgs.${system}.stdenv.cc.cc.lib
                 pkgs.${system}.zlib
               ];
             };
+            # Cache policy mirrors the CPU check derivations. CCACHE_DIR stays
+            # at the user default so a container run can mount it as a volume.
+            shellHook = ''
+              export CCACHE_BASEDIR="$PWD"
+              export CCACHE_COMPILERCHECK=content
+              export CCACHE_MAXSIZE=2G
+              export CCACHE_NOHASHDIR=true
+            '';
           };
 
         }
@@ -228,6 +246,7 @@
             files = [
               ".clang-format"
               "CMakeLists.txt"
+              "docs/RELEASING.md"
               "tools/prof/prof.py"
               "tools/bench/speculative-corpus.py"
             ];
@@ -268,6 +287,7 @@
               ".devops/nix/package.nix"
               "flake.nix"
               "THIRD_PARTY_NOTICES.md"
+              "tests/tools/check_dependencies_test.py"
               "tools/ci/check-dependencies.py"
             ];
           };
@@ -346,6 +366,7 @@
             cd "$src"
             mkdir -p $out
             python3 tools/ci/check-dependencies.py --json-report $out/dependency-inventory.json
+            python3 -B tests/tools/check_dependencies_test.py
             echo "PASS: Dependency inventory clean" > $out/result.txt
           '';
 
@@ -516,6 +537,8 @@
               };
               mtpCmd = mkServe {
                 model = "/var/models/qwen-flash.gguf";
+                context = 409600;
+                enableYarn = true;
                 speculative = "mtp";
                 mtpModel = "/var/models/mtp.gguf";
                 draftTokens = 3;
@@ -578,6 +601,10 @@
                 exit 1
               fi
               mtp_cmd="${mtpCmd}"
+              echo "$mtp_cmd" | grep -F -- "--context 409600 --enable-yarn"
+              if echo "$cmd_str" | grep -F -- "--enable-yarn"; then
+                exit 1
+              fi
               echo "$mtp_cmd" | grep -F -- "--speculative mtp"
               echo "$mtp_cmd" | grep -F -- "--mtp-model /var/models/mtp.gguf"
               echo "$mtp_cmd" | grep -F -- "--draft-tokens 3"

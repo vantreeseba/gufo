@@ -6,12 +6,15 @@
 #include <cstring>
 #include <future>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "src/core/sampling.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
+
+void LimitReportedDeviceFree(std::size_t bytes);
 
 namespace qfn = gufo::models::qwen38_flash_next;
 namespace sampling = gufo::sampling;
@@ -305,24 +308,124 @@ void CheckCheckpointRetention(const std::shared_ptr<qfn::Model>& model,
             << " short prefix exact\n";
 }
 
+/// Without device headroom for snapshot storage, captures and rewinds keep
+/// checkpoints in their host payloads instead of failing the request.
+void CheckDeviceExhaustion(const std::shared_ptr<qfn::Model>& model,
+                           std::span<const std::int32_t> prompt,
+                           gufo::core::SessionMode mode) {
+  struct Unlimit {
+    ~Unlimit() {
+      LimitReportedDeviceFree(std::numeric_limits<std::size_t>::max());
+    }
+  } unlimit;
+  std::string error;
+  auto source = model->CreateSession(mode, 8192, &error);
+  Require(source && source->Sync(prompt, &error), error);
+  // Read the bytes through another capture: reading this one would move it
+  // to the host before the rewind.
+  const auto expected = Payload(*source);
+  auto borrowed = source->SaveSnapshot(&error);
+  Require(borrowed != nullptr, error);
+  Require(borrowed->DeviceBytes() != 0, "capture did not borrow");
+
+  LimitReportedDeviceFree(0);
+  source->Reset();
+  Require(source->Sync(prompt.subspan(20, 32), &error), error);
+  Require(borrowed->DeviceBytes() == 0,
+          "exhausted rewind kept checkpoint rows on the device");
+  Require(Payload(*borrowed) == expected,
+          "exhausted rewind lost overwritten checkpoint rows");
+  auto owned = source->SaveSnapshot(&error);
+  Require(owned != nullptr, error);
+  Require(owned->DeviceBytes() == 0,
+          "exhausted capture allocated device storage");
+  const auto branch = Payload(*owned);
+  Require(source->RestoreSnapshot(*borrowed, &error), error);
+  Require(Payload(*source) == expected,
+          "exhausted restore differs from its checkpoint");
+  Require(source->RestoreSnapshot(*owned, &error), error);
+  Require(Payload(*source) == branch, "host capture differs after restore");
+  std::cout << "device exhaustion mode=" << static_cast<int>(mode)
+            << " host fallback exact\n";
+}
+
+// One resident session keeps this extended-context regression bounded in UMA
+// memory. Borrowed checkpoints preserve the warm prefix while its short tail
+// is replayed through the independent ordinary Sync path.
+void CheckExtendedPrefillCheckpoint(const std::shared_ptr<qfn::Model>& model,
+                                    gufo::core::SessionMode mode,
+                                    std::uint32_t boundary) {
+  std::string error;
+  auto session = model->CreateSession(mode, model->MaxContext(), &error);
+  Require(session != nullptr, error);
+  const auto pattern = model->Tokenize("Continue: red, blue, green. ");
+  Require(!pattern.empty(), "empty extended prompt pattern");
+  std::vector<std::int32_t> prompt(boundary + 7);
+  for (std::size_t i = 0; i < prompt.size(); ++i)
+    prompt[i] = pattern[i % pattern.size()];
+  Require(session->Sync(std::span(prompt).first(boundary - 11), &error), error);
+  auto warm = session->SaveSnapshot(&error);
+  Require(warm != nullptr, error);
+  const auto claim = session->PrefillCheckpointBytes(boundary);
+  std::unique_ptr<qfn::SessionSnapshot> checkpoint;
+  double capture_ms = -1;
+  Require(
+      session->SyncThrough(prompt, boundary, &checkpoint, &error, &capture_ms),
+      error);
+  Require(checkpoint && checkpoint->SizeBytes() == claim &&
+              std::isfinite(capture_ms) && capture_ms > 0,
+          "extended checkpoint capture differs from its admission claim");
+  const std::vector<float> final_logits(session->Logits().begin(),
+                                        session->Logits().end());
+  const auto expected = Decode(*session, 8, {.temperature = 0}, 8);
+  Require(session->RestoreSnapshot(*checkpoint, &error), error);
+  const std::vector<float> boundary_logits(session->Logits().begin(),
+                                           session->Logits().end());
+  Require(session->RestoreSnapshot(*warm, &error), error);
+  checkpoint.reset();
+  Require(session->Sync(std::span(prompt).first(boundary), &error), error);
+  Require(std::memcmp(boundary_logits.data(), session->Logits().data(),
+                      session->Logits().size_bytes()) == 0,
+          "extended checkpoint changed boundary logits");
+  Require(session->Sync(prompt, &error), error);
+  Require(std::memcmp(final_logits.data(), session->Logits().data(),
+                      session->Logits().size_bytes()) == 0,
+          "extended checkpoint changed split-pass logits");
+  RequireSame(expected, Decode(*session, 8, {.temperature = 0}, 8),
+              "extended checkpoint continuation");
+  std::cout << "extended checkpoint mode=" << static_cast<int>(mode)
+            << " boundary=" << boundary << " exact\n";
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (argc != 5 || std::string_view(argv[1]) != "--model" ||
+  const bool extended = argc == 6 && std::string_view(argv[5]) == "--extended";
+  if ((argc != 5 && !extended) || std::string_view(argv[1]) != "--model" ||
       std::string_view(argv[3]) != "--mtp-model") {
-    std::cerr
-        << "Usage: snapshot_test --model FIRST.gguf --mtp-model MTP.gguf\n";
+    std::cerr << "Usage: snapshot_test --model FIRST.gguf --mtp-model MTP.gguf "
+                 "[--extended]\n";
     return 77;
   }
   try {
     std::string error;
-    constexpr std::uint32_t kContext = 8192;
-    auto model = qfn::Model::Load(argv[2],
-                                  {.max_context = kContext,
-                                   .mtp_model_path = argv[4],
-                                   .max_draft_tokens = 7},
-                                  &error);
+    const std::uint32_t kContext = extended ? 409600 : 8192;
+    auto model = qfn::Model::Load(
+        argv[2],
+        {.max_context = kContext,
+         .mtp_model_path = argv[4],
+         .max_draft_tokens = 7,
+         .rope_scaling = qfn::RopeScalingForContext(kContext, 262144)},
+        &error);
     Require(model != nullptr, error);
+    if (extended) {
+      for (const auto mode : {gufo::core::SessionMode::kAutoregressive,
+                              gufo::core::SessionMode::kSpeculative}) {
+        for (const auto boundary : {262145U, 294913U})
+          CheckExtendedPrefillCheckpoint(model, mode, boundary);
+      }
+      return 0;
+    }
     const auto pattern = model->Tokenize(
         "The quick brown fox jumps over the lazy dog. "
         "Strix Halo executes this deterministic benchmark sequence. ");
@@ -359,6 +462,9 @@ int main(int argc, char** argv) {
                              gufo::core::SessionMode::kAutoregressive);
     CheckCheckpointRetention(model, prompt,
                              gufo::core::SessionMode::kSpeculative);
+    CheckDeviceExhaustion(model, prompt,
+                          gufo::core::SessionMode::kAutoregressive);
+    CheckDeviceExhaustion(model, prompt, gufo::core::SessionMode::kSpeculative);
     const sampling::SamplingConfig config{
         .temperature = 0.8F, .top_k = 40, .top_p = 0.9F, .seed = 7};
     constexpr std::size_t kTokens = 48;

@@ -7,6 +7,7 @@ No weights are downloaded. Model checks are manual, not hosted CI workloads.
 """
 
 import argparse
+import ast
 import contextlib
 import http.client
 import hashlib
@@ -28,10 +29,12 @@ import zlib
 from metrics import compare, comparison_status, join_server_timings, timing_measurement
 
 TESTS = Path(__file__).resolve().parent
-SUITES = ("discovery", "responses", "stops", "conversation", "image-inputs", "image-count", "structured", "structured-limits",
-          "tool-reasoning", "reasoning-separator",
-          "tools", "auto-tools", "tool-edges", "tool-agent", "tool-agent-loop", "tool-history", "messages-tools", "tool-untyped", "tool-mixed", "tool-native-schemas", "tool-native-types", "tool-schema-edges", "sampling-defaults", "sampling-ranges", "batch",
-          "long-context", "state-edges", "progress", "stream-start", "prefill-scheduling", "metrics", "cache-edits", "cache-growth", "cache-depth", "cache-rotation", "cache-concurrency", "cache-shared-prefix", "cache-bridge", "system-injection", "cache")
+SUITES = ("discovery", "messages-count-tokens", "messages-image-counts", "responses", "stops", "conversation", "image-inputs", "image-count", "tool-images", "structured", "structured-limits",
+          "tool-reasoning", "tool-streaming", "reasoning-separator", "reasoning-budget",
+          "tools", "auto-tools", "tool-edges", "tool-agent", "tool-agent-loop", "tool-history", "messages-tools", "tool-untyped", "tool-mixed", "tool-native-schemas", "tool-native-types", "tool-choice-cache", "tool-parameter-order", "tool-schema-edges", "sampling-defaults", "sampling-ranges", "batch",
+          "long-context", "state-edges", "progress", "stream-start", "prefill-scheduling", "metrics", "cache-edits", "cache-growth", "cache-depth", "cache-rotation", "cache-concurrency", "cache-shared-prefix", "cache-bridge", "cache-compaction", "cache-transforms", "cache-pressure", "cache-messages-loop", "cache-stalls", "system-injection", "cache")
+# Suites that already run another suite's checks; selecting both repeats the work.
+INCLUDED_IN = {"auto-tools": "tools", "tool-native-types": "tool-native-schemas"}
 SAMPLING = {
     "--temperature": ("temperature", float), "--top-p": ("top_p", float),
     "--top-k": ("top_k", int), "--min-p": ("min_p", float),
@@ -41,17 +44,46 @@ SAMPLING = {
     "--repeat-penalty": ("repeat_penalty", float),
     "--repeat-last-n": ("repeat_last_n", int),
 }
-COMPARISON_FIELDS = ("comparison_command", "sampling_preset", "sampling_overrides",
+COMPARISON_FIELDS = ("comparison_command", "sampling_preset", "sampling_overrides", "request_timeout", "tier",
                      "vision", "speculative", "environment", "harness_sha256", "build_inputs_sha256",
                      "expected_input_modalities")
 
 
+HARNESS_ROOTS = ("run.py", "metrics.py", "progress.py", "stream_start.py", "prefill_scheduling.py", "server_metrics.py", "openai_sdk.py", "continuation.py",
+                 "tool_reasoning.py", "tool_streaming.py", "tool_agent.py", "tool_native.py", "discovery.py", "image_inputs.py", "cache_edits.py", "cache_growth.py", "cache_depth.py", "cache_rotation.py", "cache_concurrency.py", "cache_shared_prefix.py", "cache_bridge.py", "system_injection.py",
+                 "cache_compaction.py", "cache_workloads.py", "cache_messages_loop.py", "cache_stalls.py",
+                 "cache_disk_spacing.py", "tool_images.py", "reasoning_budget.py")
+
+
+def harness_files():
+    """The harness modules and every local module they import, transitively."""
+    search = (TESTS, TESTS.parents[1] / "tools")
+    pending, found = [TESTS / name for name in HARNESS_ROOTS], set()
+    while pending:
+        path = pending.pop()
+        if path in found:
+            continue
+        found.add(path)
+        for node in ast.walk(ast.parse(path.read_text(), str(path))):
+            if isinstance(node, ast.Import):
+                modules = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and not node.level and node.module:
+                modules = [node.module]
+            else:
+                continue
+            for module in modules:
+                for base in search:
+                    candidate = base.joinpath(*module.split(".")).with_suffix(".py")
+                    if candidate.is_file():
+                        pending.append(candidate)
+                        break
+    return sorted(found)
+
+
 def provenance():
     source = hashlib.sha256()
-    for name in ("run.py", "metrics.py", "progress.py", "stream_start.py", "prefill_scheduling.py", "server_metrics.py", "openai_sdk.py", "continuation.py",
-                 "tool_reasoning.py", "tool_agent.py", "tool_native.py", "discovery.py", "image_inputs.py", "cache_edits.py", "cache_growth.py", "cache_depth.py", "cache_rotation.py", "cache_concurrency.py", "cache_shared_prefix.py", "cache_bridge.py", "system_injection.py",
-                 "cache_disk_spacing.py"):
-        source.update((TESTS / name).read_bytes())
+    for path in harness_files():
+        source.update(path.read_bytes())
     lock = TESTS.parents[1] / "flake.lock"
     kernel_command = Path("/proc/cmdline")
     return {
@@ -62,7 +94,9 @@ def provenance():
                                                 if kernel_command.is_file() else None), **{
             key: os.environ.get(key) for key in (
                 "GPU_MAX_HW_QUEUES", "HSA_ENABLE_SDMA", "HSA_ENABLE_INTERRUPT",
-                "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "LD_PRELOAD")}},
+                "HSA_USERPTR_FOR_PAGED_MEM", "HSA_USE_SVM",
+                "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES",
+                "LD_LIBRARY_PATH", "LD_PRELOAD")}},
     }
 
 
@@ -142,7 +176,9 @@ def compare_runs(baseline_dir, candidate_dir):
         if report.get("functional_status", report["status"]) != "passed":
             raise ValueError("functional checks did not pass")
     for key in (*COMPARISON_FIELDS, "through_case"):
-        if baseline.get(key) != candidate.get(key):
+        # Reports from before tiers always ran the full matrix.
+        default = "full" if key == "tier" else None
+        if baseline.get(key, default) != candidate.get(key, default):
             raise ValueError(f"unmatched baseline {key}")
     if list(baseline["suites"]) != list(candidate["suites"]):
         raise ValueError("unmatched baseline suites")
@@ -153,7 +189,7 @@ def compare_runs(baseline_dir, candidate_dir):
 
 
 @contextlib.contextmanager
-def server(command, log_path, startup_timeout):
+def server(command, log_path, startup_timeout, environment=None):
     def interrupt(signum, frame):
         raise KeyboardInterrupt(f"signal {signum}")
 
@@ -163,7 +199,8 @@ def server(command, log_path, startup_timeout):
         try:
             previous_handlers = {signum: signal.signal(signum, interrupt)
                                  for signum in (signal.SIGTERM, signal.SIGHUP)}
-            process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
+            process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT,
+                                       env=environment)
             deadline = time.monotonic() + startup_timeout
             while time.monotonic() < deadline:
                 if process.poll() is not None:
@@ -213,8 +250,12 @@ def main():
                         help="Repeat to select affected suites; use all for an explicit full run")
     parser.add_argument("--expected-input-modalities", choices=("text", "text,image"),
                         help="Expected loaded inputs for the discovery suite")
+    parser.add_argument("--tier", choices=("pr", "full"), default="full",
+                        help="pr trims each suite's transport matrix; full runs every combination")
     parser.add_argument("--startup-timeout", type=float, default=240)
     parser.add_argument("--suite-timeout", type=float, default=900)
+    parser.add_argument("--request-timeout", type=float, default=120,
+                        help="SDK request deadline in seconds; recorded separately from timing qualification")
     qualification = parser.add_mutually_exclusive_group(required=True)
     qualification.add_argument("--baseline", type=Path,
                                help="Matched previous run directory; compare every HTTP request")
@@ -227,8 +268,10 @@ def main():
     parser.add_argument("command", nargs=argparse.REMAINDER,
                         help="-- ./result/bin/gufo serve llm --model PATH [server options]")
     args = parser.parse_args()
-    if ("discovery" in args.suite or "all" in args.suite) and args.expected_input_modalities is None:
-        parser.error("discovery requires --expected-input-modalities text or text,image")
+    if not math.isfinite(args.request_timeout) or args.request_timeout <= 0:
+        parser.error("--request-timeout must be finite and positive")
+    if set(args.suite) & {"discovery", "messages-image-counts", "all"} and args.expected_input_modalities is None:
+        parser.error("discovery and messages-image-counts require --expected-input-modalities text or text,image")
     if args.allow_missing_progress and not args.record_baseline:
         parser.error("--allow-missing-progress is only for --record-baseline")
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
@@ -240,16 +283,16 @@ def main():
             parser.error(f"the test runner owns {reserved}; omit it from the server command")
     if option(command, "--api-key") is not None:
         parser.error("omit --api-key for the isolated loopback test server")
-    if set(args.suite) & {"image-inputs", "image-count"} and option(command, "--mmproj") is None:
-        parser.error("image-inputs and image-count require --mmproj in the server command")
+    if set(args.suite) & {"image-inputs", "image-count", "tool-images"} and option(command, "--mmproj") is None:
+        parser.error("image-inputs, image-count and tool-images require --mmproj in the server command")
     selected = args.suite
     if "all" in selected:
         if len(selected) != 1:
             parser.error("all cannot be combined with other suites")
-        selected = [suite for suite in SUITES if suite not in ("auto-tools", "tool-native-types", "cache-bridge", "prefill-scheduling")
-                    and (suite not in ("image-inputs", "image-count")
+        selected = [suite for suite in SUITES if suite not in (*INCLUDED_IN, "cache-bridge", "cache-compaction", "cache-transforms", "cache-pressure", "cache-messages-loop", "cache-stalls", "prefill-scheduling")
+                    and (suite not in ("image-inputs", "image-count", "tool-images")
                          or option(command, "--mmproj") is not None)]
-    selected = list(dict.fromkeys(selected))
+    selected = [suite for suite in dict.fromkeys(selected) if INCLUDED_IN.get(suite) not in selected]
     disk_enabled = bool(set(selected) & {"cache", "image-count"})
     try:
         overrides = sampling_overrides(command)
@@ -271,6 +314,8 @@ def main():
     except (ValueError, OSError) as error:
         parser.error(str(error))
     output = args.output.resolve()
+    # Every suite process inherits the tier; see tier.py.
+    os.environ["GUFO_FUNCTIONAL_TIER"] = args.tier
     with socket.socket() as reserve:
         reserve.bind(("127.0.0.1", 0))
         port = reserve.getsockname()[1]
@@ -298,6 +343,7 @@ def main():
               "binary": str(Path(command[0]).resolve()),
               "mode": "baseline" if args.record_baseline else "qualification",
               "sampling_preset": args.sampling_preset, "sampling_overrides": overrides,
+              "request_timeout": args.request_timeout, "tier": args.tier,
               "vision": vision, "speculative": speculative,
               "suites": {}, "through_case": args.through_case,
               "allow_missing_progress": args.allow_missing_progress,
@@ -376,8 +422,8 @@ def main():
                 report["snapshot_budget"] = check_snapshot_budget(
                     (output / "server.log").read_text(), available_before_load,
                     int(option(command, "--cache-ram-bytes", "0")), sessions)
-            configured = "cache-bridge" in selected and re.search(
-                r"event=snapshot_cache_configured .*?\bcapacity_bytes=(\d+)\b",
+            configured = bool(set(selected) & {"cache-bridge", "cache-pressure"}) and re.search(
+                r"event=(?:snapshot_cache_configured|configured) .*?\bcapacity_bytes=(\d+)\b",
                 (output / "server.log").read_text())
             for suite in selected:
                 if suite == "cache":
@@ -386,6 +432,7 @@ def main():
                             "--suite", suite, "--output", str(output / (suite + ".json")),
                             "--sampling-preset", args.sampling_preset,
                             "--sampling-overrides", json.dumps(overrides),
+                            "--request-timeout", str(args.request_timeout),
                             "--concurrency", str(sessions), "--speculative", speculative,
                             "--context", option(command, "--context"),
                             "--server-log", str(output / "server.log")]
@@ -395,7 +442,7 @@ def main():
                     sdk_args += ["--expected-input-modalities", args.expected_input_modalities]
                 if option(command, "--think") is not None:
                     sdk_args += ["--server-thinking", option(command, "--think")]
-                if suite == "cache-bridge" and configured:
+                if suite in ("cache-bridge", "cache-pressure") and configured:
                     sdk_args += ["--snapshot-capacity-bytes", configured[1]]
                 if suite == through_suite:
                     sdk_args += ["--through-case", through_case]
@@ -417,7 +464,7 @@ def main():
                             "--url", base_url, "--model", model, "--prefix-repetitions", "16",
                             "--output", str(output / (label + ".json")), *extra]):
                         ready_to_restore.append(label)
-                # Last, so the drained log after this offset belongs to it.
+                # Retain the window; checkpoint IDs identify fixture-owned writes.
                 spacing_offset = (output / "server.log").stat().st_size
                 spacing = run("disk-spacing", "cache_disk_spacing.py", [
                     "--url", base_url, "--model", model,
@@ -443,7 +490,8 @@ def main():
                 grown_log = log.read()
             report["disk_spacing"] = check_disk_spacing(
                 grown_log, (output / "server-restarted.log").read_text(),
-                json.loads((output / "disk-spacing.json").read_text())[0])
+                json.loads((output / "disk-spacing.json").read_text())[0],
+                json.loads((output / "disk-spacing-disk.json").read_text())[0])
     except Exception as error:
         report["error"] = str(error)
         report["traceback"] = traceback.format_exc()

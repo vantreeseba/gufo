@@ -11,7 +11,7 @@ fields return explicit errors.
 
 Chat Completions is the main API, including streaming, images and tools.
 Responses supports text, images and function tools with optional streaming.
-Anthropic Messages exposes a synchronous text subset.
+Anthropic Messages supports text, images and custom tools.
 The reference protocols are:
 
 - https://developers.openai.com/api/reference/resources/responses/methods/create/
@@ -74,6 +74,7 @@ Text serving defaults match llama.cpp for context and generation length:
 | Setting | Default |
 | --- | --- |
 | `--context` | `0`: native context from model metadata, per session |
+| `--enable-yarn` | Off; Flash-Next requires it for `--context` above 262144 |
 | `--max-tokens` | `-1`: until EOS or remaining context is exhausted |
 | `--sessions` | `1` |
 | Thinking / reasoning effort | Enabled; Qwen `xhigh`, DeepSeek `high` |
@@ -91,7 +92,7 @@ available memory.
 Text sampling follows each model's recommended defaults in `serve`, `prompt`
 and `chat`. Explicit request values override explicit server options, which
 otherwise inherit the effective thinking preset. Null request values inherit
-where supported; explicit zero values are preserved (`top_p` must remain positive).
+where supported; explicit zero values, including `top_p: 0`, are preserved.
 The startup sampling log reports server defaults; requests can override each
 setting independently, including when changing thinking mode.
 
@@ -171,9 +172,35 @@ configured ceiling. Sampled MTP proposals use p/q acceptance and residual
 correction; greedy verification follows target argmax. Draft and verification
 work can batch across ready requests. See the
 [Flash-Next benchmark and quality contract](models/qwen3.8-flash-next/BENCHMARKS.md).
+Flash-Next's native context is 262144. `--context` above it requires
+`--enable-yarn`, which enables static YaRN with factor context / 262144; the
+server refuses to start without the flag, and the flag is an error at or below
+262144. The factor applies to every request, including short ones; see the
+[measurements](https://github.com/gufo-org/gufo/pull/350#issuecomment-6323981940),
+the
+[opt-in proposal](https://github.com/gufo-org/gufo/pull/350#issuecomment-6323982386),
+the
+[accuracy check](https://github.com/gufo-org/gufo/pull/350#issuecomment-6234093998)
+and [Qwen3.8 Flash-Next](models/qwen3.8-flash-next/README.md) for the memory
+cost.
 
 Each model chooses its prefill chunk. `--prefill-chunk` limits prompt work
 between active decode rounds without changing a lone request's kernel policy.
+
+Qwen image requests reuse decoded and resized RGB pixels using a fast lookup
+hash and exact encoded-byte comparison under the preprocessing version. Each
+loaded Qwen runner retains up to 128 MiB of encoded bytes and resized pixel
+vectors combined, evicting least-recently-used images; entry metadata is also
+bounded. `cache_prompt: false` bypasses this reuse as well as continuation reuse.
+Requests share immutable buffers, so eviction does not invalidate an in-flight
+request. This CPU cache is separate from the snapshot budget below and is not
+written to disk. A resized 1920×1080 screenshot takes about 6 MiB of RGB storage,
+plus its encoded bytes. The compressible test screenshots fit 21 entries in
+this budget; larger encoded files reduce that count. Warm history still pays
+for prompt rendering, tokenization and the existing pixel/position identity
+hash; a new screenshot still needs vision encoding and prefill. Debug logs
+expose `event=image_cache` with whether reuse is enabled, entries, retained
+pixel/encoded bytes, hits, misses and evictions.
 
 `--cache-ram-bytes 0` (the default) selects an automatic snapshot budget capped
 at 32 GiB and half the available host RAM after model/state allocation, respecting
@@ -183,17 +210,35 @@ movable pages, not GPU allocations. 27B also checks HIP free memory. A
 positive value sets a byte cap that may exceed the automatic budget, up to the
 available host RAM minus 4 GiB; the startup line reports both as
 `automatic_bytes` and `max_bytes`.
-Disk staging and temporary disk-save buffers are separate from this RAM budget.
+On Qwen27B and Flash-Next, the pinned disk staging buffer comes out of that ceiling, and
+`max_bytes` excludes it. Other models' disk staging and temporary disk-save
+buffers are separate from this RAM budget.
 The 128 checkpoint records are independent of `--sessions`; more than one can
 belong to a conversation.
-Payloads are allocated only when captured. Under pressure, optional copies
-give way before another conversation's last useful checkpoint.
+Qwen27B and Qwen3.8-Flash-Next pin pages for up to about 89% of its budget as captures
+need them, about 1 GiB at a time, and keeps them; the rest covers cache metadata as
+it grows. The first step runs at startup and later ones on a background thread
+ahead of need. Each takes about 200 ms while the host has free pages and longer
+when the kernel must reclaim page cache. Segments use ordinary pages that are
+registered with HIP: `hipHostMalloc` asks for high-order pages, and compacting
+host memory for them stalled decode for seconds when most RAM belonged to the GPU.
+Growth stops early while the host would keep less than 4 GiB available. The pages hold checkpoint state and KV rows, partial
+tails and idle-session spill; there is no separate spill option.
+Other models allocate payloads only when captured. Under pressure, optional
+copies give way before another conversation's last useful checkpoint.
+
+Qwen27B uses component-cache slots in both AR and DFlash2 modes. A checkpoint
+includes target KV and recurrent state, image-prefix identity, sampled frontier
+and pending output tokens. DFlash2 also retains its independently positioned
+ring KV, pending target features and draft controller state. Completed prefill
+steps can be retained after cancellation. MTP is unsupported on Qwen27B.
 
 Prompt reuse is enabled by default; how the cache finds, retains and
 evicts that state is described in [the KV cache](KV-CACHE.md).
 `cache_prompt: false` on
-`/v1/chat/completions` or `/v1/responses` bypasses memory and disk lookup for
-that request; the result can still populate the cache. DeepSeek and Qwen tool
+`/v1/chat/completions`, `/v1/responses`, `/v1/completions` or `/completion`
+bypasses memory and disk lookup for that request; the result can still
+populate the cache. `null` keeps the default, `true`. DeepSeek and Qwen tool
 requests retain a checkpoint before the assistant-generation suffix, including
 when a client drops the interrupted assistant and appends `"."` after a tool result. DeepSeek
 also accounts for tokenization changes where adjacent user/tool turns join.
@@ -215,22 +260,49 @@ With `preserve_thinking=false`, a new user turn removes reasoning from the
 preceding tool cycle. Gufo retains the state before that cycle and processes
 its changed suffix again.
 
+A loaded Qwen vision sidecar is prepared while the model loads, before the RAM
+cache is sized and before readiness: Gufo hashes the complete sidecar for image
+cache identities and uploads the encoder weights, so neither happens in the
+first image request and admission's free device memory already excludes them.
+The weights stay resident even if no image arrives, including a sidecar
+auto-discovered as `mmproj-BF16.gguf` in the model's directory or its parent.
+The startup line `event=vision_prepared` reports `resident_bytes`,
+`identity_ms` and `upload_ms`. Startup fails if the upload does not fit. Image
+encoding scratch is still allocated per image.
+
 `SIGINT` and `SIGTERM` cancel active requests and drain accepted disk writes
 before exiting. `--cache-disk DIR` defaults to 8 GiB retained on disk.
-`--cache-disk-staging-bytes 0` (the default) selects the smaller of one eighth
-of available host RAM after model/session loading (including cgroup limits) and
-the disk budget. This bounds queued captures/writes and each disk read
-separately; it allocates nothing upfront. Live model state and retained RAM
-snapshots have separate budgets.
 
+On Qwen27B and Flash-Next, `--cache-disk-bytes` counts every file the cache manages,
+including temporary files of unfinished writes and files a crash left
+unreferenced. Restarting with a lower budget removes those first, then the
+oldest checkpoints by creation order, until the directory fits; use history does not
+survive a restart. One Qwen27B or Flash-Next server owns the directory: a second one fails
+at startup, after loading its model but before committing its RAM budget, with
+an ownership error naming the directory. The lock does not wait: a restarted
+server fails if its predecessor is still draining disk writes when the new one
+finishes loading its model. Other models do not take this lock.
+The first start on a directory written by an earlier release removes its old
+checkpoint files (`*.kvc`), and the cache refills as conversations run. Do not
+share a directory with another model server; the component cache removes
+their checkpoint and temporary files too, including writes in progress.
+Qwen27B and Flash-Next ignore `--cache-disk-staging-bytes` and logs
+`event=option_ignored`. Writes and restores stream each checkpoint through an
+internal 1 MiB pinned buffer, piece by piece; a larger buffer did not change
+restore or write speed and took pinned RAM and device heap from the cache and
+the sessions. Remove the option from Qwen27B and Flash-Next command lines.
+
+For DeepSeek, `--cache-disk-staging-bytes 0` (the default) selects the
+smaller of one eighth of available host RAM after model/session loading
+(including cgroup limits) and the disk budget. This bounds queued
+captures/writes and each disk read separately; it allocates nothing upfront.
+Live model state and retained RAM snapshots have separate budgets.
 Snapshots that exceed either limit are skipped with their required size and
 available budget logged; live conversation reuse remains available. Existing
 files that exceed the current staging limit are preserved subject to disk LRU
 eviction and can be reused after restarting with sufficient staging.
-For Flash-Next/MTP at full 262K context, explicitly set
-`--cache-disk-staging-bytes 8589934592` (8 GiB) if RAM permits.
-Qwen27B at full context needs larger staging and `--cache-disk-bytes` limits;
-use the required size reported in the skip log.
+Qwen27B streams large checkpoints through the same fixed 1 MiB staging buffer;
+`--cache-disk-bytes` still needs to fit the retained checkpoints.
 
 For a focused cancellation check, run
 `python3 tests/functional/continuation.py --output /tmp/cache-check.json`
@@ -298,6 +370,27 @@ official Jinja: thinking enabled, `xhigh` effort, prior reasoning preserved.
 Use `--think off` or `chat_template_kwargs.enable_thinking=false` for direct
 answers. DeepSeek defaults to thinking with `high` effort. Quality comparisons
 must use the same reasoning mode and effort.
+
+`--reasoning-budget N` caps reasoning at N tokens on Chat, Responses and
+Messages requests, as in llama.cpp: `-1` (the default) is unlimited and `0`
+ends reasoning at once. Chat and Responses override it per request with
+`reasoning_budget_tokens` (`-1` keeps the server default), and Messages with
+`thinking.budget_tokens` when `thinking.type` is `enabled`. Tokens are counted
+from the reasoning start, including the newline after Qwen's `<think>`. Once
+the budget is spent and the last token completes its UTF-8 character, the
+model's reasoning end is forced: `\n</think>` for Qwen, `</think>` for DeepSeek.
+For an ASCII Qwen response that reaches the cap, N generated reasoning tokens
+precede `</think>`. A natural end can use fewer tokens, and completing a UTF-8
+character can require more. A Qwen `<tool_call>` also ends reasoning. The budget
+covers the initial reasoning phase. Later `<think>` spellings remain literal
+answer or tool-argument data, consistent with Gufo's response framing.
+
+Chat and Responses also accept llama.cpp's older `thinking_budget_tokens`
+spelling for existing clients; a non-null `reasoning_budget_tokens` takes
+precedence. Request budgets must fit a signed 32-bit integer; Messages budgets
+must also be positive. The server does not automatically reserve part of
+`max_tokens` for the answer: clients must set a smaller reasoning budget when
+they need that room.
 
 Keep `reasoning_effort` (Chat) or `output_config.effort` (Messages) consistent
 across turns while thinking is enabled: Qwen and DeepSeek render the effort
@@ -566,6 +659,17 @@ no native effect are accepted and ignored so conforming clients interoperate
 `store` and `background` must be false when present; server-side conversations
 and `previous_response_id` remain unsupported.
 
+Function-call output accepts either a text string or an array of `input_text`
+and `input_image` parts. Images stay inside the corresponding tool result;
+image-only output and interleaved text/images are supported. Historical
+`custom_tool_call` items and their `custom_tool_call_output` use the same
+association and output parts; the custom call's free-form `input` is retained
+as literal tool-history data. This does not enable custom-tool generation.
+Chat Completions also accepts `image_url` parts in `role:"tool"` content.
+Existing text-string outputs keep their prompt representation. Images remain
+unsupported in assistant/system/developer messages; only `detail:"auto"` is
+accepted, and file IDs and `input_file` parts remain unsupported.
+
 Responses report `incomplete` with reason `max_output_tokens` when generation
 hits its limit. Otherwise they report `completed`. `stream: true` sends typed
 SSE events with consecutive `sequence_number` values: lifecycle, output items,
@@ -595,7 +699,7 @@ The other compatibility routes are deliberately limited:
 | Route | Supported request | Output limit |
 | --- | --- | --- |
 | `/v1/completions` | One prompt string, buffered or SSE completion | `max_tokens` |
-| `/v1/messages` | Text, thinking and tool blocks, optional text system instructions and custom tools; buffered or SSE | `max_tokens` |
+| `/v1/messages` | Text, image, thinking and tool blocks, optional text system instructions and custom tools; buffered or SSE | `max_tokens` |
 | `/completion` | One prompt string, non-streaming completion | `n_predict` |
 
 All four routes validate the loaded model, positive integer limits and shared
@@ -608,9 +712,10 @@ complete usage, and `message_stop`. `message_start` reports zero usage because
 prompt accounting is final only at the end. A failure after the headers sends
 an `error` event. Responses and Messages honor the server's thinking defaults.
 Messages accepts `thinking.type` (`enabled`, `adaptive` or `disabled`);
-`adaptive` keeps the server's thinking default, and `budget_tokens` has no
-native equivalent, so the effort stays the server's unless
-`output_config.effort` sets it. Reasoning is returned as a `thinking` block
+`adaptive` keeps the server's thinking default. With `enabled`,
+`budget_tokens` caps the reasoning (see Reasoning controls), and the answer
+follows. The effort stays the server's unless `output_config.effort`
+sets it. Reasoning is returned as a `thinking` block
 before the `text` block, with an empty `signature`, for every accepted
 `thinking.display` (`summarized`, `omitted` or `updates`). Replay assistant
 `thinking` blocks unchanged so later turns reuse the cached prompt.
@@ -622,10 +727,23 @@ reasoning effort used while thinking is on; it never enables thinking. Other
 constraints and cache reuse match Chat Completions. Calls are returned as
 `tool_use` blocks with `stop_reason: "tool_use"`; replay them unchanged with
 the following `tool_result` blocks. Server tools such as `web_search` are
-rejected. Completions routes accept `stop`;
+rejected. Messages accepts `image` blocks in user turns and in `tool_result`
+content, with a `base64` source (PNG, JPEG or WebP) or an HTTPS `url` source,
+under the same limits and model requirements as Chat Completions images;
+images in assistant turns, `file` sources and `document` blocks are rejected.
+Completions routes accept `stop`;
 Messages accepts `stop_sequences`. Responses has no stop-sequence field.
-`/infill` and `/v1/messages/count_tokens` return 501: suffix-conditioned infill
-and template-aware message counting are not implemented.
+`POST /v1/messages/count_tokens` accepts the same text, images, system, thinking and
+tool history as Messages and returns `{"input_tokens": N}` after rendering the
+model's chat template. `max_tokens` is optional; `stream: true` is rejected.
+The count includes cached prompt tokens and does not generate, prefill or
+change the conversation cache. Prompts may exceed the configured execution
+context so clients can size them before trimming; generation still enforces
+the context limit. Images use the same resizing and visual token expansion as
+generation, without running the vision encoder; the matching projector must
+be loaded. Models without image support reject image counts with 400.
+Backends without chat counting support return 501. `/infill` still returns 501 because
+suffix-conditioned infill is not implemented.
 
 Raw Completions accepts `stream: true` and
 `stream_options: {"include_usage": true}`. The final usage event reports prompt,
@@ -748,7 +866,8 @@ keys last. Impossible strict schemas are rejected before generation.
 call, with the same argument syntax as `auto`. Where
 the backend cannot constrain sampling, an unmet `required` choice still returns
 `tool_choice_unsatisfied` (HTTP 502, or an SSE error after streaming starts).
-Stops and token limits terminate normally without emitting incomplete calls.
+Stops and token limits terminate normally. Responses streams may retain a partial
+call with `status: "incomplete"`; clients must execute only completed calls.
 With no tools or `tool_choice:"none"`, tool markers are ordinary text and do
 not interrupt reasoning or delay streaming.
 
@@ -782,6 +901,16 @@ Constraints apply before target sampling in AR, DFlash2, MTP and DSpark, includi
 streaming, images and concurrent requests. Reasoning stays separate from JSON
 and counts toward the output budget. Changing the schema changes the cache prefix.
 
+Every schema and tool grammar uses one token vocabulary per loaded model.
+Gufo prepares it automatically while the model loads, before readiness, and
+every constrained request reuses it. This moves a one-time CPU cost from the
+first constrained request to startup (Flash-Next: 248,320 tokens, about 30 ms).
+The vocabulary stays resident even if no request is constrained. The startup
+line `event=structured_output_prepared` reports `vocabulary_tokens`, `prepare_ms`
+and `rss_delta_kib`. Runners without structured output skip preparation and
+retain ordinary text serving; vocabulary build errors still fail startup.
+Grammars and their masks are unchanged.
+
 `</think>` ends reasoning before constrained JSON. Native tools also accept an
 unquoted function header as the boundary when the model omits `</think>`.
 Bare marker mentions and quoted examples remain reasoning; markers inside
@@ -798,8 +927,12 @@ Supported: objects, arrays, nullable types, `enum`/`const`, `anyOf`, recursive l
 array length bounds. Formats include date/time, duration, email, hostname,
 IP addresses and UUID.
 
-The root must resolve to an object. Objects require `additionalProperties:false`;
-strict schemas require every property (use null for optional values).
+The root must resolve to an object. As in llama.cpp, an object that declares
+`properties` admits no other keys unless `additionalProperties` is `true` or a
+schema for their values; extra keys then follow the declared properties. An
+object without `properties` admits any keys unless `additionalProperties` is
+`false`. Strict schemas require every property (use null for optional values).
+Tool parameter schemas keep their separate rules below.
 Unsupported keywords, external references and unusable cycles are rejected.
 Schemas are limited to 2 MiB, 5,000 properties, 1,000 enum values and 120,000
 characters in names and enum/const strings. Patterns use ECMA-262 Unicode
@@ -807,9 +940,11 @@ semantics; lookbehind, backreferences, inline flags and unbounded repetition
 of assertions are unsupported.
 
 Function `strict:true` constrains tool arguments independently of the response
-schema. Chat Completions defaults to non-strict tools. Responses attempts strict
-schema normalization when `strict` is omitted, falling back to `strict:false`
-when unsupported; explicit `strict:false` keeps best-effort arguments.
+schema. Chat Completions and Responses preserve the supplied parameter schema
+when `strict` is omitted, `null` or `false`, matching llama.cpp's schema
+handling. Optional fields stay optional; Gufo does not add them to `required`
+or force the model to invent default values. To require every field, list them
+in `required` and use `strict:true` with a closed object schema.
 With `tool_choice: "auto"`, the model may call a tool or give a final answer;
 the response schema constrains the latter. Use `"none"` for JSON answers only,
 `"required"` to force a call, or select a named function.
@@ -877,8 +1012,10 @@ Authorization: Bearer <local-token>
 
 Authentication covers every route, including health, metrics, audio, and video.
 CORS preflight (`OPTIONS`) does not require credentials. Select the listen
-address with `--host`; it must be an IPv4 address. TLS termination belongs in
-a reverse proxy.
+address with `--host`; it must be a numeric IPv4 or IPv6 address, not a host
+name. `--host ::` is dual-stack: it accepts IPv6 clients and IPv4 clients, and
+an IPv4 client keeps its IPv4 address as its client ID. `--host ::1` accepts
+only IPv6 loopback clients. TLS termination belongs in a reverse proxy.
 
 Request bodies, prompts, generated text and credentials are not logged.
 
@@ -917,6 +1054,14 @@ service is ready, then reports `status` and the active model. Both read the
 recorded device state without performing GPU work on each poll. HTTP model replacement and persistent Responses
 conversations are not implemented.
 
+While `gufo serve llm` loads its model and walks the disk cache tier, the port
+already answers every request, `/health` included, with 503
+`{"error":{"message":"Loading model","type":"unavailable_error","code":"loading"}}`
+and `Retry-After: 1`, as llama-server does. A refused connection therefore
+means the process is not running; supervisors such as llama-swap, which treat
+only a 200 health check as ready, keep waiting until the model is loaded. If
+the address cannot be bound early, the port stays closed until the load ends.
+
 A GPU reset (for example `amdgpu` recovering from a MES hang) permanently
 invalidates the process's HIP context. The text scheduler checks it after five
 seconds of continuous idle time, then every five seconds while idle. The probe
@@ -948,6 +1093,25 @@ loss permanent for the process:
   and exits with status 75 (`EX_TEMPFAIL`), also when an external `SIGTERM`
   stops it after the loss. Teardown can block on the dead device, so the
   process exits with status 75 after 10 s regardless.
+
+A device call that never returns is a different failure: nothing fails, so
+nothing is probed, and the server keeps answering `/health` and sending stream
+heartbeats while generation has stopped. `--stall-timeout-ms MS` bounds that.
+Progress means a request being admitted, a work unit starting, a pending
+checkpoint capture completing or the idle wait returning. When the scheduler has work but none of those
+happens for `MS`, it logs
+`event=device_lost remedy=restart reason=scheduler made no progress for <MS> ms`
+and follows the lost-device path above, including the exit with status 75 and
+the `gufo_device_lost_total` increment. This covers a hang on the scheduler
+thread, in a capture the scheduler is waiting for, and in the idle device
+probe. Detection takes between `MS` and about 1.5 times `MS`. Requests already
+in flight end when the process exits. The default, 0, disables the check;
+other values must be at least 60000, because a deep checkpoint capture or a
+post-failure device probe can legitimately hold progress for tens of seconds.
+An idle server and a queued request never count as stalled. While any other
+request is still progressing, a hung capture is not reported; it is once
+nothing else can run. A disk-cache write that never completes is not detected
+while generation continues.
 
 Text streams defer HTTP headers until the scheduler admits the request and
 starts its prompt, or until the request has waited five seconds in the queue,
@@ -995,7 +1159,9 @@ reads the result, it adds the request's cached prompt tokens
 speculative verification rounds (`llamacpp:spec_decode_num_drafts_total`),
 proposed and accepted draft tokens
 (`llamacpp:spec_decode_num_draft_tokens_total`,
-`llamacpp:spec_decode_num_accepted_tokens_total`), and raises
+`llamacpp:spec_decode_num_accepted_tokens_total`), proposed and accepted
+prompt-lookup copies (`gufo_spec_lookup_tokens_total`,
+`gufo_spec_lookup_accepted_tokens_total`), and raises
 `llamacpp:n_tokens_max` to its prompt plus generated tokens. A request counts
 even if the client disconnects before reading it; requests that fail in the
 scheduler, such as on a deadline or a runner error, add none of these.
@@ -1014,8 +1180,19 @@ prompt, `n_prompt_tokens_cache` the tokens restored from cache, and
 `timings.prompt_n`. `next_token[0].n_decoded` counts generated tokens and
 `n_remain` the remaining token budget. Idle slots report zero counts and
 `n_remain` -1. `task_id` and `state` (0 idle, 1 processing) remain for older
-clients; `prompt` is always empty. `/props` metadata is a placeholder.
+clients; `prompt` is always empty.
 Slots and metrics are separate snapshots; requests can advance between polls.
+
+`GET /props` reports what a text server runs, in llama-server's shape, so
+llama-server tooling can record which model, build and settings answered it.
+`?model=` is accepted and not required. `model_alias` is the served model
+name, `model_path` is `--model`, `build_info`
+the version and revision `gufo --version` prints, `total_slots` the
+`--sessions` count, `default_generation_settings.n_ctx` the per-session context
+and `default_generation_settings.params` the sampling a request without
+sampling fields gets, with `n_predict` and `max_tokens` -1 when no default
+limit is set. `modalities.vision` is true only when a vision encoder
+loaded. Fields the server cannot report are omitted rather than sent as zero.
 
 Streaming terminal chunks always include llama.cpp-compatible `timings`, even
 without `stream_options.include_usage`. `prompt_n` counts newly processed

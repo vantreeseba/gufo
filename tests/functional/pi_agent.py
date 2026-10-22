@@ -6,6 +6,7 @@ sessions, exact HTTP bodies/SSE, task files and individual request/task timings.
 """
 
 import argparse
+import base64
 import collections
 import hashlib
 import http.client
@@ -44,6 +45,17 @@ PROMPTS = {
         f'render("user", "hello") equals "{kImStart}user\\nhello{kImEnd}\\n". '
         'Report success only after the assertions pass.'
     ),
+    "image-read": (
+        "Use the read tool to open swatch.png. Inspect the image returned by that "
+        "tool, then reply with only its dominant color in lowercase. "
+        "Do not use bash or infer the color from a filename."
+    ),
+    "wide-tool": (
+        "Use the todo tool to mark existing task 1 as completed, then mark "
+        "existing task 2 as in_progress. Make exactly two calls, both updates. "
+        "Do not change any other fields or make verification calls. "
+        "After the two successful results, reply DONE."
+    ),
 }
 SLUG_TEST = """const assert = require("node:assert");
 const slugify = require("./slugify");
@@ -61,13 +73,14 @@ def save(path, value):
 class Recorder(http.server.ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, upstream, output):
+    def __init__(self, upstream, output, *, request_timeout=180):
         super().__init__(("127.0.0.1", 0), Proxy)
         self.upstream = urllib.parse.urlsplit(upstream)
         self.output = output
         self.requests = []
         self.lock = threading.Lock()
         self.case = "startup"
+        self.request_timeout = request_timeout
 
 
 class Proxy(http.server.BaseHTTPRequestHandler):
@@ -104,7 +117,7 @@ class Proxy(http.server.BaseHTTPRequestHandler):
         body = self.rfile.read(int(self.headers["Content-Length"]))
         stem.with_suffix(".json").write_bytes(body)
         conn = http.client.HTTPConnection(
-            server.upstream.hostname, server.upstream.port, timeout=180
+            server.upstream.hostname, server.upstream.port, timeout=server.request_timeout
         )
         start = time.monotonic()
         try:
@@ -221,7 +234,8 @@ def validate_requests(rows, server_log=None):
 def validate_task(name, cwd, history):
     calls = calls_from(history)
     for call in calls:
-        assert call["name"] in {"read", "write", "edit", "bash"}, call
+        allowed = {"todo"} if name == "wide-tool" else {"read", "write", "edit", "bash"}
+        assert call["name"] in allowed, call
         assert isinstance(call["arguments"], dict), call
         path = call["arguments"].get("path", "")
         assert not any(tag in path for tag in ("<tool_call", "</tool_call", "</think")), call
@@ -241,6 +255,18 @@ def validate_task(name, cwd, history):
     # so a sampled run may create or read a file through bash instead.
     if name == "simple":
         assert not calls and text.strip().rstrip(".") == "Paris", text
+    elif name == "wide-tool":
+        expected = [{"action": "update", "id": 1, "status": "completed"},
+                    {"action": "update", "id": 2, "status": "in_progress"}]
+        actual = [call["arguments"] for call in calls]
+        assert actual == expected, calls
+        assert all(type(update["id"]) is int for update in actual), calls
+        executed = [json.loads(line) for line in (cwd / "todo-calls.jsonl").read_text().splitlines()]
+        assert executed == actual, executed
+        results = [m for m in history if m.get("role") == "toolResult"]
+        assert len(results) == 2 and all(not m.get("isError") for m in results), results
+        for result, wanted in zip(results, ("Task 1: completed", "Task 2: in_progress")):
+            assert any(p.get("text") == wanted for p in result.get("content", [])), result
     elif name == "tools":
         assert (cwd / "hello.txt").read_bytes() == b"bonjour"
         assert {"bash", "read"} <= names, names
@@ -259,6 +285,19 @@ def validate_task(name, cwd, history):
         assert {"write", "read", "bash"} <= names, names
         results = [m for m in history if m.get("role") == "toolResult"]
         assert results and all(not m.get("isError") for m in results), results
+    elif name == "image-read":
+        assert names == {"read"} and text.strip().rstrip(".!").lower() == "red", (names, text)
+        observed = [m for m in history if m.get("role") == "toolResult"]
+        assert observed and all(not m.get("isError") for m in observed), observed
+        images = [part for result in observed for part in result.get("content", [])
+                  if part.get("type") == "image"]
+        assert images, "Pi did not return an actual image from read"
+        from PIL import Image
+        import io
+        for part in images:
+            with Image.open(io.BytesIO(base64.b64decode(part["data"], validate=True))) as image:
+                image.load()
+                assert image.convert("RGB").getpixel((image.width // 2, image.height // 2)) == (255, 0, 0)
     elif name == "creation":
         assert (cwd / "stats.js").is_file() and (cwd / "test.js").is_file()
         subprocess.run(["node", "test.js"], cwd=cwd, check=True, capture_output=True, timeout=10)
@@ -291,6 +330,9 @@ def run_case(args, recorder, env, index, name):
     elif name == "bugfix":
         (cwd / "slugify.js").write_text('module.exports = function slugify(title) {\n  return title.toLowerCase().replace(/ /g, "-");\n};\n')
         (cwd / "slugify.test.js").write_text(SLUG_TEST)
+    elif name == "image-read":
+        from run import image_fixture
+        image_fixture(cwd / "swatch.png")
     session = (args.output if args.conversation else case) / "session.jsonl"
     previous_messages = len(messages(session))
     command = [
@@ -302,6 +344,9 @@ def run_case(args, recorder, env, index, name):
     ]
     if args.context_file:
         command += ["--append-system-prompt", str(args.context_file)]
+    if name == "wide-tool":
+        command += ["--extension", str(Path(__file__).resolve().parent / "fixtures/pi_wide_tool.ts"),
+                    "--tools", "todo"]
     save(case / "command.json", command)
     recorder.case = case.name
     row = {"case": case.name, "start_request": len(recorder.requests)}
@@ -391,7 +436,8 @@ def main():
     env = {k: v for k, v in os.environ.items() if k in {"PATH", "HOME", "USER", "LANG", "LC_ALL", "TMPDIR", "SHELL", "SSL_CERT_FILE"}}
     env.update(PI_CODING_AGENT_DIR=str(config), PI_OFFLINE="1", PI_TELEMETRY="0")
     rows = []
-    cases = args.case * args.passes if args.case else ["simple"] + list(PROMPTS) * args.passes
+    cases = (args.case * args.passes if args.case else
+             ["simple"] + [name for name in PROMPTS if name != "image-read"] * args.passes)
     try:
         for index, name in enumerate(cases):
             rows.append(run_case(args, recorder, env, index, name))

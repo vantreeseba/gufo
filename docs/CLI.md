@@ -31,6 +31,9 @@ The supported modalities are LLM, image, video, and audio (TTS, ASR).
 
 - `context` — maximum context capacity; memory use depends on the model and
   the number of resident sessions.
+- `enableYarn` — Qwen3.8-Flash-Next only: allow a `context` above the native
+  262144 tokens through static YaRN, which applies to every request. Required
+  above 262144 and rejected at or below it.
 - `prefillChunk` — prompt tokens processed between active decode steps in
   HTTP serving. Model runtimes choose their own internal prefill batch sizes.
 - `maxTokens` — maximum number of tokens a request may generate. In practice:
@@ -82,10 +85,16 @@ The supported modalities are LLM, image, video, and audio (TTS, ASR).
 
 - `cacheDisk` — enable an on-disk cache of computed prompt state, reused
   across requests and restarts. In practice: repeated or shared prompts get
-  much faster; costs disk space.
-- `cacheDiskBytes` — the maximum size of that cache on disk.
-- `cacheDiskStagingBytes` — scratch space used while writing new cache
-  entries. Must fit alongside `cacheDiskBytes`.
+  much faster; costs disk space. Give each Qwen27B or Flash-Next server its own
+  directory: one server owns it, and a second one fails at
+  startup.
+- `cacheDiskBytes` — the maximum size of that cache on disk. Qwen27B and Flash-Next also
+  count unfinished writes, and lowering it removes its oldest checkpoints
+  (by creation) at the next start.
+- `cacheDiskStagingBytes` — RAM used to move cache entries to and from disk.
+  Qwen27B and Flash-Next stream entries of any size through a 1 MiB buffer by default;
+  other models need it to hold a whole entry. See
+  [the server guide](SERVER.md) for the defaults.
 
 **Speculative decoding**
 
@@ -115,6 +124,9 @@ seed. Speed depends on acceptance and verification cost.
   `maxPending`; set it lower so one client cannot hog the whole queue.
 - `requestTimeoutMs` — requests are killed after this many milliseconds. In
   practice: prevents stuck requests from holding GPU sessions forever.
+- `stallTimeoutMs` — the server exits as `device_lost` when generation makes
+  no progress for this many milliseconds, so the service manager restarts
+  it. Off unless set; at least 60000.
 - `maxOutputBytes` — maximum response size per request.
 - `maxBufferedOutputBytes` — maximum generated-but-not-yet-delivered output
   buffered for one request; protects against slow clients.
@@ -177,7 +189,7 @@ These apply to every modality, before or after the subcommand:
 
 - `host` / `port` — where to listen (`-i` / `-p`). In practice: set
   `--host 0.0.0.0` if you serve from inside a container, or the published
-  port will not answer.
+  port will not answer. Use `--host ::` to listen on IPv6 and IPv4 together.
 - `sessions` (`-j`) — preallocated GPU request sessions. In practice: more
   sessions means more requests can compute at once, at the cost of memory
   per session. This option applies to LLM serving; image and speech servers

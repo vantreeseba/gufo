@@ -12,6 +12,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -138,6 +139,27 @@ int main(int argc, char** argv) try {
         reps);
     report("out", ms, 2.0 * tokens * m * k,
            Hash(y, tokens * m * sizeof(float)));
+    if (tokens >= 1024) {
+      constexpr auto stride = k + 32;
+      auto* padded =
+          static_cast<__half*>(Zeros(tokens * stride * sizeof(__half)));
+      CheckHip(
+          hipMemcpy2D(padded, stride * sizeof(__half), x, k * sizeof(__half),
+                      k * sizeof(__half), tokens, hipMemcpyDeviceToDevice),
+          "padded activation");
+      const auto expected = Hash(y, tokens * m * sizeof(float));
+      const double padded_ms = MedianMs(
+          [&] {
+            if (!q::DenseF16Gemm(w, padded, y, tokens, m, k, nullptr, stride))
+              throw std::runtime_error("strided DenseF16Gemm");
+          },
+          reps);
+      const auto actual = Hash(y, tokens * m * sizeof(float));
+      if (actual != expected)
+        throw std::runtime_error("strided projection changed output");
+      report("out-padded", padded_ms, 2.0 * tokens * m * k, actual);
+      CheckHip(hipFree(padded), "hipFree");
+    }
     CheckHip(hipFree(w), "hipFree");
     CheckHip(hipFree(x), "hipFree");
     CheckHip(hipFree(y), "hipFree");
@@ -180,6 +202,35 @@ int main(int argc, char** argv) try {
     CheckHip(hipFree(w), "hipFree");
     CheckHip(hipFree(x), "hipFree");
     CheckHip(hipFree(y), "hipFree");
+  }
+
+  // HC up projection fused with the stream mixer: [tokens][320] gates over
+  // four 2560-wide F16 streams into F16 and tiled Q8 mixer rows.
+  {
+    constexpr std::uint32_t hidden = 2560;
+    constexpr std::uint32_t rank = 320;
+    auto* w = Upload(Q8Weights(4 * hidden, rank, 51U));
+    auto* low = Upload(Activations(std::size_t{tokens} * rank, 52U));
+    auto* xn = Upload(Activations(std::size_t{tokens} * 4 * hidden, 53U));
+    auto* mixed = static_cast<__half*>(
+        Zeros(std::size_t{tokens} * hidden * sizeof(__half)));
+    const std::size_t q8_bytes =
+        ((tokens + 15) / 16) * std::size_t{hidden / 32} * 576;
+    auto* mixed_q8 = Zeros(q8_bytes);
+    const double ms = MedianMs(
+        [&] {
+          if (!q::HcMixF16Gemm(w, low, xn, nullptr, nullptr, mixed, mixed_q8,
+                               nullptr, tokens, hidden, rank, nullptr))
+            throw std::runtime_error("HcMixF16Gemm");
+        },
+        reps);
+    report("hcmix", ms, 2.0 * tokens * 4 * hidden * rank,
+           Hash(mixed, std::size_t{tokens} * hidden * sizeof(__half)) ^
+               Hash(mixed_q8, q8_bytes));
+    for (void* p :
+         {static_cast<void*>(w), static_cast<void*>(low),
+          static_cast<void*>(xn), static_cast<void*>(mixed), mixed_q8})
+      CheckHip(hipFree(p), "hipFree");
   }
 
   // SSM projection fused with the four-tap convolution.
@@ -255,9 +306,10 @@ int main(int argc, char** argv) try {
   }
 
   // BF16 indexer projections (query 512 x 2560, key 128 x 2560, and a TP2
-  // rank's halves): the library kernel against BlasLt::Gemm, which runs
-  // DenseBf16Gemm where that reproduces the library. Timed at the requested
-  // tokens; every token count up to it must match bitwise.
+  // rank's halves): the library kernel against BlasLt::Gemm's own kernel,
+  // which sums every token in K order. Timed at the requested tokens; the two
+  // agree to rounding, and the own kernel's rows must not depend on where a
+  // token sits in the batch.
   {
     std::string error;
     auto blas = q::BlasLt::Create(nullptr, &error);
@@ -307,31 +359,40 @@ int main(int argc, char** argv) try {
       std::printf("%s-own", name);
       report("", MedianMs([&] { own(t); }, reps), 2.0 * tokens * m * k,
              Hash(y_own, bytes));
-      int routed = 0;
-      int differ = 0;
-      std::string library_only;
-      for (int n = 1; n <= t; ++n) {
-        const bool uses_own = blas->UsesOwnKernel(HIP_R_16BF, m, n, k, &error);
-        routed += uses_own;
-        if (!uses_own) {
-          if (library_only.size() < 200)
-            library_only += " " + std::to_string(n);
+      if (!q::BlasLt::UsesOwnKernel(HIP_R_16BF, m, k))
+        throw std::runtime_error(std::string(name) + " runs the library");
+      lib(t);
+      own(t);
+      CheckHip(hipDeviceSynchronize(), "hipDeviceSynchronize");
+      const std::size_t count = std::size_t{static_cast<unsigned>(t)} * m;
+      const auto library = host(y_lib, count);
+      const auto whole = host(y_own, count);
+      double worst = 0.0;
+      for (std::size_t i = 0; i < count; ++i)
+        worst = std::max(worst, std::abs(double{library[i]} - whole[i]));
+      // The same rows at other offsets and batch widths.
+      int moved = 0;
+      for (const int offset : {1, 31, 37, 128, 777}) {
+        if (offset >= t)
           continue;
-        }
-        lib(n);
-        own(n);
+        const int n = t - offset;
+        if (!blas->Gemm(
+                w, static_cast<std::uint16_t*>(x) + std::size_t(offset) * k,
+                y_own, HIP_R_16BF, m, n, k, &error))
+          throw std::runtime_error(error);
         CheckHip(hipDeviceSynchronize(), "hipDeviceSynchronize");
-        const auto a = host(y_lib, std::size_t{static_cast<unsigned>(n)} * m);
-        const auto b = host(y_own, std::size_t{static_cast<unsigned>(n)} * m);
-        if (std::memcmp(a.data(), b.data(), a.size() * 4) != 0) {
-          if (++differ <= 10)
-            std::printf("%s n %d DIFF\n", name, n);
+        const auto part =
+            host(y_own, std::size_t{static_cast<unsigned>(n)} * m);
+        if (std::memcmp(part.data(), whole.data() + std::size_t(offset) * m,
+                        part.size() * 4) != 0) {
+          ++moved;
+          std::printf("%s offset %d DIFF\n", name, offset);
         }
       }
       std::printf(
-          "%s n 1..%d: own kernel at %d, bitwise differ at %d; "
-          "library only at:%s\n",
-          name, t, routed, differ, library_only.c_str());
+          "%s n %d: max |own - library| %.3g; rows changed with their "
+          "batch offset at %d of 5 offsets\n",
+          name, t, worst, moved);
       for (void* p : {static_cast<void*>(w), static_cast<void*>(x),
                       static_cast<void*>(y_lib), static_cast<void*>(y_own)})
         CheckHip(hipFree(p), "hipFree");

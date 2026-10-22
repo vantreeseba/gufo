@@ -68,6 +68,11 @@ def main():
     assert "8589934592" in help_text
     assert "0 = auto, at most the disk budget and 1/8 available RAM" in help_text
     assert "--log-progress" in help_text
+    assert "--enable-yarn" in help_text
+    assert "it applies to every request" in help_text
+    # The flag is a plain switch: it must not swallow the next argument.
+    check(["serve", "llm", "--enable-yarn", "--model", "missing.gguf"], 1,
+          "Error loading model 'missing.gguf'")
 
     # Verbosity must change the output, not merely parse. The config line is
     # emitted at the debug tier before the model file is opened, so these all
@@ -103,6 +108,10 @@ def main():
     keyed = run(load + ["-v", "--api-key", "super-secret-value"])
     assert "api_key=set" in keyed.stderr
     assert "super-secret-value" not in keyed.stderr
+    # Structured output is prepared automatically, without a separate option.
+    assert "--prepare-structured-output" not in help_text
+    check(["serve", "llm", "--model", "missing.gguf",
+           "--prepare-structured-output"], 2, "Unknown option")
     for bad in ("trace", "Debug", "", "info,debug"):
         check(["serve", "llm", "--log-level", bad, "--model", "missing.gguf"],
               2, "--log-level must be error, warn, info or debug")
@@ -168,6 +177,12 @@ def main():
                  ["--max-pending-per-client", "17"],
                  ["--max-pending-per-client", "0"], ["--max-pending", "0"]):
         check(["serve", "llm", *args], 2,
+              "sampling and scheduling limits are invalid")
+    for value in ("0", "60000"):
+        check(["serve", "llm", "--model", "missing.gguf",
+               "--stall-timeout-ms", value], 1, "Error loading model")
+    for value in ("1", "59999"):
+        check(["serve", "llm", "--stall-timeout-ms", value], 2,
               "sampling and scheduling limits are invalid")
     for flag, value in (("--temperature", "2.01"), ("--presence-penalty", "2.01"),
                         ("--frequency-penalty", "-2.01")):

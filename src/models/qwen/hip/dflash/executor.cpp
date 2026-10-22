@@ -169,7 +169,9 @@ std::size_t QwenDFlashGpuSnapshot::SerializePersistent(
     throw std::invalid_argument("DFlash GPU snapshot payload is malformed");
   }
 
-  std::fill(destination.begin(), destination.end(), std::uint8_t{0});
+  // K/V copies overwrite the payload; do not clear those pages on the CPU.
+  std::fill_n(destination.begin(), kDFlashGpuPersistentHeaderBytes,
+              std::uint8_t{0});
   std::copy(kDFlashGpuPersistentMagic.begin(), kDFlashGpuPersistentMagic.end(),
             destination.begin());
   PutLittleEndian<std::uint32_t>(destination, 8, kDFlashGpuPersistentVersion);
@@ -670,6 +672,7 @@ std::unique_ptr<QwenDFlashGpuSnapshot> QwenDFlashGpuExecutor::SaveSnapshot()
 
 void QwenDFlashGpuExecutor::RestoreSnapshot(
     const QwenDFlashGpuSnapshot& snapshot) {
+  CheckContinuation();
   const std::size_t kv_width =
       static_cast<std::size_t>(model_->GetConfig().num_key_value_heads) *
       model_->GetConfig().head_dim;
@@ -711,6 +714,7 @@ void QwenDFlashGpuExecutor::RestoreSnapshot(
 
 void QwenDFlashGpuExecutor::RestorePersistentSnapshot(
     std::span<const std::uint8_t> payload) {
+  CheckContinuation();
   if (payload.size() < kDFlashGpuPersistentHeaderBytes ||
       !std::equal(kDFlashGpuPersistentMagic.begin(),
                   kDFlashGpuPersistentMagic.end(), payload.begin()) ||
@@ -788,6 +792,13 @@ void QwenDFlashGpuExecutor::RestorePersistentSnapshot(
 }
 
 void QwenDFlashGpuExecutor::Reset() noexcept {
+  try {
+    CheckContinuation();
+  } catch (...) {
+    if (continuation_hooks_)
+      continuation_hooks_->WriteFailed();
+    return;
+  }
   // Attention only reads the valid prefix; new rows overwrite stale KV.
   injected_context_len_ = 0;
 }
@@ -795,6 +806,7 @@ void QwenDFlashGpuExecutor::Reset() noexcept {
 bool QwenDFlashGpuExecutor::InjectTargetContext(
     std::span<const float> target_features, std::uint32_t position,
     std::uint32_t num_tokens, const DFlashTrace& trace) {
+  CheckContinuation();
   const std::size_t width = GetTargetFeaturesSize();
   if (position != injected_context_len_ || position > max_context_ ||
       num_tokens > max_context_ - position ||
@@ -844,6 +856,12 @@ bool QwenDFlashGpuExecutor::InjectTargetContextChunk(
   if (cpy_err != hipSuccess) {
     return false;
   }
+  // The caller may reuse pinned prompt rows on every return, including when a
+  // later operation throws. Keep the existing wait on the successful path.
+  struct DrainContextUpload {
+    hipStream_t stream;
+    ~DrainContextUpload() { (void)hipStreamSynchronize(stream); }
+  } drain{stream_};
 
   // FC Projection & Norm
   RunInjectGemm(weights.fc_projection, d_target_features_, d_fused_features_,
@@ -904,7 +922,6 @@ bool QwenDFlashGpuExecutor::InjectTargetContextChunk(
 
   injected_context_len_ =
       std::max(injected_context_len_, position + num_tokens);
-  (void)hipStreamSynchronize(stream_);
   return true;
 }
 
@@ -914,6 +931,7 @@ std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
     std::span<const float> sample_uniforms, std::vector<float>* out_confidences,
     std::vector<tokenization::TokenId>* out_candidate_ids,
     std::vector<float>* out_candidate_probabilities, const DFlashTrace& trace) {
+  CheckContinuation();
   const auto& weights = model_->GetWeights();
   const auto& cfg = model_->GetConfig();
   const auto& df_cfg = model_->GetDFlashConfig();

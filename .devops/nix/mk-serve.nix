@@ -37,6 +37,7 @@
   # LLM Options
   servedModelName ? null,
   context ? null,
+  enableYarn ? false, # Flash-Next: required for context above 262144
   maxTokens ? null,
   temperature ? null,
   topP ? null,
@@ -65,6 +66,7 @@
   maxPending ? null,
   maxPendingPerClient ? null,
   requestTimeoutMs ? null,
+  stallTimeoutMs ? null,
   maxOutputBytes ? null,
   maxBufferedOutputBytes ? null,
   maxBufferedOutputTotal ? null,
@@ -145,6 +147,7 @@ let
         "--context"
         (toString context)
       ]
+      ++ lib.optionals enableYarn [ "--enable-yarn" ]
       ++ lib.optionals (maxTokens != null) [
         "--max-tokens"
         (toString maxTokens)
@@ -256,6 +259,10 @@ let
       ++ lib.optionals (requestTimeoutMs != null) [
         "--request-timeout-ms"
         (toString requestTimeoutMs)
+      ]
+      ++ lib.optionals (stallTimeoutMs != null) [
+        "--stall-timeout-ms"
+        (toString stallTimeoutMs)
       ]
       ++ lib.optionals (maxOutputBytes != null) [
         "--max-output-bytes"

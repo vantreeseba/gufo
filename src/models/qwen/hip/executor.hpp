@@ -1,7 +1,6 @@
 #ifndef GUFO_MODELS_QWEN_HIP_EXECUTOR_HPP_
 #define GUFO_MODELS_QWEN_HIP_EXECUTOR_HPP_
 
-#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -10,11 +9,13 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <vector>
 
 #include "src/core/model_config.hpp"
+#include "src/models/qwen/continuation_hooks.hpp"
 #include "src/models/qwen/forward.hpp"
 #include "src/models/qwen/generator.hpp"
 #include "src/models/qwen/state.hpp"
@@ -30,9 +31,15 @@
 #include "src/models/qwen/hip/ops/gemm.hpp"
 #include "src/models/qwen/hip/ops/ssm.hpp"
 #include "src/models/qwen/hip/ops/token.hpp"
+#include "src/models/qwen/hip/prompt_hidden_buffer.hpp"
 #include "src/models/qwen/vision/device_input.hpp"
 
 namespace gufo::hip {
+
+class QwenPrefillCancelled final : public std::runtime_error {
+public:
+  QwenPrefillCancelled() : std::runtime_error("Qwen prefill cancelled") {}
+};
 
 class HipblasLtGemm;
 class QwenGpuExecutor;
@@ -125,37 +132,6 @@ private:
   std::shared_ptr<models::qwen::vision::Encoder> vision_;
 };
 
-/// Positions per snapshot KV block. Checkpoints of one prefix hold the blocks
-/// they both cover together, so each new one copies only the positions past
-/// the last block boundary it shares.
-inline constexpr std::uint32_t kQwenSnapshotKvBlockTokens = 2048;
-
-/// Immutable device copy of both attention KV planes for one span of positions.
-class QwenSnapshotKvBlock final {
-public:
-  /// Throws std::bad_alloc when the device cannot hold the block.
-  explicit QwenSnapshotKvBlock(std::size_t bytes);
-  ~QwenSnapshotKvBlock();
-
-  QwenSnapshotKvBlock(const QwenSnapshotKvBlock&) = delete;
-  QwenSnapshotKvBlock& operator=(const QwenSnapshotKvBlock&) = delete;
-  QwenSnapshotKvBlock(QwenSnapshotKvBlock&&) = delete;
-  QwenSnapshotKvBlock& operator=(QwenSnapshotKvBlock&&) = delete;
-
-  [[nodiscard]] void* data() const noexcept { return data_; }
-  [[nodiscard]] std::size_t bytes() const noexcept { return bytes_; }
-  /// Unique among all blocks of the process.
-  [[nodiscard]] std::uint64_t id() const noexcept { return id_; }
-
-private:
-  void* data_{nullptr};
-  std::size_t bytes_{0};
-  std::uint64_t id_{0};
-};
-
-using QwenSnapshotKvBlocks =
-    std::vector<std::shared_ptr<const QwenSnapshotKvBlock>>;
-
 class QwenGpuSnapshot final {
 public:
   ~QwenGpuSnapshot();
@@ -171,14 +147,6 @@ public:
   }
   [[nodiscard]] std::uint32_t ValidContext() const noexcept {
     return valid_context_;
-  }
-  /// Complete KV blocks, which other snapshots of the prefix may also hold.
-  /// The positions after them are in a block this snapshot holds alone.
-  [[nodiscard]] std::span<const std::shared_ptr<const QwenSnapshotKvBlock>>
-  SharedKvBlocks() const noexcept {
-    return std::span(kv_blocks_)
-        .first(std::min<std::size_t>(
-            kv_blocks_.size(), valid_context_ / kQwenSnapshotKvBlockTokens));
   }
   [[nodiscard]] QwenKvCacheStorage KvStorage() const noexcept {
     return kv_storage_;
@@ -196,11 +164,8 @@ public:
 private:
   QwenGpuSnapshot() = default;
 
-  // Block i holds positions from i * kQwenSnapshotKvBlockTokens, K plane then
-  // V plane, each kv_block_rows_ rows of kv_block_width_ elements a position.
-  QwenSnapshotKvBlocks kv_blocks_;
-  std::size_t kv_block_rows_{0};
-  std::size_t kv_block_width_{0};
+  void* d_kv_f32_{nullptr};
+  void* d_kv_f16_{nullptr};
   void* d_ssm_conv_{nullptr};
   void* d_ssm_deltanet_{nullptr};
   std::size_t kv_elements_per_plane_{0};
@@ -360,8 +325,18 @@ public:
   QwenGpuArena& operator=(QwenGpuArena&&) noexcept;
 
   void Reset();
+  /// Pins the live recurrent state for rollback. Neither save nor restore
+  /// copies anything: the state lives in one of two buffers, and the first
+  /// pass after either call reads the pinned buffer and writes the other one.
   void SaveState(std::uint32_t valid_context);
   void RestoreState();
+  /// Names the buffers one recurrent-state pass reads and writes. Call exactly
+  /// once per forward, replay or prefill pass, before its first launch; every
+  /// launch of the pass then writes `*_out`, so the pinned buffer survives
+  /// until the next SaveState.
+  [[nodiscard]] QwenRecurrentStateIo BeginRecurrentWrite();
+  /// Buffer indices of the most recent BeginRecurrentWrite, for graph keys.
+  [[nodiscard]] std::uint64_t RecurrentIoIdentity() const noexcept;
   [[nodiscard]] bool BeginSsmReplayCapture();
   void DisableSsmReplayCapture();
   void MarkSsmReplayPosition(std::uint32_t position) noexcept;
@@ -402,6 +377,9 @@ public:
   float* d_logits{nullptr};
   void* d_attention_kv_f16{nullptr};
   float* d_kv_cache{nullptr};
+  // Mirrors of the live recurrent buffers (see BeginRecurrentWrite); reassigned
+  // whenever the live buffer changes, so snapshots and resets read and write
+  // the current state without knowing about the rollback pair.
   float* d_ssm_conv_state{nullptr};
   void* d_ssm_deltanet_state{nullptr};
   std::uint32_t* d_prompt_tokens{nullptr};
@@ -435,28 +413,17 @@ public:
   [[nodiscard]] static QwenGpuMemoryUsage EstimateMemoryUsage(
       const core::ModelConfig& config, std::uint32_t max_context,
       QwenExecutionPolicy policy = QwenExecutionPolicy::Production());
+  [[nodiscard]] static std::size_t RecurrentStateBytes(
+      const core::ModelConfig& config, QwenExecutionPolicy policy);
   [[nodiscard]] QwenGpuMemoryUsage GetMemoryUsage() const;
   [[nodiscard]] std::size_t SnapshotPayloadBytes(
       std::uint32_t valid_context) const;
 
-  /// Reuses the blocks SharedSnapshotKv(valid_context) reports and copies the
-  /// rest. Allocation failure throws std::bad_alloc.
   [[nodiscard]] std::unique_ptr<QwenGpuSnapshot> SaveSnapshot(
       std::uint32_t valid_context);
   void RestoreSnapshot(const QwenGpuSnapshot& snapshot);
   void RestoreCompactSnapshot(std::span<const std::uint8_t> payload,
                               std::uint32_t expected_valid_context);
-  /// Live snapshot blocks whose positions this arena still holds unchanged,
-  /// which a snapshot of valid_context positions would share.
-  [[nodiscard]] QwenSnapshotKvBlocks SharedSnapshotKv(
-      std::uint32_t valid_context) const;
-  /// Call before writing KV at position or later. Blocks covering those
-  /// positions no longer describe this arena.
-  void InvalidateSnapshotKvFrom(std::uint32_t position) noexcept {
-    const std::size_t unchanged = position / kQwenSnapshotKvBlockTokens;
-    if (unchanged < snapshot_kv_lineage_.size())
-      snapshot_kv_lineage_.resize(unchanged);
-  }
   [[nodiscard]] QwenGpuScratchView GetScratchView(
       std::size_t batch_size = 1) noexcept;
   void SetTargetLayerCapture(std::span<const std::uint32_t> target_layer_ids);
@@ -469,7 +436,10 @@ public:
 
 private:
   void FreeAll() noexcept;
+  friend class models::qwen::ContinuationAdapter;
+  friend class QwenGpuExecutor;
   void AllocateRecurrentSnapshot();
+  void SyncLivePointers() noexcept;
   [[nodiscard]] bool AllocateSsmReplayLog();
 
   core::ModelConfig config_;
@@ -477,8 +447,15 @@ private:
   std::uint32_t max_batch_;
   QwenExecutionPolicy policy_;
   std::vector<std::uint32_t> target_layer_ids_;
-  float* d_saved_ssm_conv_state_{nullptr};
-  void* d_saved_ssm_deltanet_state_{nullptr};
+  // Buffer 0 comes from the constructor; buffer 1 is allocated by the first
+  // SaveState. `live_recurrent_` holds the current state, `saved_recurrent_`
+  // the pinned one (meaningful while has_saved_state_), `source_recurrent_`
+  // the buffer the most recent pass read.
+  std::array<float*, 2> d_ssm_conv_buffers_{};
+  std::array<void*, 2> d_ssm_deltanet_buffers_{};
+  std::uint8_t live_recurrent_{0};
+  std::uint8_t saved_recurrent_{0};
+  std::uint8_t source_recurrent_{0};
   float* d_ssm_replay_qkv_{nullptr};
   float* d_ssm_replay_alpha_{nullptr};
   float* d_ssm_replay_beta_{nullptr};
@@ -488,9 +465,6 @@ private:
   std::size_t replay_captured_positions_{0};
   bool has_saved_state_{false};
   bool replay_capture_active_{false};
-  // Entry i is the snapshot block that equals this arena's KV for its
-  // positions. Weak: the arena shares blocks, it does not keep them alive.
-  std::vector<std::weak_ptr<const QwenSnapshotKvBlock>> snapshot_kv_lineage_;
 };
 
 /// End-to-end GPU model executor running directly on the gfx1151 RDNA 3.5 CUs.
@@ -615,6 +589,15 @@ public:
       std::span<const float> draft_candidate_probabilities,
       double draft_token_probability, sampling::SamplerState& sampler);
 
+  /// Pins the prompt-capture bound for `layer_count` captured layers up front,
+  /// so no request pays for the pinned allocation. A ledger is charged for
+  /// the pinned bytes while the executor holds them.
+  void ReservePromptHiddenCapture(std::size_t layer_count,
+                                  cache::ResourceLedger* ledger = nullptr);
+  [[nodiscard]] std::size_t PromptHiddenChargedBytes() const noexcept {
+    return h_prompt_hidden_.ChargedBytes();
+  }
+
   /// Enables host capture of every final-layer prompt hidden state. Disabled
   /// by default so ordinary prefill does not incur device-to-host copies.
   void SetPromptHiddenCapture(
@@ -623,7 +606,7 @@ public:
   /// Returns the flattened [prompt_tokens, hidden_size] capture from the most
   /// recent ForwardPromptBatch call.
   [[nodiscard]] std::span<const float> GetPromptHiddenStates() const noexcept {
-    return h_prompt_hidden_;
+    return h_prompt_hidden_.View();
   }
 
   /// Copies the final-layer hidden state from the most recent forward pass.
@@ -645,12 +628,6 @@ public:
   }
   [[nodiscard]] std::size_t SnapshotPayloadBytes(
       std::uint32_t valid_context) const;
-  /// Blocks SaveSnapshot(valid_context) will share rather than copy, counted
-  /// within SnapshotPayloadBytes(valid_context).
-  [[nodiscard]] QwenSnapshotKvBlocks SharedSnapshotKv(
-      std::uint32_t valid_context) const {
-    return arena_.SharedSnapshotKv(valid_context);
-  }
   void ConfigureVision(
       std::shared_ptr<const models::qwen::vision::Prompt> prompt,
       std::shared_ptr<models::qwen::vision::Encoder> encoder);
@@ -676,6 +653,8 @@ public:
   void FinishVerification();
 
 private:
+  friend class models::qwen::ContinuationAdapter;
+  models::qwen::ContinuationHooks* continuation_hooks_{nullptr};
   void CheckPrefillCancellation() const;
   void PrefillLayerCheckpoint(std::uint32_t layer);
   std::function<bool()> cancellation_check_;
@@ -683,6 +662,8 @@ private:
   void CheckReset() const {
     if (reset_failure_)
       std::rethrow_exception(reset_failure_);
+    if (continuation_hooks_)
+      continuation_hooks_->BeforeExecution();
   }
   std::exception_ptr reset_failure_;
   void ReplaySsmState(std::uint32_t position, std::uint32_t count = 1);
@@ -708,7 +689,7 @@ private:
   bool moe_decode_warmed_{false};
   models::qwen::vision::DeviceInput vision_input_;
   std::vector<float> h_logits_;
-  std::vector<float> h_prompt_hidden_;
+  PromptHiddenBuffer h_prompt_hidden_;
   std::vector<float> h_verification_hidden_;
   std::vector<float> h_verification_logits_;
   std::vector<float> h_last_hidden_;

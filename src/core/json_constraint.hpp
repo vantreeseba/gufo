@@ -26,14 +26,22 @@ public:
   struct Stack {
     std::vector<std::uint32_t> symbols;
     std::string lexeme;
+    // Wide native argument sets retain only the subset chosen by this request.
+    // Sampler copies and speculative rollback copy this state with the stack.
+    std::vector<std::uint64_t> used_parameters;
     auto operator<=>(const Stack&) const = default;
   };
   using State = std::vector<Stack>;
   using Sequence = std::vector<std::uint32_t>;
   using Rule = std::vector<Sequence>;
 
+  // Response formats pass open_objects: as in llama.cpp, an object then admits
+  // extra keys after its declared properties when additionalProperties is
+  // true or a schema, or when it declares no properties. Omitting
+  // additionalProperties beside properties still closes the object. Tool
+  // admission and argument recovery keep closed objects.
   static std::shared_ptr<const JsonConstraint> Compile(
-      const json::Value& schema, bool strict);
+      const json::Value& schema, bool strict, bool open_objects = false);
   static std::shared_ptr<const JsonConstraint> Object();
   // Resolve a local JSON pointer using the same rules as schema compilation.
   // Throws invalid_argument for malformed or missing references.
@@ -72,6 +80,13 @@ private:
   std::vector<Rule> rules_;
   std::vector<std::bitset<256>> classes_;
   std::vector<std::shared_ptr<const JsonSchemaLexeme>> lexemes_;
+  // Only outer native parameter lists use these sets; their values remain
+  // ordinary JSON/string rules, so sets never nest within a request stack.
+  struct ArgumentSet {
+    Sequence members;
+    std::vector<std::uint64_t> required;
+  };
+  std::vector<ArgumentSet> argument_sets_;
   std::uint32_t root_{0};
   std::string prompt_;
   bool stop_only_when_complete_{true};

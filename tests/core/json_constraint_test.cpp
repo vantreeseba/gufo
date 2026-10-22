@@ -6,10 +6,13 @@
 #include <cassert>
 #include <cmath>
 #include <fstream>
+#include <initializer_list>
 #include <iostream>
 #include <limits>
+#include <stdexcept>
 #include <string_view>
 #include <thread>
+#include <utility>
 
 #include "src/core/sampling.hpp"
 
@@ -24,6 +27,143 @@ bool Accepts(const JsonConstraint& grammar, std::string_view text) {
       return false;
   }
   return grammar.Complete(state);
+}
+
+void TestWideNativeArgumentOrder() {
+  using Format = JsonConstraint::ToolFormat;
+  for (const auto format : {Format::kQwen, Format::kDeepSeek}) {
+    const auto parameter = [&](unsigned i, std::string_view value = "1") {
+      const auto name = "p" + std::to_string(i);
+      return format == Format::kQwen
+                 ? "<parameter=" + name + ">\n" + std::string(value) +
+                       "\n</parameter>\n"
+                 : "<｜DSML｜parameter name=\"" + name +
+                       "\" string=\"false\">" + std::string(value) +
+                       "</｜DSML｜parameter>\n";
+    };
+    // Cross the old ten-property cutoff and the per-request bitset word
+    // boundary. Declaration order must never make a later argument unreachable.
+    for (const unsigned count : {10, 11, 12, 16, 24, 65}) {
+      auto schema = parse(R"({"type":"object","properties":{},
+        "required":["p0"],"additionalProperties":false})");
+      for (unsigned i = 0; i < count; ++i)
+        schema["properties"]["p" + std::to_string(i)] =
+            parse(R"({"type":"integer","minimum":1,"maximum":9})");
+      {
+        const auto grammar =
+            JsonConstraint::ToolParameters(schema, false, format);
+        assert(Accepts(*grammar,
+                       parameter(0) + parameter(count - 1) + parameter(4)));
+        assert(Accepts(*grammar, parameter(count - 1) + parameter(0)));
+        assert(!Accepts(*grammar, parameter(count - 1)));
+        assert(!Accepts(*grammar, parameter(0) + parameter(0)));
+        assert(!Accepts(*grammar, parameter(0) + parameter(count)));
+        assert(!Accepts(*grammar, parameter(0) + parameter(4, "10")));
+        assert(!Accepts(*grammar, parameter(0) + parameter(4, "\"1\"")));
+      }
+      auto optional_schema = schema;
+      optional_schema["required"] = gufo::json::Value::array();
+      const auto optional =
+          JsonConstraint::ToolParameters(optional_schema, false, format);
+      assert(Accepts(*optional, ""));
+      assert(Accepts(*optional, parameter(count - 1) + parameter(4)));
+      assert(!Accepts(*optional, parameter(4) + parameter(4)));
+      // Many required fields also remain unordered, without enumerating 2^N
+      // grammar rules. Reject a call missing even the final required member.
+      schema["required"] = gufo::json::Value::array();
+      std::string reverse;
+      for (unsigned i = count; i-- > 0;) {
+        schema["required"].push_back("p" + std::to_string(i));
+        reverse += parameter(i);
+      }
+      const auto required =
+          JsonConstraint::ToolParameters(schema, true, format);
+      assert(Accepts(*required, reverse));
+      assert(!Accepts(*required,
+                      reverse.substr(0, reverse.size() - parameter(0).size())));
+      if (count != 12)
+        continue;
+      // A pattern selects the loose native route. Its other typed fields and
+      // required names must keep the same unordered contract.
+      schema["required"] = parse(R"(["p0"])");
+      schema["properties"]["p1"] =
+          parse(R"({"type":"string","pattern":"^[a-z]+$"})");
+      const auto loose = JsonConstraint::ToolParameters(schema, false, format);
+      const auto body = parameter(0) + parameter(11) + parameter(4);
+      assert(Accepts(*loose, body));
+      assert(!Accepts(*loose, parameter(11) + parameter(4)));
+      assert(!Accepts(*loose, parameter(0) + parameter(4, "10")));
+
+      schema["properties"]["p0"]["minimum"] = 2;
+      for (unsigned i = count; i < 65; ++i)
+        schema["properties"]["p" + std::to_string(i)] =
+            parse(R"({"type":"integer"})");
+      const auto other = JsonConstraint::ToolParameters(schema, false, format);
+      const auto opening = [&](std::string_view name) {
+        return format == Format::kQwen
+                   ? "<tool_call>\n<function=" + std::string(name) + ">\n"
+                   : "<｜DSML｜invoke name=\"" + std::string(name) + "\">\n";
+      };
+      const std::string closing = format == Format::kQwen
+                                      ? "</function>\n</tool_call>"
+                                      : "</｜DSML｜invoke>\n";
+      const auto wrap = [&](std::string text) {
+        return format == Format::kQwen
+                   ? text
+                   : "<｜DSML｜tool_calls>\n" + text + "</｜DSML｜tool_calls>";
+      };
+      const auto combined = JsonConstraint::WithTools(
+          nullptr, {{"a", loose}, {"b", other}, {"alias", loose}}, true, true,
+          format);
+      // Import distinct argument sets and reuse one imported set. Each call
+      // starts fresh; required/used bits cannot leak between calls or tools.
+      const auto calls = wrap(opening("a") + body + closing + opening("b") +
+                              parameter(64) + parameter(0, "2") + parameter(4) +
+                              closing + opening("alias") + body + closing);
+      assert(Accepts(*combined, calls));
+      assert(Accepts(*JsonConstraint::WithReasoning(combined),
+                     "Choose the fields.</think>" + calls));
+      assert(!Accepts(*combined, wrap(opening("b") + body + closing)));
+      assert(!Accepts(*combined, wrap(opening("a") + body + closing +
+                                      opening("b") + parameter(4) + closing)));
+
+      // Vocabulary masks and speculative sampler copies must include the
+      // chosen subset, including tokens crossing complete parameter blocks.
+      auto binding = std::make_shared<TokenConstraint>();
+      binding->grammar = combined;
+      const std::vector<std::string> pieces{
+          (format == Format::kQwen ? "" : "<｜DSML｜tool_calls>\n") +
+              opening("a"),
+          parameter(0),
+          parameter(11),
+          parameter(4),
+          parameter(4) + parameter(11),
+          ""};
+      binding->vocabulary = std::make_shared<ConstraintVocabulary>(
+          pieces.size(), [&](std::uint32_t id) {
+            return ConstraintVocabulary::Piece{pieces[id], id == 5};
+          });
+      SamplerState sampler({.constraint = binding});
+      sampler.Accept(0);
+      sampler.Accept(1);
+      auto saved = sampler;
+      sampler.Accept(2);
+      std::vector<float> logits(pieces.size(), -INFINITY);
+      logits[2] = 100;  // a repeated name is unavailable in this copy
+      logits[3] = 10;
+      assert(sampler.Sample(logits) == 3);
+      assert(saved.Sample(logits) == 2);
+      sampler = saved;
+      sampler.Accept(4);  // both complete parameter blocks fit one token
+      bool duplicate_rejected = false;
+      try {
+        sampler.Accept(2);
+      } catch (const std::runtime_error&) {
+        duplicate_rejected = true;
+      }
+      assert(duplicate_rejected);
+    }
+  }
 }
 
 void TestJsonLanguage() {
@@ -195,6 +335,34 @@ void TestSchemaIntersections() {
   assert(!Accepts(*formats, R"({"x":"127.example"})"));
 }
 
+void TestMixedEnumValues() {
+  // An untyped member can hold a string in one enum value and a number in
+  // another; each must stay reachable whatever the enum order.
+  for (const char* values :
+       {R"([{"x":"a"},{"x":1}])", R"([{"x":1},{"x":"a"}])"}) {
+    auto schema = parse(R"({"type":"object","properties":{"x":{"anyOf":[
+      {"type":"string"},{"type":"integer"}]}},"required":["x"],
+      "additionalProperties":false})");
+    schema["enum"] = parse(values);
+    const auto grammar = JsonConstraint::Compile(schema, true);
+    assert(Accepts(*grammar, R"({"x":"a"})"));
+    assert(Accepts(*grammar, R"({"x":1})"));
+    assert(!Accepts(*grammar, R"({"x":2})"));
+  }
+  // Enum literals spell integers as decimals, so the model is never forced
+  // into 1e+05.
+  auto large = parse(R"({"type":"object","properties":{"x":{
+    "type":"integer"}},"required":["x"],"additionalProperties":false})");
+  large["enum"] = parse(R"([{"x":100000}])");
+  assert(Accepts(*JsonConstraint::Compile(large, true), R"({"x":100000})"));
+  const auto list = JsonConstraint::Compile(
+      parse(R"({"type":"object","properties":{"l":{"type":"array","items":{
+        "anyOf":[{"type":"string"},{"type":"number"}]},"enum":[["a",1]]}},
+        "required":["l"],"additionalProperties":false})"),
+      true);
+  assert(Accepts(*list, R"({"l":["a",1]})"));
+}
+
 void TestPrimitiveConstraints() {
   auto compile = [](std::string_view property) {
     return JsonConstraint::Compile(
@@ -347,6 +515,96 @@ void TestPrimitiveConstraints() {
     assert(Accepts(*grammar, std::string("{\"x\":\"") + valid + "\"}"));
     assert(!Accepts(*grammar, std::string("{\"x\":\"") + invalid + "\"}"));
   }
+}
+
+bool Rejects(const gufo::json::Value& schema, bool strict,
+             bool open_objects = false) {
+  try {
+    (void)JsonConstraint::Compile(schema, strict, open_objects);
+  } catch (const std::invalid_argument&) {
+    return true;
+  }
+  return false;
+}
+
+// Response formats follow llama.cpp (#580): objects that declare properties
+// stay closed unless additionalProperties is true or a schema, and objects
+// without properties admit any keys. Tool schemas keep the closed contract.
+void TestOpenResponseObjects() {
+  const auto person = parse(R"({
+    "type":"object","properties":{
+      "name":{"type":"string"},
+      "born":{"type":"integer","description":"birth year"}
+    },"required":["name","born"]})");
+  // Compiling the open form first must not leak into the closed cache entry.
+  const auto implicit = JsonConstraint::Compile(person, true, true);
+  assert(implicit == JsonConstraint::Compile(person, true, true));
+  assert(Rejects(person, true));
+  assert(Rejects(person, false));
+  assert(Accepts(*implicit, R"({"name":"Nostradamus","born":1503})"));
+  for (const char* invalid :
+       {R"({"name":"a","born":1,"occupation":"seer"})", R"({"name":"a"})"})
+    assert(!Accepts(*implicit, invalid));
+
+  auto extensible = person;
+  extensible["additionalProperties"] = true;
+  const auto open = JsonConstraint::Compile(extensible, true, true);
+  for (const char* valid :
+       {R"({"name":"Nostradamus","born":1503})",
+        R"({"name":"a","born":1,"occupation":"seer"})",
+        R"({ "name" : "a" , "born" : 1 , "x" : [1,{"y":null}], "z" : true })"})
+    assert(Accepts(*open, valid));
+  for (const char* invalid :
+       {R"({"name":"a"})", R"({"name":"a","born":"1503"})",
+        R"({"name":"a","born":1,"name":"b"})",
+        R"({"name":"a","born":1,"born":2})", R"({"name":"a","born":1,})",
+        R"({"name":"a","born":1,"x":})"})
+    assert(!Accepts(*open, invalid));
+
+  const auto nested = JsonConstraint::Compile(parse(R"({
+    "type":"object","properties":{
+      "items":{"type":"array","minItems":1,"items":{
+        "type":"object","properties":{"id":{"type":"integer"}},"required":["id"]}},
+      "closed":{"type":"object","properties":{"a":{"type":"boolean"}},
+        "required":["a"],"additionalProperties":false},
+      "typed":{"type":"object","properties":{},"additionalProperties":{"type":"integer"}},
+      "explicit":{"type":"object","properties":{},"additionalProperties":true},
+      "any":{"type":"object"}
+    },"required":["items","closed","typed","explicit","any"]})"),
+                                              true, true);
+  assert(Accepts(
+      *nested,
+      R"({"items":[{"id":1}],"closed":{"a":true},"typed":{"n":2},"explicit":{"k":[]},"any":{"m":{}}})"));
+  for (
+      const char* invalid :
+      {R"({"items":[{"id":1,"note":"x"}],"closed":{"a":true},"typed":{},"explicit":{},"any":{}})",
+       R"({"items":[{"id":1}],"closed":{"a":true,"b":1},"typed":{},"explicit":{},"any":{}})",
+       R"({"items":[{"id":1}],"closed":{"a":true},"typed":{"n":"2"},"explicit":{},"any":{}})",
+       R"({"items":[{"note":"x"}],"closed":{"a":true},"typed":{},"explicit":{},"any":{}})",
+       R"({"items":[{"id":1}],"closed":{"a":true},"typed":{},"explicit":{},"any":{},"more":1})"})
+    assert(!Accepts(*nested, invalid));
+
+  // Closed schemas compile to the same language with or without the flag.
+  const auto closed = parse(R"({
+    "type":"object","properties":{"a":{"type":"integer"},"b":{"type":"boolean"}},
+    "required":["a"],"additionalProperties":false})");
+  for (const char* text : {R"({"a":1})", R"({"a":1,"b":false})",
+                           R"({"a":1,"c":0})", R"({"b":true})"})
+    assert(Accepts(*JsonConstraint::Compile(closed, false), text) ==
+           Accepts(*JsonConstraint::Compile(closed, false, true), text));
+
+  // Only undeclared keys open up: strict requirements, untyped leaves,
+  // unsupported keywords and a non-object root remain errors.
+  for (
+      const auto& [input, strict] :
+      std::initializer_list<std::pair<const char*, bool>>{
+          {R"({"type":"object","properties":{"a":{"type":"integer"}}})", true},
+          {R"({"type":"object","properties":{"a":{}},"required":["a"]})",
+           false},
+          {R"({"type":"object","properties":{},"patternProperties":{"x":{"type":"integer"}}})",
+           false},
+          {R"({"type":"array","items":{"type":"integer"}})", false}})
+    assert(Rejects(parse(input), strict, true));
 }
 
 void TestIntegerBoundsAndRecursion() {
@@ -1994,8 +2252,11 @@ int main(int argc, char** argv) {
       auto output = gufo::json::Value::object();
       try {
         const auto input = parse(line);
-        const auto grammar =
-            JsonConstraint::Compile(*input.find("schema"), true);
+        const auto* strict = input.find("strict");
+        const auto* open = input.find("open");
+        const auto grammar = JsonConstraint::Compile(
+            *input.find("schema"), !strict || strict->as_bool(),
+            open && open->as_bool());
         output["accepted"] = gufo::json::Value::array();
         for (const auto& text : input.find("texts")->items())
           output["accepted"].push_back(Accepts(*grammar, text.str()));
@@ -2018,7 +2279,9 @@ int main(int argc, char** argv) {
   TestJsonLanguage();
   TestSchemaLanguage();
   TestSchemaIntersections();
+  TestMixedEnumValues();
   TestRejectedSchemas();
+  TestOpenResponseObjects();
   TestIntegerBoundsAndRecursion();
   TestPrimitiveConstraints();
   TestTokensAndSampling();
@@ -2027,6 +2290,7 @@ int main(int argc, char** argv) {
   TestNativeRequestMaskReuse();
   TestReasoningConstraint();
   TestAutomaticTools();
+  TestWideNativeArgumentOrder();
   TestNativeTools();
   TestOpenNativeTools();
   TestNonStrictAgentTools();

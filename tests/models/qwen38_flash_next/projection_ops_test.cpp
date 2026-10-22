@@ -12,8 +12,10 @@
 #include <string>
 #include <vector>
 
+#include "src/models/qwen/vision/device_input.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
+#include "src/models/qwen38_flash_next/rope_scaling.hpp"
 
 namespace q = gufo::models::qwen38_flash_next::rocm;
 namespace {
@@ -197,7 +199,7 @@ void CheckSsmProjection(const void* w, const __half* x, float* projected,
   }
   // A rejected geometry must not touch any pointer.
   if (q::DenseF16SsmGemm(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-                         1023, m, k, channels, 4, nullptr) ||
+                         0, m, k, channels, 4, nullptr) ||
       q::DenseF16SsmGemm(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
                          batch, m, k, channels, 3, nullptr)) {
     throw std::runtime_error("SSM projection accepted an unsupported shape");
@@ -205,8 +207,10 @@ void CheckSsmProjection(const void* w, const __half* x, float* projected,
   std::cout << "fused SSM convolution, output, state and replay are exact\n";
 }
 
-void CheckAttentionProjection(const void* weights, const __half* input,
-                              const float* projected, std::uint32_t batch) {
+void CheckAttentionProjection(
+    const void* weights, const __half* input, const float* projected,
+    std::uint32_t batch,
+    const gufo::models::qwen38_flash_next::YarnRope& yarn = {}) {
   constexpr std::uint32_t start = 131069;
   const std::size_t query_bytes = (std::size_t(batch) * 6144 + 16) * 4;
   const std::size_t cache_bytes =
@@ -248,12 +252,19 @@ void CheckAttentionProjection(const void* weights, const __half* input,
                            static_cast<float*>(expected[1]) + 8,
                            static_cast<__half*>(expected[2]) + 8,
                            static_cast<__half*>(expected[3]) + 8, batch, 24, 2,
-                           256, 64, position, 1e7F, 1e-6F, nullptr))
+                           256, 64, position, 1e7F, 1e-6F, nullptr, nullptr,
+                           false, yarn))
     throw std::runtime_error("attention preparation rejected the model shape");
   hipStream_t stream = nullptr;
   hipGraph_t graph = nullptr;
   hipGraphExec_t replay = nullptr;
   CheckHip(hipStreamCreate(&stream), "attention stream");
+  gufo::models::qwen::vision::DeviceInput vision;
+  vision.PrepareRope(stream);
+  const auto* descriptor = vision.rope();
+  vision.PrepareRope(stream);
+  if (descriptor == nullptr || vision.rope() != descriptor)
+    throw std::runtime_error("prepared image descriptor is not stable");
   CheckHip(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal),
            "attention capture");
   if (!q::AttentionF16Gemm(weights, input, device_gamma, device_gamma + 256,
@@ -261,12 +272,15 @@ void CheckAttentionProjection(const void* weights, const __half* input,
                            static_cast<float*>(actual[1]) + 8,
                            static_cast<__half*>(actual[2]) + 8,
                            static_cast<__half*>(actual[3]) + 8, batch, position,
-                           1e7F, 1e-6F, stream))
+                           1e7F, 1e-6F, stream, vision.rope(), yarn))
     throw std::runtime_error("attention fusion rejected the model shape");
   CheckHip(hipStreamEndCapture(stream, &graph), "attention capture end");
   CheckHip(hipGraphInstantiate(&replay, graph, nullptr, nullptr, 0),
            "attention graph");
   for (unsigned repetition = 0; repetition < 2; ++repetition) {
+    vision.RestoreLayout({}, stream);
+    if (vision.rope() != descriptor)
+      throw std::runtime_error("text restore replaced the image descriptor");
     for (unsigned i = 0; i < 4; ++i)
       CheckHip(hipMemsetAsync(actual[i], 0xA5,
                               i < 2 ? query_bytes : cache_bytes, stream),
@@ -289,12 +303,14 @@ void CheckAttentionProjection(const void* weights, const __half* input,
                           static_cast<float*>(actual[0]) + 8,
                           static_cast<float*>(actual[1]) + 8,
                           static_cast<__half*>(actual[2]) + 8,
-                          static_cast<__half*>(actual[3]) + 8, 1023, position,
-                          1e7F, 1e-6F, nullptr))
-    throw std::runtime_error("attention fusion accepted a short batch");
+                          static_cast<__half*>(actual[3]) + 8, 0, position,
+                          1e7F, 1e-6F, nullptr, nullptr, yarn))
+    throw std::runtime_error("attention fusion accepted an empty batch");
   CheckHip(hipGraphExecDestroy(replay), "attention graph free");
   CheckHip(hipGraphDestroy(graph), "attention graph definition free");
   CheckHip(hipStreamDestroy(stream), "attention stream free");
+  std::cout << "fused attention projection yarn=" << yarn.enabled
+            << ": exact against PrepareAttention, including replay\n";
 }
 
 void CheckHcDownProjection(const void* w, const void* tiled,
@@ -352,6 +368,80 @@ void CheckHcDownProjection(const void* w, const void* tiled,
   CheckHip(hipFree(output), "HC output free");
   CheckHip(hipFree(reference), "HC reference free");
   CheckHip(hipFree(activated), "HC activation free");
+}
+
+/// A batch a few tokens past a full 128-token tile computes its tail with
+/// W8A8TailKernel; every row must equal the tiled kernel's row from a batch
+/// whose tail is too wide to split.
+void CheckW8A8Tail(std::size_t m, std::size_t k, std::uint32_t seed) {
+  constexpr std::size_t kShort = 2051;  // three tokens past 16 tiles
+  constexpr std::size_t kLong = 2091;   // a 43-token tail stays tiled
+  const Q8Weights w = MakeWeights(m, k, seed, false);
+  std::vector<float> x(kLong * k);
+  std::uint32_t state = seed ^ 0x7A11U;
+  for (float& v : x) {
+    v = Uniform(&state, 2.0F);
+  }
+  void* d_w = nullptr;
+  float* d_x = nullptr;
+  void* d_tiled = nullptr;
+  float* d_long = nullptr;
+  float* d_short = nullptr;
+  CheckHip(hipMalloc(&d_w, w.blocks.size() + 4096), "tail weights");
+  CheckHip(hipMalloc(&d_x, x.size() * 4), "tail input");
+  CheckHip(hipMalloc(&d_tiled, q::Q8TiledBytes(kLong, k)), "tail tiles");
+  CheckHip(hipMalloc(&d_long, kLong * m * 4), "tail long output");
+  CheckHip(hipMalloc(&d_short, kLong * m * 4), "tail short output");
+  CheckHip(
+      hipMemcpy(d_w, w.blocks.data(), w.blocks.size(), hipMemcpyHostToDevice),
+      "tail weight upload");
+  CheckHip(hipMemcpy(d_x, x.data(), x.size() * 4, hipMemcpyHostToDevice),
+           "tail input upload");
+  CheckHip(hipMemset(d_short, 0x7F, kLong * m * 4), "tail guards");
+  q::QuantizeQ8Tiled(d_x, d_tiled, kLong, k, nullptr);
+  if (!q::W8A8Gemm(d_w, d_tiled, d_long, kLong, m, k, nullptr) ||
+      !q::W8A8Gemm(d_w, d_tiled, d_short, kShort, m, k, nullptr))
+    throw std::runtime_error("W8A8 tail shapes rejected");
+  std::vector<float> a(kLong * m);
+  std::vector<float> b(kLong * m);
+  CheckHip(hipMemcpy(a.data(), d_long, a.size() * 4, hipMemcpyDeviceToHost),
+           "tail long download");
+  CheckHip(hipMemcpy(b.data(), d_short, b.size() * 4, hipMemcpyDeviceToHost),
+           "tail short download");
+  if (std::memcmp(a.data(), b.data(), kShort * m * 4) != 0)
+    throw std::runtime_error("W8A8 tail rows differ from the tiled rows");
+  for (std::size_t i = kShort * m; i < b.size(); ++i) {
+    std::uint32_t bits;
+    std::memcpy(&bits, &b[i], sizeof(bits));
+    if (bits != 0x7F7F7F7FU)
+      throw std::runtime_error("W8A8 tail wrote past its batch");
+  }
+  if (m == 320 && k == 10240) {
+    __half* h_long = nullptr;
+    __half* h_short = nullptr;
+    CheckHip(hipMalloc(&h_long, kLong * m * 2), "HC tail long");
+    CheckHip(hipMalloc(&h_short, kLong * m * 2), "HC tail short");
+    if (!q::HcDownF16Gemm(d_w, d_tiled, h_long, kLong, nullptr) ||
+        !q::HcDownF16Gemm(d_w, d_tiled, h_short, kShort, nullptr))
+      throw std::runtime_error("HC down tail shapes rejected");
+    std::vector<__half> ha(kShort * m);
+    std::vector<__half> hb(kShort * m);
+    CheckHip(hipMemcpy(ha.data(), h_long, ha.size() * 2, hipMemcpyDeviceToHost),
+             "HC tail long download");
+    CheckHip(
+        hipMemcpy(hb.data(), h_short, hb.size() * 2, hipMemcpyDeviceToHost),
+        "HC tail short download");
+    if (std::memcmp(ha.data(), hb.data(), ha.size() * 2) != 0)
+      throw std::runtime_error("HC down tail rows differ from the tiled rows");
+    (void)hipFree(h_long);
+    (void)hipFree(h_short);
+  }
+  std::cout << "W8A8 tail m=" << m << " k=" << k << ": exact\n";
+  (void)hipFree(d_w);
+  (void)hipFree(d_x);
+  (void)hipFree(d_tiled);
+  (void)hipFree(d_long);
+  (void)hipFree(d_short);
 }
 
 void CheckRoutedQ8Placement() {
@@ -526,6 +616,27 @@ double Run(std::size_t batch, std::size_t m, std::size_t k, std::uint32_t seed,
       0) {
     throw std::runtime_error("F16 replay changed the output");
   }
+  if (batch >= 1024 && m == 2560 && k == 6144) {
+    const std::size_t stride = k + 32;
+    __half* padded = nullptr;
+    // The ragged final row ends at the allocation boundary. NaN padding
+    // exposes accidental reads without masking them with extra valid rows.
+    const auto elements = (batch - 1) * stride + k;
+    CheckHip(hipMalloc(&padded, elements * sizeof(__half)), "padded input");
+    CheckHip(hipMemset(padded, 0xFF, elements * sizeof(__half)), "padding");
+    CheckHip(hipMemcpy2D(padded, stride * sizeof(__half), d_x_half,
+                         k * sizeof(__half), k * sizeof(__half), batch,
+                         hipMemcpyDeviceToDevice),
+             "padded rows");
+    if (!q::DenseF16Gemm(d_w, padded, d_f16, batch, m, k, nullptr, stride))
+      throw std::runtime_error("strided F16 projection rejected the shape");
+    CheckHip(hipMemcpy(replay.data(), d_f16, replay.size() * sizeof(float),
+                       hipMemcpyDeviceToHost),
+             "strided output");
+    CheckHip(hipFree(padded), "free padded input");
+    if (std::memcmp(replay.data(), f16.data(), replay.size() * sizeof(float)))
+      throw std::runtime_error("strided F16 projection changed the output");
+  }
 
   // Large production shapes still compare every output against MMQ. Sample
   // evenly spaced tokens for the more expensive independent F64 reference.
@@ -550,7 +661,7 @@ double Run(std::size_t batch, std::size_t m, std::size_t k, std::uint32_t seed,
             << worst_f16_vs_mmq << ", worst |W8A8 - F64| " << worst_vs_ref
             << ", worst |F16 - F64| " << worst_f16 << " (reference scale "
             << ref_scale << ")\n";
-  if (m == 16384 && k == 2560 && batch >= 1024) {
+  if (m == 16384 && k == 2560 && batch > 8) {
     CheckSsmProjection(d_w, d_x_half, d_f16, f16,
                        static_cast<std::uint32_t>(batch));
   }
@@ -558,9 +669,13 @@ double Run(std::size_t batch, std::size_t m, std::size_t k, std::uint32_t seed,
     CheckHcDownProjection(d_w, d_tiled, d_w8,
                           static_cast<std::uint32_t>(batch));
   }
-  if (m == 13312 && k == 2560 && batch >= 1024) {
+  if (m == 13312 && k == 2560 && batch > 8) {
     CheckAttentionProjection(d_w, d_x_half, d_f16,
                              static_cast<std::uint32_t>(batch));
+    CheckAttentionProjection(
+        d_w, d_x_half, d_f16, static_cast<std::uint32_t>(batch),
+        gufo::models::qwen38_flash_next::MakeYarnRope(
+            {.factor = 2.5F, .original_context = 262144}, 64, 1e7F));
   }
   (void)hipFree(d_w);
   (void)hipFree(d_x);
@@ -664,8 +779,9 @@ void CheckSmallProjection(q::WeightType type, unsigned rows, unsigned cols) {
   CheckHip(hipFree(dw), "small weights free");
 }
 
-void CheckDecodeGrouping(int rows, int cols) {
-  const int tokens = rows == 320 && cols == 10240
+void CheckDecodeGrouping(int rows, int cols, int grouped_tokens = 0) {
+  const int tokens = grouped_tokens != 0 ? grouped_tokens
+                     : rows == 320 && cols == 10240
                          ? 64
                          : (rows >= 8192 && cols == 2560 ? 48 : 32);
   const auto w = MakeWeights(rows, cols, 11, false);
@@ -717,6 +833,8 @@ void CheckDecodeGrouping(int rows, int cols) {
                        hipMemcpyDeviceToHost),
              "scalar output");
     for (int n = 2; n <= (gated ? 8 : tokens); ++n) {
+      if (grouped_tokens != 0 && n > 32 && n % 32 != 0)
+        continue;
       if (rows == 320 && cols == 10240 && n > 32 && n % 8 != 0)
         continue;
       CheckHip(hipMemset(out, 0xA5, batch.size() * sizeof(float)),
@@ -831,21 +949,30 @@ void CheckMtpOutputHead(float input_scale) {
 
 int main() {
   try {
+    CheckHip(q::PrepareW8A8GemmWave64(), "prepare wide Q8 projection");
+    if (qfn_mmq_init(0) != 0)
+      throw std::runtime_error("prepare quantized decode projections");
     CheckRoutedQ8Placement();
     CheckSmallProjection(q::WeightType::kF32, 513, 2560);
     CheckSmallProjection(q::WeightType::kF32, 96, 2560);
     CheckSmallProjection(q::WeightType::kBF16, 129, 2560);
+    CheckSmallProjection(q::WeightType::kF16, 513, 2560);
+    CheckSmallProjection(q::WeightType::kF16, 96, 2560);
+    CheckSmallProjection(q::WeightType::kBF16, 128, 2560);
+    CheckSmallProjection(q::WeightType::kBF16, 512, 2560);
     CheckSmallProjection(q::WeightType::kF16, 7, 131);
     CheckDecodeGrouping(64, 2560);
     CheckDecodeGrouping(320, 10240);
-    CheckDecodeGrouping(1024, 2560);
-    CheckDecodeGrouping(10240, 320);
-    CheckDecodeGrouping(2561, 2560);
+    CheckDecodeGrouping(1024, 2560, 256);
+    CheckDecodeGrouping(10240, 320, 256);
+    CheckDecodeGrouping(2561, 2560, 64);
     CheckDecodeGrouping(12289, 2560);
     CheckDecodeGrouping(65537, 2560);
     CheckMtpOutputHead(1.0F);
     // Small activations must retain products below F16's normal range.
     CheckMtpOutputHead(0.0001F);
+    CheckW8A8Tail(320, 10240, 0x7A1320U);
+    CheckW8A8Tail(640, 2560, 0x7A1640U);
     bool ok = true;
     // Ragged batch and rows against the 128-wide macro tiles, the 64-token
     // tile below 96, and the model's ssm_out / shexp_down widths.
@@ -857,6 +984,13 @@ int main() {
     // Wide SSM projection: two K blocks per stage, with a partial token tile.
     ok = Run(2049, 16384, 2560, 0x16384256U, 2) < 1e-2 && ok;
     ok = Run(2049, 13312, 2560, 0x13312256U, 2) < 1e-2 && ok;
+    // Every prefill pass wider than a vector batch fuses these projections:
+    // one partial 32-token tile, a ragged 128-token tile and a mid-size pass.
+    for (const std::size_t batch : {9U, 33U, 470U}) {
+      const auto seed = static_cast<std::uint32_t>(batch);
+      ok = Run(batch, 16384, 2560, 0x16384000U + seed, 2) < 1e-2 && ok;
+      ok = Run(batch, 13312, 2560, 0x13312000U + seed, 2) < 1e-2 && ok;
+    }
     // HC up: the grouped grid, including the last partial token tile.
     ok = Run(2049, 10240, 320, 0x8A8A320U, 2) < 1e-2 && ok;
     // HC down fusion: its first supported batch and a partial final tile.

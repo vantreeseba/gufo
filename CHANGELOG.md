@@ -4,6 +4,301 @@ Notable user-facing changes are recorded here. Gufo follows
 [Semantic Versioning](https://semver.org/) under the compatibility policy in
 [the release guide](docs/RELEASING.md).
 
+## [0.21.0](https://github.com/gufo-org/gufo/compare/v0.20.0...v0.21.0) (2026-10-22)
+
+
+### Features
+
+* **platform:** add the os_info leaf ([#709](https://github.com/gufo-org/gufo/issues/709)) ([3aa068b](https://github.com/gufo-org/gufo/commit/3aa068b419e6272482298c1c6daccafb122764fa))
+* **qwen-flash:** opt-in YaRN context extension ([#350](https://github.com/gufo-org/gufo/issues/350)) ([2947624](https://github.com/gufo-org/gufo/commit/2947624b9e65f52d4b4fdd96297f39e040a0ed24))
+
+
+### Bug Fixes
+
+* **bench:** stop the benchmark server when startup is interrupted ([#702](https://github.com/gufo-org/gufo/issues/702)) ([53ebb51](https://github.com/gufo-org/gufo/commit/53ebb51ed0c0b24dbe7c1e35dce6c97d82740bfe))
+
+
+### Performance
+
+* **qwen:** reduce Flash-Next sampled decoding overhead ([#699](https://github.com/gufo-org/gufo/issues/699)) ([e060aee](https://github.com/gufo-org/gufo/commit/e060aeed923730b74ea3f4116c3c39de55741370))
+
+## [0.20.0](https://github.com/gufo-org/gufo/compare/v0.19.0...v0.20.0) (2026-10-21)
+
+
+### Features
+
+* **cache:** add Qwen 27B AR and DFlash2 cache continuation ([#540](https://github.com/gufo-org/gufo/issues/540)) ([da5d5a2](https://github.com/gufo-org/gufo/commit/da5d5a2b237c654bc0523e33fdee10465240da0c))
+
+
+### Bug Fixes
+
+* **rocm:** let DeepSeek V4 Flash load when weights exceed the device pool ([#609](https://github.com/gufo-org/gufo/issues/609)) ([a7ca5f0](https://github.com/gufo-org/gufo/commit/a7ca5f0fc143203219dc71e079683d16642c6f15))
+* **serve:** answer Expect: 100-continue before reading the body ([#686](https://github.com/gufo-org/gufo/issues/686)) ([f020bd3](https://github.com/gufo-org/gufo/commit/f020bd3a037d58aa42138ca11fa895524e43cdd6))
+* **serve:** report no content for whitespace between parallel tool calls ([#676](https://github.com/gufo-org/gufo/issues/676)) ([9a9717c](https://github.com/gufo-org/gufo/commit/9a9717c1dae67a2623ba862b775bd9ba24633e0a))
+
+
+### Performance
+
+* **cache:** avoid repeated resets and full checkpoint lookups ([#680](https://github.com/gufo-org/gufo/issues/680)) ([887c38a](https://github.com/gufo-org/gufo/commit/887c38a17896d7c01095dfd0cf4b990378442846))
+* **qwen-flash:** prefetch n-gram rows across cache checkpoints ([#683](https://github.com/gufo-org/gufo/issues/683)) ([62c840e](https://github.com/gufo-org/gufo/commit/62c840ee71cf203f2d1d0078f010bb0fec49b759))
+* **qwen38_flash_next:** take the vector-load small projection path for F16 and BF16 weights ([#681](https://github.com/gufo-org/gufo/issues/681)) ([ae9ec69](https://github.com/gufo-org/gufo/commit/ae9ec6918350a97f78eeb680ae4ebf8fc0e9ad86))
+
+## [0.19.0](https://github.com/gufo-org/gufo/compare/v0.18.0...v0.19.0) (2026-10-20)
+
+
+### Features
+
+* **serve:** report model, build, context, sessions and vision in /props ([#669](https://github.com/gufo-org/gufo/issues/669)) ([4862410](https://github.com/gufo-org/gufo/commit/4862410edc6852305e3b0f1b226332591fc56948))
+
+
+### Bug Fixes
+
+* **ci:** refresh the release app token after waiting for release checks ([#665](https://github.com/gufo-org/gufo/issues/665)) ([270b533](https://github.com/gufo-org/gufo/commit/270b53338829d25ea05dab633fb924621d9168f9))
+* **ds4:** stop the batched greedy DSpark frontier before an accepted EOS ([#668](https://github.com/gufo-org/gufo/issues/668)) ([1b0a5a8](https://github.com/gufo-org/gufo/commit/1b0a5a845f18ad67fde0920d44785c2ffa1bd7d5))
+* **qwen-flash:** store d*sum(q) as the q8_1 block sum ([#667](https://github.com/gufo-org/gufo/issues/667)) ([86730bd](https://github.com/gufo-org/gufo/commit/86730bda292fc15d8fbbb37cc89e1268431f3b48))
+
+
+### Performance
+
+* **qwen-flash:** let sampled requests use the small MTP draft head on multi-session servers ([#655](https://github.com/gufo-org/gufo/issues/655)) ([b6a671c](https://github.com/gufo-org/gufo/commit/b6a671c813f6ff35d9a2a0d2a57f59dad870c1a4))
+* **qwen27b:** run verification attention rows &gt; 1 as wave64 with shared per-head steps ([#660](https://github.com/gufo-org/gufo/issues/660)) ([d1830de](https://github.com/gufo-org/gufo/commit/d1830de7df21815ace54ecc76df738ed04e7d5c7))
+* **qwen38_flash_next:** price greedy MTP drafts at the decoding occupancy ([#664](https://github.com/gufo-org/gufo/issues/664)) ([2caf2a8](https://github.com/gufo-org/gufo/commit/2caf2a82f5620d8de77661cb64e5af1bed044a89))
+
+
+### Documentation
+
+* note Claude Code is unsupported with Qwen ([#672](https://github.com/gufo-org/gufo/issues/672)) ([8775189](https://github.com/gufo-org/gufo/commit/877518953c153b2aac57f7b77fc904e8540b1fde))
+
+## [0.18.0](https://github.com/gufo-org/gufo/compare/v0.17.1...v0.18.0) (2026-10-19)
+
+
+### Features
+
+* **serve:** honor the Messages thinking budget ([#524](https://github.com/gufo-org/gufo/issues/524)) ([295f26c](https://github.com/gufo-org/gufo/commit/295f26ce63e93b288a47b1bb54d8d823a93e8c0d))
+* **serve:** prepare the structured-output vocabulary before serving ([#638](https://github.com/gufo-org/gufo/issues/638)) ([e773094](https://github.com/gufo-org/gufo/commit/e77309421b0013d44d62ec0824be63c057a970e5))
+
+
+### Bug Fixes
+
+* **cache:** keep disk-cache snapshots out of the page cache ([#477](https://github.com/gufo-org/gufo/issues/477)) ([bff0eec](https://github.com/gufo-org/gufo/commit/bff0eec6f1eaaa5847d00712787153a3de78a4a0))
+* **ci:** keep the devlab report when later jobs start ([#659](https://github.com/gufo-org/gufo/issues/659)) ([fbfc712](https://github.com/gufo-org/gufo/commit/fbfc712586c8972b2209bd6c13c69c8146311b81))
+* **qwen-flash:** pin square-accumulation order in all HcCombineMoeF16Kernel instantiations ([#624](https://github.com/gufo-org/gufo/issues/624)) ([43b829d](https://github.com/gufo-org/gufo/commit/43b829d4dee5574d66fbd499640e56f40cbf4baa))
+* **qwen:** reuse historical image preprocessing ([#645](https://github.com/gufo-org/gufo/issues/645)) ([f948ddd](https://github.com/gufo-org/gufo/commit/f948ddd371bf2a3f7360b7069fc703badbbc07ed))
+* **serve:** reclaimable page cache is available in cgroup space ([#637](https://github.com/gufo-org/gufo/issues/637)) ([9e1afaa](https://github.com/gufo-org/gufo/commit/9e1afaaa4da0f36e3638ac88bf12b054d2a1114a))
+* **tools:** preserve optional arguments in native calls ([#643](https://github.com/gufo-org/gufo/issues/643)) ([a802cc7](https://github.com/gufo-org/gufo/commit/a802cc77c795e26388e45cacec94aafcd69d12b4))
+
+
+### Performance
+
+* **flash-next:** reduce prompt and decode stalls ([#653](https://github.com/gufo-org/gufo/issues/653)) ([3462aa9](https://github.com/gufo-org/gufo/commit/3462aa96d0c02da3a6a511e0be197e186bd9f36a))
+* **qwen:** fork the recurrent state across two buffers instead of copying it ([#650](https://github.com/gufo-org/gufo/issues/650)) ([95ba1ea](https://github.com/gufo-org/gufo/commit/95ba1eae63f62fd8a4576f6313ffa6be05f1e83b))
+
+## [0.17.1](https://github.com/gufo-org/gufo/compare/v0.17.0...v0.17.1) (2026-10-18)
+
+
+### Bug Fixes
+
+* **cache:** reject capacity retries before reading payloads ([#636](https://github.com/gufo-org/gufo/issues/636)) ([778061d](https://github.com/gufo-org/gufo/commit/778061d453ff4cf863c47059f8ea63142c7f5ca1))
+* **inference:** reduce Flash-Next cache and cold-prompt stalls ([#633](https://github.com/gufo-org/gufo/issues/633)) ([1f97092](https://github.com/gufo-org/gufo/commit/1f97092333af10f29887b098d9cb8a041610004a))
+
+
+### Performance
+
+* **qwen-flash:** copy repeated context into MTP drafts ([#613](https://github.com/gufo-org/gufo/issues/613)) ([8497711](https://github.com/gufo-org/gufo/commit/8497711eb154ecff55ef4119a01ace214149e276))
+* **qwen-flash:** cut prefill and decode attention cost at depth ([#626](https://github.com/gufo-org/gufo/issues/626)) ([5a1669a](https://github.com/gufo-org/gufo/commit/5a1669a6c15129917a4e91b77bd36ddaa3e7b0d8))
+
+## [0.17.0](https://github.com/gufo-org/gufo/compare/v0.16.0...v0.17.0) (2026-10-17)
+
+
+### Features
+
+* **serve:** prepare the Qwen vision sidecar before serving ([#616](https://github.com/gufo-org/gufo/issues/616)) ([0604e9e](https://github.com/gufo-org/gufo/commit/0604e9ebc41388ab610ed0bed198e49ef96a6a82))
+
+
+### Bug Fixes
+
+* **cache:** bound publication waits by observed prefill cost ([#621](https://github.com/gufo-org/gufo/issues/621)) ([e8e508f](https://github.com/gufo-org/gufo/commit/e8e508f51826c86d567ed3b7ea6bf2b1eaeb1ab5))
+* **cache:** let disk eviction wait for startup orphan reclamation ([#625](https://github.com/gufo-org/gufo/issues/625)) ([78248de](https://github.com/gufo-org/gufo/commit/78248de23cc279b1a5d4443cef816a6059bde189))
+* **serve:** keep the decimal spelling of integer JSON numbers ([#614](https://github.com/gufo-org/gufo/issues/614)) ([22e3676](https://github.com/gufo-org/gufo/commit/22e36769f9b25a57963a9215003eae0f5f9c15d6))
+* **serve:** preserve cache reuse when tool choice changes ([#623](https://github.com/gufo-org/gufo/issues/623)) ([23d970d](https://github.com/gufo-org/gufo/commit/23d970d0ca0ef694dafec64131269f9c24590940))
+
+
+### Performance
+
+* **qwen-flash:** compact sparse attention selections once per row ([#622](https://github.com/gufo-org/gufo/issues/622)) ([baf5a1b](https://github.com/gufo-org/gufo/commit/baf5a1bbab5b99a8278c4869122fd173b205671b))
+
+## [0.16.0](https://github.com/gufo-org/gufo/compare/v0.15.1...v0.16.0) (2026-10-16)
+
+
+### Features
+
+* **serve:** keep /health answering while the model and disk tier load ([#610](https://github.com/gufo-org/gufo/issues/610)) ([f6ca085](https://github.com/gufo-org/gufo/commit/f6ca085a5091eed23541cde6fa1ff282cbd4c68b))
+
+
+### Performance
+
+* **cache:** reduce long-context checkpoint overhead ([#615](https://github.com/gufo-org/gufo/issues/615)) ([f8be547](https://github.com/gufo-org/gufo/commit/f8be5474228095dd0eec6cec14cbc6ba7f070f90))
+* **qwen-flash:** score MTP drafts over request vocabulary ([#603](https://github.com/gufo-org/gufo/issues/603)) ([51a8b00](https://github.com/gufo-org/gufo/commit/51a8b00d9dc5360688fc8642df94dfe1387ec2ca))
+
+
+### Code Refactoring
+
+* **serve:** move tool-call dialect parsing next to its renderers ([#592](https://github.com/gufo-org/gufo/issues/592)) ([b6ba33d](https://github.com/gufo-org/gufo/commit/b6ba33d48c7a2749a2e0b98e891a22e27d17cbdb))
+
+## [0.15.1](https://github.com/gufo-org/gufo/compare/v0.15.0...v0.15.1) (2026-10-15)
+
+
+### Bug Fixes
+
+* **cache:** avoid artifact hashing for RAM-only Flash-Next ([#602](https://github.com/gufo-org/gufo/issues/602)) ([43ad9a5](https://github.com/gufo-org/gufo/commit/43ad9a5a7133dabc820a66a825247331c5503bf4))
+* **cache:** repair flash-next functional cache regressions ([#596](https://github.com/gufo-org/gufo/issues/596)) ([ec69aa3](https://github.com/gufo-org/gufo/commit/ec69aa328ea78f00090c42a78034cc012eae151e))
+
+## [0.15.0](https://github.com/gufo-org/gufo/compare/v0.14.0...v0.15.0) (2026-10-13)
+
+
+### Features
+
+* **serve:** accept IPv6 listen addresses ([#585](https://github.com/gufo-org/gufo/issues/585)) ([a690704](https://github.com/gufo-org/gufo/commit/a690704b99ce7f8b962e1b6004c07c7af24e0ce3))
+
+
+### Bug Fixes
+
+* **cache:** pin Flash-Next cache pages without compacting host memory ([#589](https://github.com/gufo-org/gufo/issues/589)) ([10c40b0](https://github.com/gufo-org/gufo/commit/10c40b0d09b6a58f0932c1f73e08318647b75474))
+* **serve:** accept response schemas without additionalProperties ([#582](https://github.com/gufo-org/gufo/issues/582)) ([c406e40](https://github.com/gufo-org/gufo/commit/c406e40e97fcee008e47e3447b71f82066def6a7))
+
+
+### Performance
+
+* **qwen-flash:** speed up wide prefill kernels ([#571](https://github.com/gufo-org/gufo/issues/571)) ([a33e989](https://github.com/gufo-org/gufo/commit/a33e989cf49e533e3cb591a9f0483c67c590ba50))
+
+## [0.14.0](https://github.com/gufo-org/gufo/compare/v0.13.0...v0.14.0) (2026-10-13)
+
+
+### Features
+
+* **cache:** wire Flash-Next serving to the component cache ([#573](https://github.com/gufo-org/gufo/issues/573)) ([058d6e8](https://github.com/gufo-org/gufo/commit/058d6e80c21089b8e3af76b6ae3c7b31a01d541f))
+* **rocm:** managed-alloc fallback ([#460](https://github.com/gufo-org/gufo/issues/460)) ([248d902](https://github.com/gufo-org/gufo/commit/248d902e206be118216d8a3627718824816b0ab2))
+
+
+### Documentation
+
+* update readme ([#574](https://github.com/gufo-org/gufo/issues/574)) ([8d4e1a2](https://github.com/gufo-org/gufo/commit/8d4e1a2b74c94752b9b16b1dda153cbf52638443))
+
+## [0.13.0](https://github.com/gufo-org/gufo/compare/v0.12.0...v0.13.0) (2026-10-12)
+
+
+### Features
+
+* **serve:** exit as device_lost when generation stops making progress ([#541](https://github.com/gufo-org/gufo/issues/541)) ([2b4daed](https://github.com/gufo-org/gufo/commit/2b4daede679e4fd46cc77e5658606306ed5ed2f0))
+
+
+### Bug Fixes
+
+* **serve:** accept a boolean or null stream on compatibility routes ([#544](https://github.com/gufo-org/gufo/issues/544)) ([ccf3463](https://github.com/gufo-org/gufo/commit/ccf3463f028bc97e5082cb2c612cf40da9cf77c4))
+* **serve:** honor cache_prompt on raw completion routes ([#557](https://github.com/gufo-org/gufo/issues/557)) ([956f3d6](https://github.com/gufo-org/gufo/commit/956f3d62386a80d327aea9610310fef105c31b95))
+
+
+### Performance
+
+* **qwen-flash:** use 128 n-gram readers as documented ([#551](https://github.com/gufo-org/gufo/issues/551)) ([f37fb01](https://github.com/gufo-org/gufo/commit/f37fb012281bbd58054b1082933153bbec303106))
+
+
+### Documentation
+
+* **cache:** warn that the automatic RAM budget ignores later co-resident servers ([#556](https://github.com/gufo-org/gufo/issues/556)) ([113d42f](https://github.com/gufo-org/gufo/commit/113d42fbfecd57b3b18126a22e62a04dd4a4b51d))
+* **qwen-flash:** record rejected fork prefill kernels ([#565](https://github.com/gufo-org/gufo/issues/565)) ([1834991](https://github.com/gufo-org/gufo/commit/1834991317745b095ea42fc21370d594fabd519c))
+
+## [0.12.0](https://github.com/gufo-org/gufo/compare/v0.11.0...v0.12.0) (2026-10-11)
+
+
+### Features
+
+* **cache:** add Flash-Next continuation adapter ([#536](https://github.com/gufo-org/gufo/issues/536)) ([95d7619](https://github.com/gufo-org/gufo/commit/95d76191e9d2cd434bc13defb971bf26e3c9e3f0))
+* **serve:** accept image blocks in Messages user turns and tool results ([#510](https://github.com/gufo-org/gufo/issues/510)) ([6a1b136](https://github.com/gufo-org/gufo/commit/6a1b136aba5982e5a35c628824f2380280766d46))
+* **serve:** implement /v1/messages/count_tokens ([#512](https://github.com/gufo-org/gufo/issues/512)) ([8ca0c4a](https://github.com/gufo-org/gufo/commit/8ca0c4a0b06310b522cb045a0ed820e635204845))
+
+
+### Bug Fixes
+
+* **json:** keep mixed string and number enum values reachable ([#535](https://github.com/gufo-org/gufo/issues/535)) ([d8efa54](https://github.com/gufo-org/gufo/commit/d8efa542cf5a991bf5fd293cba2602e8605529ac))
+* **qwen:** keep Flash-Next snapshots within device headroom ([#549](https://github.com/gufo-org/gufo/issues/549)) ([eada056](https://github.com/gufo-org/gufo/commit/eada0564b000a8e630118d10dbdd5bfcd6dc13d7))
+* **serve:** exclude cache reads from Messages input_tokens ([#530](https://github.com/gufo-org/gufo/issues/530)) ([2a3b09e](https://github.com/gufo-org/gufo/commit/2a3b09e187208c3895eee7391ca0a6a3179a2efc))
+* **serve:** keep listening WebSocket clients connected past the idle timeout ([#527](https://github.com/gufo-org/gufo/issues/527)) ([15ecb0c](https://github.com/gufo-org/gufo/commit/15ecb0c2ce5d98e49423a2cab7eb148754488d44))
+* **serve:** name max_completion_tokens in its Chat validation error ([#545](https://github.com/gufo-org/gufo/issues/545)) ([fc760f2](https://github.com/gufo-org/gufo/commit/fc760f2075cf6b812089794b69feaa66597cd8af))
+* **serve:** refuse images before reading when model is text-only ([#550](https://github.com/gufo-org/gufo/issues/550)) ([3323e7c](https://github.com/gufo-org/gufo/commit/3323e7c789e7cdf56466602e032e24e8c01df0a8))
+* **serve:** reject HTTP header names that are not tokens ([#533](https://github.com/gufo-org/gufo/issues/533)) ([da827bd](https://github.com/gufo-org/gufo/commit/da827bd244fe277913bd9f98801b0117e02748ac))
+* **serve:** report non-string models and documented reasoning efforts in Chat errors ([#546](https://github.com/gufo-org/gufo/issues/546)) ([8fa2369](https://github.com/gufo-org/gufo/commit/8fa2369f3de015a2281f86428b4b1eac30078c50))
+* **serve:** stream native tool-call arguments incrementally ([#534](https://github.com/gufo-org/gufo/issues/534)) ([0377339](https://github.com/gufo-org/gufo/commit/037733911b8526b45ddcdf35df96508eea4fe25b))
+
+
+### Documentation
+
+* **cache:** note the final user turn an unchanged retry prefills ([#552](https://github.com/gufo-org/gufo/issues/552)) ([d03c8fc](https://github.com/gufo-org/gufo/commit/d03c8fcc8309e949357f9bba8d6a5fc1a1eebd3f))
+* **server:** allow top_p zero and scope cache_prompt to its endpoints ([#548](https://github.com/gufo-org/gufo/issues/548)) ([d0f7c3a](https://github.com/gufo-org/gufo/commit/d0f7c3a023a11af81161264eeb24e9a97aa7498a))
+
+## [0.11.0](https://github.com/gufo-org/gufo/compare/v0.10.0...v0.11.0) (2026-10-10)
+
+
+### Features
+
+* **cache:** add committed HIP backing and transfer pools ([#504](https://github.com/gufo-org/gufo/issues/504)) ([e6c850d](https://github.com/gufo-org/gufo/commit/e6c850d3df61578bf878db2ad1fc96266d8bc07d))
+* **cache:** define disk manifests and metadata startup index ([#507](https://github.com/gufo-org/gufo/issues/507)) ([9024101](https://github.com/gufo-org/gufo/commit/9024101b12a59ffe8e067dfad25250236f57d1b9))
+* **cache:** preserve borrowed rows while slots are idle ([#505](https://github.com/gufo-org/gufo/issues/505)) ([525d9c4](https://github.com/gufo-org/gufo/commit/525d9c4dbd4b126ed092bad2c736382392a8a4a1))
+* **cache:** publish checkpoints with crash-safe recovery ([#509](https://github.com/gufo-org/gufo/issues/509)) ([d65addf](https://github.com/gufo-org/gufo/commit/d65addfb0ea246726640f1d149c6960fca5adbb9))
+* **cache:** select and evict resident and durable checkpoints ([#517](https://github.com/gufo-org/gufo/issues/517)) ([92aaed5](https://github.com/gufo-org/gufo/commit/92aaed5d30cd82e5730e43be3501775b77c26e5e))
+* **cache:** stream checkpoints through bounded transfer pieces ([#515](https://github.com/gufo-org/gufo/issues/515)) ([081e8a0](https://github.com/gufo-org/gufo/commit/081e8a048afe6611517fcac86c6c2e759f45e021))
+
+
+### Bug Fixes
+
+* **cache:** keep a live frontier when a branch restores its borrowed checkpoint ([#476](https://github.com/gufo-org/gufo/issues/476)) ([7def5ad](https://github.com/gufo-org/gufo/commit/7def5adcb8b2e13262eeed8bfc98d81a040cd84f))
+* **ci:** match GitHub anchors and relative links in the docs check ([#528](https://github.com/gufo-org/gufo/issues/528)) ([b869dd0](https://github.com/gufo-org/gufo/commit/b869dd056f6d068839858c96eb34c20d2479fcf7))
+* **ci:** require exact dependency inventory rows ([#531](https://github.com/gufo-org/gufo/issues/531)) ([3f53952](https://github.com/gufo-org/gufo/commit/3f53952e9ee68e3a64828a752d7bbac322135a58))
+* **gguf:** decode 8- and 16-bit integer metadata arrays ([#532](https://github.com/gufo-org/gufo/issues/532)) ([3fac1bb](https://github.com/gufo-org/gufo/commit/3fac1bb51c97ef3606bf0bc662bf778344414cb4))
+* **qwen-image:** stage weight uploads through pinned buffers ([#499](https://github.com/gufo-org/gufo/issues/499)) ([eb91daa](https://github.com/gufo-org/gufo/commit/eb91daa2b8ae2b2e35c11dc26c1cb08becb972cf))
+* **serve:** log the cause of generic generation failures ([#520](https://github.com/gufo-org/gufo/issues/520)) ([b0af357](https://github.com/gufo-org/gufo/commit/b0af357b34a7b34055a155eb77168a4b10d6b0b2))
+* **serve:** preserve images in tool results ([#506](https://github.com/gufo-org/gufo/issues/506)) ([5f0b194](https://github.com/gufo-org/gufo/commit/5f0b19403b1b9cecb018db2c39b9272daf6c0ab2))
+
+
+### Performance
+
+* **qwen-flash:** faster decode kernels ([#518](https://github.com/gufo-org/gufo/issues/518)) ([7e4621c](https://github.com/gufo-org/gufo/commit/7e4621c37079ab1bc62c1fd07ca03c37b85831cc))
+
+
+### Documentation
+
+* **cache:** mark implemented cards done in the card index ([#526](https://github.com/gufo-org/gufo/issues/526)) ([a41e88d](https://github.com/gufo-org/gufo/commit/a41e88da229441f31b49cef5ea1cbfc5f2704dc3))
+
+
+### Code Refactoring
+
+* **cache:** add coherent prefix index and lookup ([#500](https://github.com/gufo-org/gufo/issues/500)) ([e17e2d1](https://github.com/gufo-org/gufo/commit/e17e2d1dd1d05c0be14f0e9cc309a82f510de68d))
+* **cache:** add common adapter contracts and fake adapter ([#493](https://github.com/gufo-org/gufo/issues/493)) ([c875a5b](https://github.com/gufo-org/gufo/commit/c875a5bd37eb390b1e08383459882085ce193a3b))
+* **cache:** add resource ledger and transactional reservations ([#496](https://github.com/gufo-org/gufo/issues/496)) ([c8d3ab5](https://github.com/gufo-org/gufo/commit/c8d3ab550d20df3e5b3d244318e8c4757625dd5a))
+* **cache:** add shared chunks and checkpoint provenance ([#498](https://github.com/gufo-org/gufo/issues/498)) ([087c192](https://github.com/gufo-org/gufo/commit/087c192d9f74b8557646699d6fc55bc23b37f25e))
+* **cache:** add slot leases and transactional mutation guards ([#501](https://github.com/gufo-org/gufo/issues/501)) ([7035ebb](https://github.com/gufo-org/gufo/commit/7035ebbf70489bdc469dc1c701fea5295757297e))
+* **cache:** port retention policy and replayable events ([#503](https://github.com/gufo-org/gufo/issues/503)) ([51ceefc](https://github.com/gufo-org/gufo/commit/51ceefc1989cb8689008628f64c1d3b988df7d5c))
+
+## [0.10.0](https://github.com/gufo-org/gufo/compare/v0.9.1...v0.10.0) (2026-10-09)
+
+
+### Features
+
+* **serve:** support tools and streaming on /v1/messages ([#469](https://github.com/gufo-org/gufo/issues/469)) ([50900eb](https://github.com/gufo-org/gufo/commit/50900eb717925cc8e85ed952e1a75e522958a7f6))
+
+
+### Performance
+
+* **ds4:** keep the 8-row IQ2 gate/up tiles out of scratch ([#482](https://github.com/gufo-org/gufo/issues/482)) ([e9b0f0b](https://github.com/gufo-org/gufo/commit/e9b0f0b34b41b1968dcf6eb2f215cbfd53ae4ebe))
+* **qwen-flash:** accelerate prefill and MTP catch-up ([#485](https://github.com/gufo-org/gufo/issues/485)) ([fd747a5](https://github.com/gufo-org/gufo/commit/fd747a51951ccd09eda20de5c34313670dc9b9d3))
+* **qwen-image:** unroll the fused attention value halves ([#481](https://github.com/gufo-org/gufo/issues/481)) ([b2438a4](https://github.com/gufo-org/gufo/commit/b2438a4a12717cd0970b46bb293875eaf31d9839))
+
+
+### Documentation
+
+* **cache:** add cache redesign implementation cards ([#489](https://github.com/gufo-org/gufo/issues/489)) ([d221a01](https://github.com/gufo-org/gufo/commit/d221a01c74052737a04148ef86a47e1db3e270b7))
+* **cache:** propose continuation cache redesign RFC ([#488](https://github.com/gufo-org/gufo/issues/488)) ([b3facce](https://github.com/gufo-org/gufo/commit/b3facce1180e4bb44ac25c8f8a0fee348ae36da9))
+
 ## [0.9.1](https://github.com/gufo-org/gufo/compare/v0.9.0...v0.9.1) (2026-10-08)
 
 

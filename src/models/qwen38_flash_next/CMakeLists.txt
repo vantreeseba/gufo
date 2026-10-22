@@ -2,7 +2,9 @@
 # only by explicit validation targets, not by production or routine checks.
 add_library(gufo_qwen38_flash_next STATIC
   config.cpp
+  continuation_layout.cpp
   ngram.cpp
+  rope_scaling.cpp
   weights.cpp)
 
 target_include_directories(gufo_qwen38_flash_next PUBLIC ${PROJECT_SOURCE_DIR})
@@ -41,7 +43,7 @@ if (ENGINE_ENABLE_HIP)
     HIP_STANDARD_REQUIRED ON
     POSITION_INDEPENDENT_CODE ON)
   target_compile_definitions(gufo_qwen38_flash_next_mmq PRIVATE
-    GGML_HIP_NO_VMM)
+    GGML_HIP_NO_VMM ENGINE_ENABLE_HIP=1)
   target_compile_options(gufo_qwen38_flash_next_mmq PRIVATE
     $<$<COMPILE_LANGUAGE:HIP>:-O3;-ffast-math;-fno-finite-math-only;-Wno-unused-value;-Wno-unused-command-line-argument>)
   target_include_directories(gufo_qwen38_flash_next_mmq SYSTEM PUBLIC ${QFN_MMQ_DIR})
@@ -73,6 +75,7 @@ if (ENGINE_ENABLE_HIP)
     roc::hipblas)
 
   set(QFN_HIP_SOURCES
+    continuation_adapter.cpp
     ${QFN_ROCM_DIR}/blaslt.cpp
     ${QFN_ROCM_DIR}/device_model.cpp
     ${QFN_ROCM_DIR}/executor.cpp
@@ -88,6 +91,13 @@ if (ENGINE_ENABLE_HIP)
     ${ROCPRIM_INCLUDE_DIR}
     ${ROCWMMA_INCLUDE_DIR})
   target_link_libraries(gufo_qwen38_flash_next PUBLIC
-    gufo_qwen38_flash_next_kernels gufo_qwen38_flash_next_mmq hip::host
-    roc::hipblas roc::hipblaslt)
+    gufo_cache_hip gufo_qwen38_flash_next_kernels gufo_qwen38_flash_next_mmq
+    hip::host roc::hipblas roc::hipblaslt)
+
+  if (GUFO_BUILD_TOOLS AND NOT BUILD_TESTING)
+    add_executable(qwen38_flash_next_continuation_probe EXCLUDE_FROM_ALL
+      ${PROJECT_SOURCE_DIR}/tests/models/qwen38_flash_next/continuation_probe.cpp)
+    target_link_libraries(qwen38_flash_next_continuation_probe PRIVATE
+      gufo_qwen38_flash_next)
+  endif()
 endif()

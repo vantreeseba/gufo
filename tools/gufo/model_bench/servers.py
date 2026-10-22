@@ -59,7 +59,20 @@ class HipMemory:
     @classmethod
     def for_binary(cls, gufo_binary: Path) -> "HipMemory | None":
         """Resolve libamdhip64 the way the Gufo binary links it."""
-        completed = subprocess.run(["ldd", str(gufo_binary)], capture_output=True, text=True)
+        executable = gufo_binary.resolve()
+        # Nix's makeWrapper keeps the production ELF beside its launch script.
+        # ldd cannot inspect the script that selects Gufo's patched runtime.
+        for candidate in (executable, executable.with_name(f".{executable.name}-wrapped")):
+            try:
+                with candidate.open("rb") as binary:
+                    if binary.read(4) == b"\x7fELF":
+                        executable = candidate
+                        break
+            except OSError:
+                pass
+        else:
+            return None
+        completed = subprocess.run(["ldd", str(executable)], capture_output=True, text=True)
         for line in completed.stdout.splitlines():
             if "libamdhip64" in line and "=>" in line:
                 path = Path(line.split("=>", 1)[1].split()[0])
@@ -103,24 +116,31 @@ class Server:
             self.command, stdout=log, stderr=subprocess.STDOUT, env=env,
             start_new_session=True,
         )
-        deadline = started + timeout
-        url = self.base_url + self.readiness
-        while time.perf_counter() < deadline:
-            if self.process.poll() is not None:
-                self.failure_exit_code = self.process.returncode
-                raise RuntimeError(
-                    f"server exited with {self.process.returncode} before readiness; see {self.log_path}"
-                )
-            try:
-                with urllib.request.urlopen(url, timeout=5) as response:
-                    if response.status == 200:
-                        self.ready_seconds = time.perf_counter() - started
-                        return self
-            except (urllib.error.URLError, urllib.error.HTTPError, ConnectionError, TimeoutError):
-                pass
-            time.sleep(0.05)
-        self.stop()
-        raise RuntimeError(f"server not ready within {timeout:.0f} s; see {self.log_path}")
+        try:
+            deadline = started + timeout
+            url = self.base_url + self.readiness
+            while time.perf_counter() < deadline:
+                if self.process.poll() is not None:
+                    self.failure_exit_code = self.process.returncode
+                    raise RuntimeError(
+                        f"server exited with {self.process.returncode} before readiness; see {self.log_path}"
+                    )
+                try:
+                    with urllib.request.urlopen(url, timeout=5) as response:
+                        if response.status == 200:
+                            self.ready_seconds = time.perf_counter() - started
+                            return self
+                except (urllib.error.URLError, urllib.error.HTTPError, ConnectionError, TimeoutError):
+                    pass
+                time.sleep(0.05)
+            self.stop()
+            raise RuntimeError(f"server not ready within {timeout:.0f} s; see {self.log_path}")
+        except BaseException:
+            # Ctrl-C included: the server runs in its own session, so the
+            # terminal's SIGINT never reaches it, and __exit__ never runs when
+            # __enter__ raises.
+            self.stop()
+            raise
 
     def stop(self) -> None:
         if self.process is None or self.process.poll() is not None:

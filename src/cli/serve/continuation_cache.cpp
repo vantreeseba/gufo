@@ -7,8 +7,6 @@
 #include <mutex>
 #include <optional>
 #include <stdexcept>
-#include <string>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -42,19 +40,6 @@ int MaxRemovalPriority(SnapshotPurpose purpose) {
       return 3;
   }
   return 0;
-}
-
-std::size_t BlockBytes(std::span<const SnapshotBlock> blocks) noexcept {
-  std::size_t bytes = 0;
-  for (const auto& block : blocks)
-    bytes += block.bytes;
-  return bytes;
-}
-
-// New room a payload needs once its shared blocks are held separately.
-std::size_t ChargedBytes(std::size_t payload_bytes,
-                         std::span<const SnapshotBlock> blocks) noexcept {
-  return payload_bytes - std::min(payload_bytes, BlockBytes(blocks));
 }
 
 void EmitSnapshotEvents(const ContinuationCache::SnapshotEventSink& sink,
@@ -104,73 +89,9 @@ struct ContinuationCache::Impl {
   std::size_t snapshot_capacity_bytes{0};
   std::size_t retained_snapshot_bytes{0};
   std::size_t reserved_snapshot_bytes{0};
-  // Blocks held by retained snapshots and admitted reservations. Each counts
-  // once in retained_snapshot_bytes while anything holds it.
-  struct SharedBlock {
-    std::size_t bytes{0};
-    std::size_t holders{0};
-  };
-  std::unordered_map<std::uint64_t, SharedBlock> shared_blocks;
 
   [[nodiscard]] bool snapshot_mode() const noexcept {
     return static_cast<bool>(snapshot_support.restore);
-  }
-
-  void ReleaseBlocks(std::span<const SnapshotBlock> blocks) noexcept {
-    for (const auto& block : blocks) {
-      const auto found = shared_blocks.find(block.id);
-      if (found == shared_blocks.end() || --found->second.holders != 0)
-        continue;
-      retained_snapshot_bytes -= found->second.bytes;
-      shared_blocks.erase(found);
-    }
-  }
-
-  void HoldBlocks(std::span<const SnapshotBlock> blocks) {
-    std::size_t held = 0;
-    try {
-      for (; held < blocks.size(); ++held) {
-        auto& shared = shared_blocks
-                           .try_emplace(blocks[held].id,
-                                        SharedBlock{blocks[held].bytes, 0})
-                           .first->second;
-        if (shared.holders++ == 0)
-          retained_snapshot_bytes += shared.bytes;
-      }
-    } catch (...) {
-      ReleaseBlocks(blocks.first(held));
-      throw;
-    }
-  }
-
-  [[nodiscard]] std::size_t UnheldBytes(
-      std::span<const SnapshotBlock> blocks) const {
-    std::size_t bytes = 0;
-    for (const auto& block : blocks)
-      if (!shared_blocks.contains(block.id))
-        bytes += block.bytes;
-    return bytes;
-  }
-
-  void HoldSnapshot(const ContinuationSnapshot& snapshot) {
-    const auto blocks = snapshot.SharedBlocks();
-    HoldBlocks(blocks);
-    retained_snapshot_bytes += ChargedBytes(snapshot.PayloadBytes(), blocks);
-  }
-
-  void ReleaseSnapshot(const ContinuationSnapshot& snapshot) noexcept {
-    const auto blocks = snapshot.SharedBlocks();
-    retained_snapshot_bytes -= ChargedBytes(snapshot.PayloadBytes(), blocks);
-    ReleaseBlocks(blocks);
-  }
-
-  // False when the reservation was not counted, which voids its admission.
-  bool ReleaseCharge(std::size_t reservation_bytes,
-                     std::span<const SnapshotBlock> blocks) noexcept {
-    const std::size_t charge = ChargedBytes(reservation_bytes, blocks);
-    const bool counted = charge <= reserved_snapshot_bytes;
-    reserved_snapshot_bytes -= counted ? charge : reserved_snapshot_bytes;
-    return counted;
   }
 
   // Rank extra copies before the last useful checkpoint of a prefix family.
@@ -204,6 +125,34 @@ struct ContinuationCache::Impl {
       next = token;
     }
     return learned;
+  }
+
+  /// A prompt that restores `source` and then differs from a deeper retained
+  /// checkpoint or live frontier of the same family branches at `source`, as
+  /// conversations sharing a system prompt do. Later conversations restore
+  /// it as well, so it is learned like a published branch point; otherwise a
+  /// grid checkpoint stays history and yields to any frontier frozen later.
+  /// A prompt inside the deeper tokens retries it and teaches nothing.
+  [[nodiscard]] bool RestoreDiverges(
+      std::size_t source, std::span<const ContinuationToken> prompt) const {
+    const auto& entry = *entries[source];
+    if (entry.purpose != SnapshotPurpose::kHistory &&
+        entry.purpose != SnapshotPurpose::kContinuation)
+      return false;
+    const auto diverges = [&](const auto& tokens, const auto& identity) {
+      if (identity != entry.input_identity ||
+          tokens.size() <= entry.tokens.size() ||
+          !IsPrefix(entry.tokens, tokens))
+        return false;
+      const auto common = static_cast<std::size_t>(
+          std::ranges::mismatch(tokens, prompt).in1 - tokens.begin());
+      return common < std::min(tokens.size(), prompt.size());
+    };
+    return std::ranges::any_of(entries, [&](const auto& peer) {
+      return (peer->valid && peer->snapshot &&
+              diverges(peer->tokens, peer->input_identity)) ||
+             diverges(peer->live_tokens, peer->live_identity);
+    });
   }
 
   [[nodiscard]] int RemovalPriority(
@@ -273,7 +222,6 @@ ContinuationCache::Lease::Lease(Lease&& other) noexcept
       restored_from_disk_(std::exchange(other.restored_from_disk_, false)),
       reserved_snapshot_bytes_(
           std::exchange(other.reserved_snapshot_bytes_, 0)),
-      reserved_sharing_(std::exchange(other.reserved_sharing_, {})),
       snapshot_purpose_(other.snapshot_purpose_),
       prompt_tokens_(std::exchange(other.prompt_tokens_, 0)),
       stable_prefix_tokens_(std::exchange(other.stable_prefix_tokens_, 0)),
@@ -294,7 +242,6 @@ ContinuationCache::Lease& ContinuationCache::Lease::operator=(
     restore_ms_ = std::exchange(other.restore_ms_, 0.0);
     restored_from_disk_ = std::exchange(other.restored_from_disk_, false);
     reserved_snapshot_bytes_ = std::exchange(other.reserved_snapshot_bytes_, 0);
-    reserved_sharing_ = std::exchange(other.reserved_sharing_, {});
     snapshot_purpose_ = other.snapshot_purpose_;
     prompt_tokens_ = std::exchange(other.prompt_tokens_, 0);
     stable_prefix_tokens_ = std::exchange(other.stable_prefix_tokens_, 0);
@@ -334,8 +281,7 @@ void ContinuationCache::Lease::AdoptRestoredPrefix(std::size_t cached_tokens,
 bool ContinuationCache::Lease::TryReserveSnapshot(
     std::size_t snapshot_bytes, std::size_t token_count, bool preserve_source,
     SnapshotPurpose purpose,
-    std::span<const ContinuationToken> replacement_prefix,
-    SnapshotSharing sharing) {
+    std::span<const ContinuationToken> replacement_prefix) {
   if (cache_ == nullptr) {
     throw std::logic_error("continuation cache lease is empty");
   }
@@ -345,43 +291,11 @@ bool ContinuationCache::Lease::TryReserveSnapshot(
   }
   if (!cache_->ReserveSnapshot(source_index_, snapshot_bytes, token_count,
                                preserve_source, purpose, replacement_prefix,
-                               InputIdentity(token_count), sharing.blocks)) {
+                               InputIdentity(token_count))) {
     return false;
   }
   reserved_snapshot_bytes_ = snapshot_bytes;
-  reserved_sharing_ = std::move(sharing);
   snapshot_purpose_ = purpose;
-  return true;
-}
-
-bool ContinuationCache::Lease::RetryReserveSnapshot(
-    std::size_t token_count, bool preserve_source,
-    std::span<const ContinuationToken> replacement_prefix) {
-  if (cache_ == nullptr) {
-    throw std::logic_error("continuation cache lease is empty");
-  }
-  const std::size_t snapshot_bytes = std::exchange(reserved_snapshot_bytes_, 0);
-  if (snapshot_bytes == 0)
-    return false;
-  auto sharing = std::exchange(reserved_sharing_, {});
-  // The failed attempt keeps its blocks held until the retry holds them too,
-  // so evictions in between cannot drop them from the count.
-  cache_->LowerSnapshotCapacity(snapshot_bytes, sharing.blocks);
-  bool admitted = false;
-  try {
-    admitted = cache_->ReserveSnapshot(
-        source_index_, snapshot_bytes, token_count, preserve_source,
-        snapshot_purpose_, replacement_prefix, InputIdentity(token_count),
-        sharing.blocks);
-  } catch (...) {
-    cache_->ReleaseSnapshotBlocks(sharing.blocks);
-    throw;
-  }
-  cache_->ReleaseSnapshotBlocks(sharing.blocks);
-  if (!admitted)
-    return false;
-  reserved_snapshot_bytes_ = snapshot_bytes;
-  reserved_sharing_ = std::move(sharing);
   return true;
 }
 
@@ -391,10 +305,9 @@ void ContinuationCache::Lease::SkipSnapshot(SnapshotEventReason reason,
   if (cache_ == nullptr) {
     return;
   }
-  cache_->SkipSnapshot(reserved_snapshot_bytes_, reserved_sharing_.blocks,
-                       reason, snapshot_bytes, token_count);
+  cache_->SkipSnapshot(reserved_snapshot_bytes_, reason, snapshot_bytes,
+                       token_count);
   reserved_snapshot_bytes_ = 0;
-  reserved_sharing_ = {};
 }
 
 std::size_t ContinuationCache::Lease::Commit(
@@ -409,14 +322,12 @@ std::size_t ContinuationCache::Lease::Commit(
   const auto identity = InputIdentity(tokens.size());
   const auto live_identity = InputIdentity(live_tokens.size());
   const std::size_t retained = cache_->Commit(
-      index_, source_index_, reserved_snapshot_bytes_, reserved_sharing_.blocks,
-      std::move(tokens), std::move(snapshot),
-      {identity.begin(), identity.end()}, std::move(live_tokens),
-      {live_identity.begin(), live_identity.end()}, true, nullptr,
-      stable_prefix, snapshot_purpose_);
+      index_, source_index_, reserved_snapshot_bytes_, std::move(tokens),
+      std::move(snapshot), {identity.begin(), identity.end()},
+      std::move(live_tokens), {live_identity.begin(), live_identity.end()},
+      true, nullptr, stable_prefix, snapshot_purpose_);
   cache_ = nullptr;
   reserved_snapshot_bytes_ = 0;
-  reserved_sharing_ = {};
   return retained;
 }
 
@@ -428,22 +339,18 @@ std::size_t ContinuationCache::Lease::PublishSnapshot(
     throw std::logic_error("continuation cache lease is empty");
   const auto identity = InputIdentity(tokens.size());
   const auto retained = cache_->Commit(
-      index_, source_index_, reserved_snapshot_bytes_, reserved_sharing_.blocks,
-      std::move(tokens), std::move(snapshot),
-      {identity.begin(), identity.end()}, {}, {}, false,
+      index_, source_index_, reserved_snapshot_bytes_, std::move(tokens),
+      std::move(snapshot), {identity.begin(), identity.end()}, {}, {}, false,
       preserve_source ? nullptr : &source_index_, 0, snapshot_purpose_);
   reserved_snapshot_bytes_ = 0;
-  reserved_sharing_ = {};
   return retained;
 }
 
 void ContinuationCache::Lease::Invalidate() noexcept {
   if (cache_ != nullptr) {
-    cache_->Invalidate(index_, reserved_snapshot_bytes_,
-                       reserved_sharing_.blocks);
+    cache_->Invalidate(index_, reserved_snapshot_bytes_);
     cache_ = nullptr;
     reserved_snapshot_bytes_ = 0;
-    reserved_sharing_ = {};
   }
 }
 
@@ -664,7 +571,14 @@ ContinuationCache::Lease ContinuationCache::Acquire(
       std::uint64_t oldest = std::numeric_limits<std::uint64_t>::max();
       for (std::size_t index = 0; index < impl_->entries.size(); ++index) {
         const auto& entry = *impl_->entries[index];
-        if (entry.available && cache_hit && impl_->entries[source]->snapshot &&
+        // Borrowed rows save the restore a copy, never another
+        // conversation's live frontier, whose loss costs its whole prefill.
+        // A prompt inside the frontier retries that conversation and
+        // replaces the reply the frontier holds.
+        if (entry.available &&
+            (entry.live_tokens.empty() ||
+             IsPrefix(prompt, entry.live_tokens)) &&
+            cache_hit && impl_->entries[source]->snapshot &&
             impl_->entries[source]->snapshot->PrefersState(*entry.state)) {
           selected = index;
           break;
@@ -699,6 +613,8 @@ ContinuationCache::Lease ContinuationCache::Acquire(
           auto& source_entry = *impl_->entries[source];
           snapshot = source_entry.snapshot;
           source_entry.snapshot_last_used = ++impl_->clock;
+          if (impl_->RestoreDiverges(source, prompt))
+            source_entry.purpose = SnapshotPurpose::kBranchPoint;
         }
       } else {
         entry.valid = false;
@@ -873,12 +789,10 @@ bool ContinuationCache::ReserveSnapshot(
     std::size_t source_index, std::size_t snapshot_bytes,
     std::size_t token_count, bool preserve_source, SnapshotPurpose& purpose,
     std::span<const ContinuationToken> replacement_prefix,
-    std::span<const std::uint8_t> input_identity,
-    std::span<const SnapshotBlock> shared_blocks) {
+    std::span<const std::uint8_t> input_identity) {
   std::vector<std::shared_ptr<const ContinuationSnapshot>> removed_snapshots;
   std::vector<SnapshotEvent> events;
   bool admitted = false;
-  const std::size_t charge = ChargedBytes(snapshot_bytes, shared_blocks);
   const int max_priority = MaxRemovalPriority(purpose);
   const auto incoming = IsContinuation(purpose)
                             ? replacement_prefix
@@ -905,7 +819,7 @@ bool ContinuationCache::ReserveSnapshot(
       const std::size_t used =
           impl_->retained_snapshot_bytes + impl_->reserved_snapshot_bytes;
       return snapshot_bytes != 0 && used <= impl_->snapshot_capacity_bytes &&
-             charge <= impl_->snapshot_capacity_bytes - used;
+             snapshot_bytes <= impl_->snapshot_capacity_bytes - used;
     };
     if (!IsContinuation(purpose) &&
         std::ranges::none_of(impl_->entries.begin() + impl_->state_count,
@@ -922,9 +836,6 @@ bool ContinuationCache::ReserveSnapshot(
                                   SnapshotEventReason::kEntryCapacity,
                                   snapshot_bytes, token_count));
     } else {
-      // Held first: evicting their owner below then frees only what it alone
-      // holds, and the loop keeps going until the remainder really fits.
-      impl_->HoldBlocks(shared_blocks);
       const auto oldest_snapshot = [&](bool allow_source) {
         std::size_t selected = impl_->entries.size();
         std::uint64_t oldest = std::numeric_limits<std::uint64_t>::max();
@@ -980,17 +891,17 @@ bool ContinuationCache::ReserveSnapshot(
       const bool can_fit_after_eviction =
           snapshot_bytes != 0 &&
           impl_->reserved_snapshot_bytes <= impl_->snapshot_capacity_bytes &&
-          charge <=
+          snapshot_bytes <=
               impl_->snapshot_capacity_bytes - impl_->reserved_snapshot_bytes;
       const auto remove = [&](std::size_t target, SnapshotEventReason reason) {
         auto& entry = *impl_->entries[target];
         const std::size_t removed_bytes = entry.snapshot_bytes;
         const std::size_t removed_tokens = entry.tokens.size();
-        impl_->ReleaseSnapshot(*entry.snapshot);
         removed_snapshots.push_back(std::move(entry.snapshot));
         entry.tokens.clear();
         entry.snapshot_bytes = 0;
         entry.valid = false;
+        impl_->retained_snapshot_bytes -= removed_bytes;
         events.push_back(make_event(SnapshotEventAction::kRemoved, reason,
                                     removed_bytes, removed_tokens));
       };
@@ -1018,10 +929,9 @@ bool ContinuationCache::ReserveSnapshot(
       }
 
       if (fits()) {
-        impl_->reserved_snapshot_bytes += charge;
+        impl_->reserved_snapshot_bytes += snapshot_bytes;
         admitted = true;
       } else {
-        impl_->ReleaseBlocks(shared_blocks);
         events.push_back(make_event(SnapshotEventAction::kSkipped,
                                     SnapshotEventReason::kByteCapacity,
                                     snapshot_bytes, token_count));
@@ -1033,53 +943,18 @@ bool ContinuationCache::ReserveSnapshot(
   return admitted;
 }
 
-void ContinuationCache::ReleaseSnapshotBlocks(
-    std::span<const SnapshotBlock> blocks) noexcept {
-  const std::lock_guard<std::mutex> lock(impl_->mutex);
-  impl_->ReleaseBlocks(blocks);
-}
-
-void ContinuationCache::LowerSnapshotCapacity(
-    std::size_t reservation_bytes,
-    std::span<const SnapshotBlock> reservation_blocks) noexcept {
-  std::size_t previous = 0;
-  std::size_t capacity = 0;
-  {
-    const std::lock_guard<std::mutex> lock(impl_->mutex);
-    impl_->ReleaseCharge(reservation_bytes, reservation_blocks);
-    previous = impl_->snapshot_capacity_bytes;
-    // Everything still counted was allocated; the failed reservation was not.
-    // Keep room for that one checkpoint, so a transient failure against an
-    // empty cache cannot disable retention for the rest of the process.
-    impl_->snapshot_capacity_bytes = std::min(
-        previous, std::max(impl_->retained_snapshot_bytes +
-                               impl_->reserved_snapshot_bytes,
-                           reservation_bytes));
-    capacity = impl_->snapshot_capacity_bytes;
-  }
-  if (capacity == previous)
-    return;
-  try {
-    Logger::Log(LogLevel::kWarn, "cache",
-                "event=snapshot_capacity_lowered reason=allocation_failure "
-                "previous_capacity_bytes=" +
-                    std::to_string(previous) +
-                    " capacity_bytes=" + std::to_string(capacity));
-  } catch (...) {
-    // Cache observability must never affect request execution.
-  }
-}
-
-void ContinuationCache::SkipSnapshot(
-    std::size_t reservation_bytes,
-    std::span<const SnapshotBlock> reservation_blocks,
-    SnapshotEventReason reason, std::size_t snapshot_bytes,
-    std::size_t token_count) noexcept {
+void ContinuationCache::SkipSnapshot(std::size_t reservation_bytes,
+                                     SnapshotEventReason reason,
+                                     std::size_t snapshot_bytes,
+                                     std::size_t token_count) noexcept {
   SnapshotEvent event;
   {
     const std::lock_guard<std::mutex> lock(impl_->mutex);
-    impl_->ReleaseCharge(reservation_bytes, reservation_blocks);
-    impl_->ReleaseBlocks(reservation_blocks);
+    if (reservation_bytes <= impl_->reserved_snapshot_bytes) {
+      impl_->reserved_snapshot_bytes -= reservation_bytes;
+    } else {
+      impl_->reserved_snapshot_bytes = 0;
+    }
     event = {
         .action = SnapshotEventAction::kSkipped,
         .reason = reason,
@@ -1096,7 +971,6 @@ void ContinuationCache::SkipSnapshot(
 
 std::size_t ContinuationCache::Commit(
     std::size_t index, std::size_t source_index, std::size_t reservation_bytes,
-    std::span<const SnapshotBlock> reservation_blocks,
     std::vector<ContinuationToken> tokens,
     std::shared_ptr<const ContinuationSnapshot> snapshot,
     std::vector<std::uint8_t> input_identity,
@@ -1135,9 +1009,10 @@ std::size_t ContinuationCache::Commit(
   std::size_t retained_bytes = 0;
   {
     const std::lock_guard<std::mutex> lock(impl_->mutex);
-    // The reservation's blocks stay held until the end of this publication,
-    // so replacing their owner below cannot drop them from the count.
-    if (!impl_->ReleaseCharge(reservation_bytes, reservation_blocks)) {
+    if (reservation_bytes <= impl_->reserved_snapshot_bytes) {
+      impl_->reserved_snapshot_bytes -= reservation_bytes;
+    } else {
+      impl_->reserved_snapshot_bytes = 0;
       retain_snapshot = false;
       skip_reason = SnapshotEventReason::kReservationMismatch;
     }
@@ -1260,8 +1135,8 @@ std::size_t ContinuationCache::Commit(
           if (snapshot_entry.snapshot != nullptr) {
             const std::size_t removed_bytes = snapshot_entry.snapshot_bytes;
             const std::size_t removed_tokens = snapshot_entry.tokens.size();
-            impl_->ReleaseSnapshot(*snapshot_entry.snapshot);
             removed_snapshots.push_back(std::move(snapshot_entry.snapshot));
+            impl_->retained_snapshot_bytes -= removed_bytes;
             snapshot_entry.tokens.clear();
             snapshot_entry.snapshot_bytes = 0;
             snapshot_entry.valid = false;
@@ -1273,16 +1148,11 @@ std::size_t ContinuationCache::Commit(
           }
           const std::size_t used =
               impl_->retained_snapshot_bytes + impl_->reserved_snapshot_bytes;
-          const auto blocks = retained_snapshot->SharedBlocks();
-          // Blocks something already holds are in used; the rest is new.
-          const std::size_t added = ChargedBytes(snapshot_bytes, blocks) +
-                                    impl_->UnheldBytes(blocks);
           if (used > impl_->snapshot_capacity_bytes ||
-              added > impl_->snapshot_capacity_bytes - used) {
+              snapshot_bytes > impl_->snapshot_capacity_bytes - used) {
             retain_snapshot = false;
             skip_reason = SnapshotEventReason::kReservationMismatch;
           } else {
-            impl_->HoldSnapshot(*retained_snapshot);
             snapshot_entry.tokens = std::move(tokens);
             snapshot_entry.input_identity = std::move(input_identity);
             snapshot_entry.snapshot = std::move(retained_snapshot);
@@ -1292,6 +1162,7 @@ std::size_t ContinuationCache::Commit(
                 learned ? SnapshotPurpose::kBranchPoint : purpose;
             snapshot_entry.valid = !snapshot_entry.tokens.empty();
             snapshot_entry.snapshot_last_used = ++impl_->clock;
+            impl_->retained_snapshot_bytes += snapshot_bytes;
             retained_bytes = snapshot_bytes;
             if (published_index)
               *published_index = target;
@@ -1316,7 +1187,6 @@ std::size_t ContinuationCache::Commit(
       state_entry.available = true;
       state_entry.state_last_used = ++impl_->clock;
     }
-    impl_->ReleaseBlocks(reservation_blocks);
   }
   removed_snapshots.clear();
   EmitSnapshotEvents(impl_->snapshot_support.on_event, events);
@@ -1324,15 +1194,17 @@ std::size_t ContinuationCache::Commit(
   return retained_bytes;
 }
 
-void ContinuationCache::Invalidate(
-    std::size_t index, std::size_t reservation_bytes,
-    std::span<const SnapshotBlock> reservation_blocks) noexcept {
+void ContinuationCache::Invalidate(std::size_t index,
+                                   std::size_t reservation_bytes) noexcept {
   auto& entry = *impl_->entries[index];
   entry.state->Invalidate();
   {
     const std::lock_guard<std::mutex> lock(impl_->mutex);
-    impl_->ReleaseCharge(reservation_bytes, reservation_blocks);
-    impl_->ReleaseBlocks(reservation_blocks);
+    if (reservation_bytes <= impl_->reserved_snapshot_bytes) {
+      impl_->reserved_snapshot_bytes -= reservation_bytes;
+    } else {
+      impl_->reserved_snapshot_bytes = 0;
+    }
     if (!impl_->snapshot_mode()) {
       entry.tokens.clear();
       entry.valid = false;

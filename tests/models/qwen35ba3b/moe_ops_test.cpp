@@ -560,26 +560,6 @@ void CheckDenseBf16(hipStream_t stream) {
   std::cout << "dense BF16 WMMA: OK\n";
 }
 
-/// Random block_q6_K payload for `rows` x `cols`: arbitrary codes, int8
-/// sub-block scales and a small F16 superblock scale.
-std::vector<std::uint8_t> RandomQ6K(std::size_t rows, std::size_t cols) {
-  constexpr std::size_t kBlockBytes = 210;
-  std::vector<std::uint8_t> out(rows * (cols / 256) * kBlockBytes);
-  for (std::size_t b = 0; b < out.size() / kBlockBytes; ++b) {
-    std::uint8_t* blk = out.data() + (b * kBlockBytes);
-    for (std::size_t i = 0; i < 192; ++i) {
-      blk[i] = static_cast<std::uint8_t>(Rnd() & 0xFFU);
-    }
-    for (std::size_t i = 192; i < 208; ++i) {
-      blk[i] = static_cast<std::uint8_t>(
-          static_cast<std::int8_t>(static_cast<int>(Rnd() % 81) - 40));
-    }
-    const std::uint16_t d = FloatToFp16Bits(RndFloat(0.0002F, 0.0012F));
-    std::memcpy(blk + 208, &d, sizeof(d));
-  }
-  return out;
-}
-
 /// Random block_q4_K / block_q5_K payload for `rows` x `cols`: arbitrary
 /// codes and 6-bit sub-block scales/mins, with small F16 superblock scales.
 /// Q5_K carries 32 bytes of high bits ahead of the 128 nibble bytes.
@@ -611,8 +591,6 @@ struct RoutedFormat {
 constexpr RoutedFormat kRoutedFormats[] = {
     {GgmlType::kQ8_0, gufo::models::qwen38_flash_next::rocm::WeightType::kQ8_0,
      "Q8_0"},
-    {GgmlType::kQ6_K, gufo::models::qwen38_flash_next::rocm::WeightType::kQ6_K,
-     "Q6_K"},
     {GgmlType::kQ5_K, gufo::models::qwen38_flash_next::rocm::WeightType::kQ5_K,
      "Q5_K"},
     {GgmlType::kQ4_K, gufo::models::qwen38_flash_next::rocm::WeightType::kQ4_K,
@@ -622,9 +600,6 @@ constexpr RoutedFormat kRoutedFormats[] = {
 /// Random expert weights `rows` x `cols` in `type`.
 std::vector<std::uint8_t> RandomExpertWeights(GgmlType type, std::size_t rows,
                                               std::size_t cols) {
-  if (type == GgmlType::kQ6_K) {
-    return RandomQ6K(rows, cols);
-  }
   if (type == GgmlType::kQ4_K || type == GgmlType::kQ5_K) {
     return RandomQ45K(type, rows, cols);
   }
@@ -786,6 +761,10 @@ void CheckRoutedPair(hipStream_t stream) {
   constexpr std::size_t kM = 512;
   constexpr std::size_t kK = 2048;
   for (const RoutedFormat& format : kRoutedFormats) {
+    // Flash-Next pairs only its K-quant formats.
+    if (format.type != GgmlType::kQ4_K && format.type != GgmlType::kQ5_K) {
+      continue;
+    }
     const GgmlType type = format.type;
     const auto weight_type = format.weight_type;
     const char* type_name = format.name;

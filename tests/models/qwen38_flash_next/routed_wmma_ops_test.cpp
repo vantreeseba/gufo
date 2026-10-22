@@ -192,6 +192,54 @@ Experts MakeQ5_1(std::size_t e, std::size_t m, std::size_t k,
   return w;
 }
 
+/// Q5_1 blocks quantized from Gaussian weights as llama.cpp's
+/// quantize_row_q5_1 does (m = block minimum, d = (max - min) / 31), so the
+/// dequantized values centre on zero like a model's weights.
+Experts MakeQuantizedQ5_1(std::size_t e, std::size_t m, std::size_t k,
+                          std::uint32_t seed) {
+  Experts w;
+  const std::size_t blocks = e * m * (k / 32);
+  w.packed.resize(blocks * 24);
+  w.values.resize(e * m * k);
+  constexpr float kTwoPi = 6.28318530717958647692F;
+  for (std::size_t b = 0; b < blocks; ++b) {
+    float x[32];
+    for (float& v : x) {
+      const float u1 =
+          (static_cast<float>(NextRandom(&seed) >> 8) + 1.0F) / 16777217.0F;
+      const float u2 = static_cast<float>(NextRandom(&seed) >> 8) / 16777216.0F;
+      v = 0.02F * std::sqrt(-2.0F * std::log(u1)) * std::cos(kTwoPi * u2);
+    }
+    const float lo = *std::min_element(x, x + 32);
+    const float hi = *std::max_element(x, x + 32);
+    const float scale = (hi - lo) / 31.0F;
+    const float inverse = scale != 0.0F ? 1.0F / scale : 0.0F;
+    std::uint8_t* blk = w.packed.data() + b * 24;
+    const __half d = __float2half(scale);
+    const __half mn = __float2half(lo);
+    std::memcpy(blk, &d, 2);
+    std::memcpy(blk + 2, &mn, 2);
+    std::uint32_t qh = 0;
+    std::uint8_t* qs = blk + 8;
+    int codes[32];
+    for (int j = 0; j < 32; ++j) {
+      codes[j] = std::min(31, static_cast<int>((x[j] - lo) * inverse + 0.5F));
+      qh |= static_cast<std::uint32_t>(codes[j] >> 4) << j;
+    }
+    for (int j = 0; j < 16; ++j) {
+      qs[j] = static_cast<std::uint8_t>((codes[j] & 0xF) |
+                                        ((codes[j + 16] & 0xF) << 4));
+    }
+    std::memcpy(blk + 4, &qh, 4);
+    const float df = __half2float(d);
+    const float mf = __half2float(mn);
+    for (int j = 0; j < 32; ++j) {
+      w.values[b * 32 + j] = df * static_cast<float>(codes[j]) + mf;
+    }
+  }
+  return w;
+}
+
 /// Random Q8_0 blocks: d and 32 signed codes.
 Experts MakeQ8_0(std::size_t e, std::size_t m, std::size_t k,
                  std::uint32_t seed) {
@@ -218,7 +266,16 @@ struct Result {
   double vs_ref;
   double mmq_vs_ref;
   double scale;
+  double mmq_sq_error = 0.0;
+  double ref_sq = 0.0;
 };
+
+const char* TypeName(q::WeightType type) {
+  return type == q::WeightType::kQ4_K   ? "Q4_K"
+         : type == q::WeightType::kQ5_K ? "Q5_K"
+         : type == q::WeightType::kQ5_1 ? "Q5_1"
+                                        : "Q8_0";
+}
 
 /// Runs the MMQ tier and the F16 route over the same routing and reports
 /// the worst absolute errors of the F16 route against the tier and against
@@ -226,7 +283,8 @@ struct Result {
 /// its activation quantization).
 Result Run(q::WeightType type, std::size_t n_tokens, std::size_t used,
            std::size_t experts, std::size_t m, std::size_t k,
-           std::uint32_t seed, std::uint32_t tile_rows = 48) {
+           std::uint32_t seed, std::uint32_t tile_rows = 48,
+           float input_scale = 2.0F) {
   const Experts w =
       type == q::WeightType::kQ4_K   ? MakeQ4K(experts, m, k, seed)
       : type == q::WeightType::kQ5_K ? MakeQ5K(experts, m, k, seed)
@@ -250,7 +308,7 @@ Result Run(q::WeightType type, std::size_t n_tokens, std::size_t used,
   }
   std::vector<float> x(n_tokens * k);
   for (float& v : x) {
-    v = Uniform(&state, 2.0F);
+    v = Uniform(&state, input_scale);
   }
   std::vector<std::uint32_t> counts(experts, 0);
   for (std::int32_t e : ids) {
@@ -292,6 +350,28 @@ Result Run(q::WeightType type, std::size_t n_tokens, std::size_t used,
                    d_rows_slot, static_cast<std::uint32_t>(n_tokens),
                    static_cast<std::uint32_t>(used),
                    static_cast<std::uint32_t>(experts), nullptr);
+  const auto bounds = Download(d_bounds, experts + 1);
+  const auto token_rows = Download(d_rows_token, compact);
+  const auto slot_rows = Download(d_rows_slot, compact);
+  std::vector<bool> seen(slots, false);
+  for (std::size_t e = 0; e < experts; ++e) {
+    for (auto row = bounds[e]; row < bounds[e + 1]; ++row) {
+      const auto slot = slot_rows[row];
+      if (static_cast<std::uint32_t>(row - bounds[e]) >= counts[e]) {
+        if (slot != -1 || token_rows[row] != -1)
+          throw std::runtime_error(
+              "routed padding retained a stale assignment");
+      } else {
+        if (slot < 0 || static_cast<std::size_t>(slot) >= slots || seen[slot] ||
+            ids[slot] != static_cast<std::int32_t>(e) ||
+            token_rows[row] != slot / static_cast<std::int32_t>(used))
+          throw std::runtime_error("routed compaction lost an assignment");
+        seen[slot] = true;
+      }
+    }
+  }
+  if (std::find(seen.begin(), seen.end(), false) != seen.end())
+    throw std::runtime_error("routed compaction omitted a slot");
   std::vector<__half> x_half(x.size());
   for (std::size_t i = 0; i < x.size(); ++i) {
     x_half[i] = __float2half(x[i]);
@@ -303,7 +383,12 @@ Result Run(q::WeightType type, std::size_t n_tokens, std::size_t used,
       tiles.push_back(static_cast<std::int32_t>(e | (j << 16)));
     }
   }
-  __half* d_x_half = Upload(x_half);
+  __half* d_x_half = nullptr;
+  CheckHip(hipMalloc(&d_x_half, x_half.size() * sizeof(__half)),
+           "exact F16 input allocation");
+  CheckHip(hipMemcpy(d_x_half, x_half.data(), x_half.size() * sizeof(__half),
+                     hipMemcpyHostToDevice),
+           "F16 input upload");
   std::int32_t* d_tiles = Upload(tiles);
   float* d_f16 = Upload(zero_out);
   if (!q::RoutedF16Gemm(d_w, type, d_x_half, d_tiles,
@@ -363,7 +448,8 @@ Result Run(q::WeightType type, std::size_t n_tokens, std::size_t used,
       throw std::runtime_error("routed F16 output overwrote its guard");
   }
 
-  if (tile_rows == 48 &&
+  // Prefill pairs gate/up for buckets the separate 16- and 48-row tiles take.
+  if ((tile_rows == 16 || tile_rows == 48) &&
       (type == q::WeightType::kQ4_K || type == q::WeightType::kQ5_K)) {
     // Different gate/up weights, with the up scale small enough that these
     // deliberately large synthetic weights do not overflow the F16 output.
@@ -378,7 +464,14 @@ Result Run(q::WeightType type, std::size_t n_tokens, std::size_t used,
       }
     }
     auto* d_up = Upload(up);
-    auto* d_pair = Upload(std::vector<__half>(slots * m, __float2half(0.0F)));
+    __half* d_pair = nullptr;
+    CheckHip(hipMalloc(&d_pair, (slots * m + kHalfGuard) * sizeof(__half)),
+             "paired output allocation");
+    const std::vector<__half> pair_initial(slots * m + kHalfGuard, half_guard);
+    CheckHip(
+        hipMemcpy(d_pair, pair_initial.data(),
+                  pair_initial.size() * sizeof(__half), hipMemcpyHostToDevice),
+        "paired output upload");
     if (!q::RoutedF16Gemm(d_up, type, d_x_half, d_tiles,
                           static_cast<std::uint32_t>(tiles.size()), tile_rows,
                           d_bounds, d_rows_token, d_rows_slot, d_f16, nullptr,
@@ -386,7 +479,8 @@ Result Run(q::WeightType type, std::size_t n_tokens, std::size_t used,
       throw std::runtime_error("separate routed SwiGLU launch failed");
     }
     const auto separate = Download(d_f16_half, slots * m);
-    for (std::uint32_t pair_rows : {64U, 128U}) {
+    {
+      constexpr std::uint32_t pair_rows = 128;
       std::vector<std::int32_t> gate_tiles;
       for (std::size_t e = 0; e < experts; ++e) {
         for (std::uint32_t j = 0; j < (counts[e] + pair_rows - 1) / pair_rows;
@@ -398,11 +492,17 @@ Result Run(q::WeightType type, std::size_t n_tokens, std::size_t used,
       auto launch_pair = [&] {
         if (!q::RoutedGatedF16Gemm(
                 d_w, d_up, type, d_x_half, d_gate_tiles,
-                static_cast<std::uint32_t>(gate_tiles.size()), pair_rows,
-                d_bounds, d_rows_token, d_rows_slot, d_pair, m, k, nullptr)) {
+                static_cast<std::uint32_t>(gate_tiles.size()), d_bounds,
+                d_rows_token, d_rows_slot, d_pair, m, k, nullptr)) {
           throw std::runtime_error("paired routed SwiGLU launch failed");
         }
       };
+      // The paired launch must write the whole output itself; stale results
+      // can hide an incomplete launch grid.
+      CheckHip(hipMemcpy(d_pair, pair_initial.data(),
+                         pair_initial.size() * sizeof(__half),
+                         hipMemcpyHostToDevice),
+               "paired output reset");
       launch_pair();
       const auto paired = Download(d_pair, slots * m);
       for (std::size_t i = 0; i < paired.size(); ++i) {
@@ -416,6 +516,10 @@ Result Run(q::WeightType type, std::size_t n_tokens, std::size_t used,
               std::to_string(a) + " vs " + std::to_string(b));
         }
       }
+      const auto guard = Download(d_pair + slots * m, kHalfGuard);
+      if (std::memcmp(guard.data(), pair_initial.data() + slots * m,
+                      kHalfGuard * sizeof(__half)) != 0)
+        throw std::runtime_error("paired output overwrote its guard");
       launch_pair();
       const auto replay = Download(d_pair, slots * m);
       if (std::memcmp(paired.data(), replay.data(),
@@ -448,17 +552,16 @@ Result Run(q::WeightType type, std::size_t n_tokens, std::size_t used,
       r.vs_ref = std::max(r.vs_ref, std::abs(ref - f));
       r.mmq_vs_ref = std::max(r.mmq_vs_ref, std::abs(ref - v));
       r.scale = std::max(r.scale, std::abs(ref));
+      r.mmq_sq_error += (ref - v) * (ref - v);
+      r.ref_sq += ref * ref;
     }
   }
-  std::cout << (type == q::WeightType::kQ4_K   ? "Q4_K"
-                : type == q::WeightType::kQ5_K ? "Q5_K"
-                : type == q::WeightType::kQ5_1 ? "Q5_1"
-                                               : "Q8_0")
-            << " routed n=" << n_tokens << " used=" << used << " E=" << experts
-            << " m=" << m << " k=" << k << ": worst |F16 - MMQ| " << r.vs_mmq
-            << ", worst |F16 - F64| " << r.vs_ref << ", worst |MMQ - F64| "
-            << r.mmq_vs_ref << " (scale " << r.scale << ", widest bucket "
-            << max_bucket << ")\n";
+  std::cout << TypeName(type) << " routed n=" << n_tokens << " used=" << used
+            << " E=" << experts << " m=" << m << " k=" << k
+            << ": worst |F16 - MMQ| " << r.vs_mmq << ", worst |F16 - F64| "
+            << r.vs_ref << ", worst |MMQ - F64| " << r.mmq_vs_ref
+            << ", MMQ NMSE " << r.mmq_sq_error / r.ref_sq << " (scale "
+            << r.scale << ", widest bucket " << max_bucket << ")\n";
   for (void* p : {static_cast<void*>(d_w), static_cast<void*>(d_x),
                   static_cast<void*>(d_ids), static_cast<void*>(d_counts),
                   static_cast<void*>(d_bounds), static_cast<void*>(d_cursors),
@@ -477,6 +580,110 @@ bool Ok(const Result& r) {
   // agree to the tier's quantization; the F16 route sits well inside it.
   return r.vs_mmq < 1e-2 * r.scale && r.vs_ref < 2e-3 * r.scale &&
          r.mmq_vs_ref < 1e-2 * r.scale;
+}
+
+/// The activations as quantize_q8_1 hands them to the dot products: each
+/// 32-wide block becomes its F16 scale times the rounded codes.
+std::vector<float> Q8_1Activations(const std::vector<float>& x) {
+  std::vector<float> out(x.size());
+  for (std::size_t b = 0; b < x.size(); b += 32) {
+    float amax = 0.0F;
+    for (std::size_t i = b; i < b + 32; ++i)
+      amax = std::max(amax, std::abs(x[i]));
+    const float d = amax / 127.0F;
+    const float dh = __half2float(__float2half(d));
+    for (std::size_t i = b; i < b + 32; ++i)
+      out[i] = amax == 0.0F ? 0.0F : dh * std::round(x[i] / d);
+  }
+  return out;
+}
+
+/// Reports the vector tier (decode and verify widths) against F64 dots over
+/// the dequantized weights, for the gate/up (640 x 2560) and down
+/// (2560 x 640) shapes: with the exact activations (the tier's error is its
+/// activation quantization, so this reports rather than gates) and with the
+/// q8_1 activations it consumes (ggml's q8_1 contract; only F16 scale and sum
+/// rounding remain). "Q5_1 quantized" blocks centre like a model's weights.
+void ReportVectorAccuracy() {
+  constexpr int experts = 8;
+  struct Case {
+    q::WeightType type;
+    bool quantized;
+  };
+  for (const bool down : {false, true}) {
+    const int rows = down ? 2560 : 640;
+    const int cols = down ? 640 : 2560;
+    const int used = down ? 1 : 2;
+    const std::vector<Case> cases =
+        down ? std::vector<Case>{{q::WeightType::kQ5_1, false},
+                                 {q::WeightType::kQ5_1, true},
+                                 {q::WeightType::kQ8_0, false}}
+             : std::vector<Case>{{q::WeightType::kQ4_K, false},
+                                 {q::WeightType::kQ5_K, false},
+                                 {q::WeightType::kQ5_1, false},
+                                 {q::WeightType::kQ5_1, true},
+                                 {q::WeightType::kQ8_0, false}};
+    for (const auto [type, quantized] : cases) {
+      for (const int n : {1, 4, 8}) {
+        const std::uint32_t seed =
+            0x7EC70000U + 256U * static_cast<int>(type) + (down ? 64U : 0U) + n;
+        const Experts w =
+            quantized ? MakeQuantizedQ5_1(experts, rows, cols, seed)
+            : type == q::WeightType::kQ4_K ? MakeQ4K(experts, rows, cols, seed)
+            : type == q::WeightType::kQ5_K ? MakeQ5K(experts, rows, cols, seed)
+            : type == q::WeightType::kQ5_1
+                ? MakeQ5_1(experts, rows, cols, seed)
+                : MakeQ8_0(experts, rows, cols, seed);
+        std::uint32_t state = seed ^ 0xA5A5A5A5U;
+        std::vector<float> x(static_cast<std::size_t>(n) * cols);
+        for (float& v : x)
+          v = Uniform(&state, 2.0F);
+        std::vector<std::int32_t> ids(static_cast<std::size_t>(n) * used);
+        for (std::size_t i = 0; i < ids.size(); ++i)
+          ids[i] = static_cast<std::int32_t>((3 * i + 1) % experts);
+        auto* dw = Upload(w.packed);
+        auto* dx = Upload(x);
+        auto* di = Upload(ids);
+        auto* dout = Upload(std::vector<float>(ids.size() * rows, 0.0F));
+        if (qfn_mmq_moe_vec(static_cast<int>(type), dw, dx, di, dout, rows,
+                            cols, n, experts, used, nullptr))
+          throw std::runtime_error("vector accuracy launch failed");
+        const auto out = Download(dout, ids.size() * rows);
+        const auto xq = Q8_1Activations(x);
+        double worst = 0.0, error = 0.0, norm = 0.0;
+        double worst_q = 0.0, error_q = 0.0;
+        for (std::size_t s = 0; s < ids.size(); ++s) {
+          const float* xr = x.data() + (s / used) * cols;
+          const float* xqr = xq.data() + (s / used) * cols;
+          for (int row = 0; row < rows; ++row) {
+            const float* wr =
+                w.values.data() +
+                (static_cast<std::size_t>(ids[s]) * rows + row) * cols;
+            double ref = 0.0, ref_q = 0.0;
+            for (int i = 0; i < cols; ++i) {
+              ref += static_cast<double>(wr[i]) * xr[i];
+              ref_q += static_cast<double>(wr[i]) * xqr[i];
+            }
+            const double e = ref - out[s * rows + row];
+            const double eq = ref_q - out[s * rows + row];
+            worst = std::max(worst, std::abs(e));
+            worst_q = std::max(worst_q, std::abs(eq));
+            error += e * e;
+            error_q += eq * eq;
+            norm += ref * ref;
+          }
+        }
+        std::cout << TypeName(type) << (quantized ? " quantized" : "")
+                  << " vector n=" << n << " m=" << rows << " k=" << cols
+                  << ": worst |vector - F64| " << worst << ", NMSE "
+                  << error / norm << "; against the q8_1 activations: worst "
+                  << worst_q << ", NMSE " << error_q / norm << '\n';
+        for (void* p : {static_cast<void*>(dw), static_cast<void*>(dx),
+                        static_cast<void*>(di), static_cast<void*>(dout)})
+          (void)hipFree(p);
+      }
+    }
+  }
 }
 
 void CheckVectorGrouping(bool down = false) {
@@ -709,6 +916,7 @@ void CheckPairedMmq() {
 
 int main() {
   try {
+    ReportVectorAccuracy();
     CheckVectorGrouping();
     CheckVectorGrouping(true);
     CheckPairedMmq();
@@ -731,6 +939,13 @@ int main() {
          ok;
     // Ragged rows against the 128-row tile and a tiny batch.
     ok = Ok(Run(q::WeightType::kQ4_K, 40, 4, 8, 201, 512, 0xDEADBEEFU)) && ok;
+    // Paired waves must retain unsaturated SiLU arithmetic and protect the
+    // last odd output row in short and partial token groups.
+    for (auto type : {q::WeightType::kQ4_K, q::WeightType::kQ5_K}) {
+      for (std::size_t rows : {1U, 8U, 9U, 32U, 33U, 65U, 129U}) {
+        ok = Ok(Run(type, rows, 1, 1, 65, 256, 0x5A1711U, 48, 0.002F)) && ok;
+      }
+    }
     // The 16-row tile (small buckets) on every type.
     ok = Ok(Run(q::WeightType::kQ4_K, 300, 10, 64, 640, 2560, 0x16161616U,
                 16)) &&

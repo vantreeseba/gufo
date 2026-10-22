@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <deque>
 #include <exception>
+#include <fstream>
 #include <iomanip>
 #include <iterator>
 #include <limits>
@@ -135,6 +136,13 @@ struct ScheduledRequest {
   std::size_t prefix_position{0};
   bool prefix_considered{false};
   std::optional<TextGenerationScheduler::Clock::time_point> prefix_wait_start;
+  // Admission also waits, once and bounded, for a disk job writing a much
+  // deeper prefix of the prompt (a conversation larger than the RAM budget).
+  std::optional<TextGenerationScheduler::Clock::time_point>
+      publication_wait_start;
+  bool publication_waiting{false};
+  TextPendingPublication publication;
+  detail::PublicationWaitEstimate::Milliseconds publication_wait_limit{};
   // The held `/slots` session while counted_processing is set. Only the
   // scheduler worker changes it.
   std::size_t session{kNoSession};
@@ -158,6 +166,38 @@ struct PendingClient {
   std::string client_id;
   std::deque<std::shared_ptr<ScheduledRequest>> requests;
 };
+
+void LogPublicationWait(const std::shared_ptr<ScheduledRequest>& request,
+                        std::string_view stage, std::string_view release = {}) {
+  if (!Logger::Enabled(LogLevel::kInfo))
+    return;
+  std::ostringstream line;
+  line << "event=publication_wait request=" << request->id << " stage=" << stage
+       << " checkpoint_id=" << request->publication.checkpoint_id
+       << " pending_tokens=" << request->publication.pending_tokens
+       << " available_tokens=" << request->publication.available_tokens
+       << " limit_ms=" << request->publication_wait_limit.count();
+  if (request->publication_wait_start)
+    line << " wait_ms="
+         << std::chrono::duration<double, std::milli>(
+                TextGenerationScheduler::Clock::now() -
+                *request->publication_wait_start)
+                .count();
+  if (!release.empty())
+    line << " release=" << release;
+  Logger::Info("cache", line.str());
+}
+
+void EndPublicationWait(const std::shared_ptr<ScheduledRequest>& request,
+                        std::string_view reason) noexcept {
+  if (!std::exchange(request->publication_waiting, false))
+    return;
+  try {
+    LogPublicationWait(request, "release", reason);
+  } catch (...) {
+    // Observability cannot prevent cancellation or failure completion.
+  }
+}
 
 bool IsTerminal(const std::shared_ptr<ScheduledRequest>& request) noexcept {
   return request->phase.load(std::memory_order_acquire) ==
@@ -389,6 +429,8 @@ void WriteGenerationTrace(GenerationTrace trace,
                           const TextGenerationScheduler::Result& result,
                           const std::exception_ptr& failure) {
   auto& record = trace.record;
+  if (result.component_cache)
+    record["component_cache"] = ComponentCacheJson(*result.component_cache);
   record["prompt_tokens"] = result.prompt_tokens;
   record["cache"] = result.cache_disk_hit ? "disk"
                     : result.cache_hit    ? "memory"
@@ -416,6 +458,39 @@ void WriteGenerationTrace(GenerationTrace trace,
   record["prompt"] = std::move(trace.prompt);
   record["output"] = Trace::Text(result.text);
   Trace::Write(record);
+}
+
+std::size_t ResidentKiB() {
+  std::ifstream status("/proc/self/status");
+  for (std::string line; std::getline(status, line);) {
+    if (line.starts_with("VmRSS:")) {
+      std::istringstream value(line.substr(6));
+      std::size_t kib = 0;
+      if (value >> kib)
+        return kib;
+    }
+  }
+  return 0;
+}
+
+// The first constrained request would otherwise build the vocabulary inside
+// its queue time (about 30 ms for Flash-Next's 248,320 tokens).
+void PrepareStructuredOutput(const TextModelRunner& runner) {
+  const auto resident = ResidentKiB();
+  const auto started = std::chrono::steady_clock::now();
+  const auto tokens = runner.PrepareConstraintVocabulary();
+  if (tokens == 0)
+    return;
+  const std::chrono::duration<double, std::milli> elapsed =
+      std::chrono::steady_clock::now() - started;
+  std::ostringstream line;
+  line << "event=structured_output_prepared vocabulary_tokens=" << tokens
+       << " prepare_ms=" << std::fixed << std::setprecision(1)
+       << elapsed.count() << " rss_delta_kib="
+       << static_cast<long long>(ResidentKiB()) -
+              static_cast<long long>(resident)
+       << ' ' << Logger::MemoryStatus();
+  Logger::Info("loader", line.str());
 }
 
 }  // namespace
@@ -455,7 +530,8 @@ struct TextGenerationScheduler::Impl {
         scheduler_policy.max_output_bytes_per_request == 0 ||
         scheduler_policy.max_buffered_output_bytes_per_request == 0 ||
         scheduler_policy.max_buffered_output_bytes_total == 0 ||
-        scheduler_policy.request_timeout.count() < 0) {
+        scheduler_policy.request_timeout.count() < 0 ||
+        scheduler_policy.stall_timeout.count() < 0) {
       throw std::invalid_argument("invalid text scheduler limits");
     }
     incremental_prefill_supported =
@@ -477,11 +553,21 @@ struct TextGenerationScheduler::Impl {
             .Descriptor()
             .capabilities.batched_multi_token_decode_max_width;
     device_lost_requests.reserve(runner_pool->capacity());
+    PrepareStructuredOutput(runner_pool->runner());
     worker = std::jthread(
         [this](const std::stop_token& stop_token) { Run(stop_token); });
+    if (scheduler_policy.stall_timeout.count() > 0) {
+      stall_monitor = std::jthread([this](const std::stop_token& stop_token) {
+        MonitorStalls(stop_token);
+      });
+    }
   }
 
   ~Impl() {
+    stall_monitor.request_stop();
+    if (stall_monitor.joinable()) {
+      stall_monitor.join();
+    }
     {
       const std::lock_guard<std::mutex> lock(queue_mutex);
       stopping = true;
@@ -692,6 +778,7 @@ struct TextGenerationScheduler::Impl {
 
   void CompleteCancelled(
       const std::shared_ptr<ScheduledRequest>& request) noexcept {
+    EndPublicationWait(request, "cancelled");
     if (device_lost.load(std::memory_order_acquire)) {
       CompleteFailure(request, device_lost_failure);
       return;
@@ -699,6 +786,7 @@ struct TextGenerationScheduler::Impl {
     try {
       if (request->runner_request) {
         const auto retained = request->runner_request.Cancel();
+        request->result.component_cache = retained.component_cache;
         request->result.cache_snapshot_bytes = retained.snapshot_bytes;
         request->result.cache_snapshot_ms = retained.snapshot_ms;
         request->result.cache_disk_queued_bytes = retained.disk_queued_bytes;
@@ -717,6 +805,7 @@ struct TextGenerationScheduler::Impl {
   void CompleteFailure(const std::shared_ptr<ScheduledRequest>& request,
                        std::exception_ptr failure,
                        bool classified = false) noexcept {
+    EndPublicationWait(request, "failed");
     if (IsTerminal(request))
       return;
     if (!classified)
@@ -745,6 +834,45 @@ struct TextGenerationScheduler::Impl {
                                      std::string(reason));
     } catch (...) {
       // Loss remains observable even if logging fails.
+    }
+  }
+
+  // A device call that never returns blocks its thread, so nothing on that
+  // thread can report it. This thread only reads atomics; it never touches
+  // the device or the scheduler's queues.
+  void MonitorStalls(const std::stop_token& stop_token) noexcept {
+    const auto timeout = scheduler_policy.stall_timeout;
+    const auto interval = std::clamp<std::chrono::milliseconds>(
+        timeout / 4, std::chrono::milliseconds(1), std::chrono::minutes(1));
+    std::mutex mutex;
+    std::condition_variable_any condition;
+    std::unique_lock<std::mutex> lock(mutex);
+    std::uint64_t seen = progress.load(std::memory_order_relaxed);
+    // Stalled time is counted in wake-ups, not read from the clock, so a
+    // process paused as a whole (SIGSTOP, a cgroup freeze) is credited one
+    // interval for the pause however long it lasted.
+    std::chrono::milliseconds stalled{0};
+    while (!stop_token.stop_requested()) {
+      condition.wait_for(lock, stop_token, interval, [] { return false; });
+      if (stop_token.stop_requested() ||
+          device_lost.load(std::memory_order_acquire))
+        return;
+      const std::uint64_t now = progress.load(std::memory_order_relaxed);
+      if (now != seen || !loop_working.load(std::memory_order_relaxed)) {
+        seen = now;
+        stalled = std::chrono::milliseconds(0);
+        continue;
+      }
+      stalled += interval;
+      if (stalled < timeout)
+        continue;
+      try {
+        MarkDeviceLost("scheduler made no progress for " +
+                       std::to_string(timeout.count()) + " ms");
+      } catch (...) {
+        MarkDeviceLost("scheduler made no progress");
+      }
+      return;
     }
   }
 
@@ -782,6 +910,7 @@ struct TextGenerationScheduler::Impl {
 
   void CompleteDeadline(
       const std::shared_ptr<ScheduledRequest>& request) noexcept {
+    EndPublicationWait(request, "deadline");
     CompleteFailure(request, std::make_exception_ptr(TextGenerationError(
                                  TextGenerationErrorCode::kDeadlineExceeded,
                                  "text generation request deadline exceeded")));
@@ -824,10 +953,17 @@ struct TextGenerationScheduler::Impl {
     // A stop may land on a preview, an unadvanced AR token, or inside an
     // accepted speculative block. Retain only correctly labelled executed
     // state, using the same cache reconciliation as an interrupted request.
+    // Read before the commit returns the leased state.
+    const auto ngram = request->runner_request.ngram_rows();
+    request->result.ngram_rows = ngram.rows;
+    request->result.ngram_dedup_rows = ngram.dedup_rows;
+    request->result.ngram_cache_hits = ngram.cache_hits;
+    request->result.ngram_disk_reads = ngram.disk_reads;
     const auto cache_commit =
         finish_reason == TextGenerationBackend::FinishReason::kStopSequence
             ? request->runner_request.Cancel()
             : request->runner_request.Commit();
+    request->result.component_cache = cache_commit.component_cache;
     request->result.cache_snapshot_bytes = cache_commit.snapshot_bytes;
     request->result.cache_snapshot_ms = cache_commit.snapshot_ms;
     request->result.cache_disk_queued_bytes = cache_commit.disk_queued_bytes;
@@ -907,17 +1043,24 @@ struct TextGenerationScheduler::Impl {
         common = shared;
       }
     }
-    if (leader == nullptr ||
-        common < TextRunnerPool::Request::kSharedPrefixMinTokens)
+    if (leader == nullptr)
       return false;
     // A longer retained prefix, such as this conversation's previous turn,
     // already beats waiting for a peer.
     const auto cached =
         runner_pool->CachedPrefixTokens(prompt, request->prompt_context.get());
-    if (common < cached + TextRunnerPool::Request::kSharedPrefixMinTokens)
+    // A leader may have leased a deeper native frontier than a sibling can
+    // restore. Share its next planned checkpoint even for a short suffix:
+    // replaying generated tokens through prefill can change recurrent state.
+    // Ordinary cold-prefix sharing retains its minimum-work threshold.
+    const auto minimum_gain =
+        leader->runner_request.cached_prompt_tokens() > cached
+            ? std::size_t{1}
+            : TextRunnerPool::Request::kSharedPrefixMinTokens;
+    if (common < cached + minimum_gain)
       return false;
     const auto position = leader->runner_request.ShareCheckpoint(common);
-    if (position < cached + TextRunnerPool::Request::kSharedPrefixMinTokens)
+    if (position < cached + minimum_gain)
       return false;
     request->prefix_leader = std::move(leader);
     request->prefix_position = position;
@@ -972,15 +1115,48 @@ struct TextGenerationScheduler::Impl {
         }
         request->prefix_leader.reset();
       }
+      if (request->publication_waiting) {
+        const auto pending = runner_pool->PendingPublication(
+            request->prompt, request->prompt_context.get(),
+            request->publication.checkpoint_id);
+        if (!pending) {
+          // Published, failed or superseded: the matching job is no longer
+          // pending. Its completion log carries this same checkpoint ID.
+          EndPublicationWait(request, "not_pending");
+        } else {
+          request->publication = *pending;
+          if (pending->Gain() <= TextPendingPublication::kMinimumGainTokens) {
+            EndPublicationWait(request, "available");
+          } else if (const auto limit =
+                         publication_prefill.Limit(pending->Gain())) {
+            // Better usable cache or faster recent prefill may shorten the
+            // original deadline. Neither slower samples nor a new disk job
+            // may extend it or restart this request's one publication wait.
+            request->publication_wait_limit =
+                std::min(request->publication_wait_limit, *limit);
+            if (Clock::now() - *request->publication_wait_start >=
+                request->publication_wait_limit)
+              EndPublicationWait(
+                  request, request->publication_wait_limit ==
+                                   detail::PublicationWaitEstimate::kMaximumWait
+                               ? "cap"
+                               : "cost_bound");
+          } else {
+            EndPublicationWait(request, "no_estimate");
+          }
+        }
+      }
       ++it;
     }
   }
 
   [[nodiscard]] static std::shared_ptr<ScheduledRequest> PopReleased(
       std::deque<std::shared_ptr<ScheduledRequest>>& waiting) {
-    const auto released = std::ranges::find_if(
-        waiting,
-        [](const auto& request) { return request->prefix_leader == nullptr; });
+    const auto released =
+        std::ranges::find_if(waiting, [](const auto& request) {
+          return request->prefix_leader == nullptr &&
+                 !request->publication_waiting;
+        });
     if (released == waiting.end())
       return {};
     auto request = std::move(*released);
@@ -1022,6 +1198,21 @@ struct TextGenerationScheduler::Impl {
           waiting.push_back(std::move(request));
           continue;
         }
+        if (request->cache_prompt && !request->publication_wait_start) {
+          if (const auto pending = runner_pool->PendingPublication(
+                  request->prompt, request->prompt_context.get())) {
+            request->publication = *pending;
+            if (const auto limit = publication_prefill.Limit(pending->Gain())) {
+              request->publication_wait_limit = *limit;
+              request->publication_wait_start = Clock::now();
+              request->publication_waiting = true;
+              LogPublicationWait(request, "start");
+              waiting.push_back(std::move(request));
+              continue;
+            }
+            LogPublicationWait(request, "skip", "no_estimate");
+          }
+        }
 
         const std::weak_ptr<ScheduledRequest> weak_request = request;
         request->runner_request = runner_pool->Acquire(
@@ -1034,11 +1225,15 @@ struct TextGenerationScheduler::Impl {
             },
             std::move(request->prompt_context), request->cache_prompt,
             request->cache_prefix_tokens, request->stop_at_eos);
+        // Each admission may restore or capture a checkpoint of its own.
+        progress.fetch_add(1, std::memory_order_relaxed);
         if (!request->runner_request) {
           CompleteCancelled(request);
           continue;
         }
 
+        request->result.component_cache =
+            request->runner_request.component_cache_metrics();
         request->result.cache_hit = request->runner_request.cache_hit();
         const auto lookup = request->runner_request.cache_lookup();
         request->result.cache_miss_reason = lookup.miss_reason;
@@ -1119,6 +1314,8 @@ struct TextGenerationScheduler::Impl {
               .count();
       request->result.prefill_ms += step_ms;
       request->result.prefill_tokens += step.consumed_tokens;
+      if (!decoder_runnable && !peer_waiting)
+        publication_prefill.Observe(step.consumed_tokens, step_ms);
       request->live_prefill_tokens.store(request->result.prefill_tokens,
                                          std::memory_order_relaxed);
       detail::TotalPromptTokens().fetch_add(step.consumed_tokens,
@@ -1305,6 +1502,8 @@ struct TextGenerationScheduler::Impl {
       request->result.draft_rounds += step.draft_rounds;
       request->result.draft_tokens += step.draft_tokens;
       request->result.draft_accepted_tokens += step.draft_accepted_tokens;
+      request->result.lookup_tokens += step.lookup_tokens;
+      request->result.lookup_accepted_tokens += step.lookup_accepted_tokens;
 
       CheckPreviewResult(request, step);
       for (const auto& selection : step.selections) {
@@ -1609,6 +1808,9 @@ struct TextGenerationScheduler::Impl {
       item.request->result.draft_rounds += step.draft_rounds;
       item.request->result.draft_tokens += step.draft_tokens;
       item.request->result.draft_accepted_tokens += step.draft_accepted_tokens;
+      item.request->result.lookup_tokens += step.lookup_tokens;
+      item.request->result.lookup_accepted_tokens +=
+          step.lookup_accepted_tokens;
 
       bool published = true;
       try {
@@ -1722,6 +1924,7 @@ struct TextGenerationScheduler::Impl {
     while (!stop_token.stop_requested()) {
       if (device_lost.load(std::memory_order_acquire))
         break;
+      loop_working.store(true, std::memory_order_relaxed);
       ProcessQueuedCancellations();
 
       for (std::size_t count = capturing.size(); count != 0; --count) {
@@ -1729,7 +1932,10 @@ struct TextGenerationScheduler::Impl {
         capturing.pop_front();
         if (request->runner_request.SnapshotPending()) {
           capturing.push_back(std::move(request));
-        } else if (!CompleteIfStopped(request)) {
+          continue;
+        }
+        progress.fetch_add(1, std::memory_order_relaxed);
+        if (!CompleteIfStopped(request)) {
           if (request->runner_request.prefill_complete()) {
             // Its capture already waited through peer prefill. Resume it
             // before another bounded chunk, as for any due decoder.
@@ -1754,8 +1960,12 @@ struct TextGenerationScheduler::Impl {
           // Only the idle wait has a timer. Arrival interrupts it immediately;
           // no clock checks or device polling are added to active work units.
           while (!wake()) {
-            if (queue_condition.wait_for(
-                    lock, scheduler_policy.device_probe_interval, wake))
+            loop_working.store(false, std::memory_order_relaxed);
+            const bool woken = queue_condition.wait_for(
+                lock, scheduler_policy.device_probe_interval, wake);
+            progress.fetch_add(1, std::memory_order_relaxed);
+            loop_working.store(true, std::memory_order_relaxed);
+            if (woken)
               break;
             lock.unlock();
             try {
@@ -1774,6 +1984,7 @@ struct TextGenerationScheduler::Impl {
         continue;
       }
 
+      progress.fetch_add(1, std::memory_order_relaxed);
       const bool due_decoder = HasDueDecoder(decoding);
       const std::size_t resident_count = prefilling.size() + decoding.size();
       const bool preparing_multi_token_batch =
@@ -1878,6 +2089,7 @@ struct TextGenerationScheduler::Impl {
   std::shared_ptr<TextRunnerPool> runner_pool;
   TextPrefillPolicy prefill_policy;
   TextSchedulerPolicy scheduler_policy;
+  detail::PublicationWaitEstimate publication_prefill;
   std::shared_ptr<OutputBudget> output_budget;
   std::shared_ptr<SessionTable> sessions;
   bool incremental_prefill_supported{false};
@@ -1899,7 +2111,15 @@ struct TextGenerationScheduler::Impl {
   std::size_t consecutive_active_prefill_chunks{0};
   std::uint64_t last_prefill_request_id{0};
   std::atomic<std::uint64_t> next_request_id{1};
+  // Written by the scheduler thread and read by the stall monitor. `progress`
+  // advances when a request is admitted, a work unit starts, a pending
+  // capture completes or an idle wait returns; `loop_working` is false only
+  // inside that idle wait. A loop that only polls a capture which never
+  // completes makes no progress.
+  std::atomic<std::uint64_t> progress{0};
+  std::atomic<bool> loop_working{false};
   std::jthread worker;
+  std::jthread stall_monitor;
 };
 
 TextGenerationScheduler::Request::Request() = default;

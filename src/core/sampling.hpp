@@ -15,6 +15,21 @@ namespace gufo::sampling {
 
 using TokenId = std::uint32_t;
 
+/// A reasoning token budget, enforced like llama.cpp's reasoning-budget
+/// sampler (#266). Tokens are counted after the reasoning start, including
+/// reasoning text already in the prompt. Once the budget is spent, and the
+/// last token completed its UTF-8 character, `forced` is emitted token by
+/// token. Any token in `ends` closes reasoning early. Later tokens are answer
+/// content, including literal reasoning tags, as in Gufo's response framing.
+struct ReasoningBudget {
+  std::size_t tokens{0};
+  std::vector<TokenId> forced;
+  std::vector<TokenId> ends;
+  std::vector<TokenId> prompt;
+  /// Indexed by token: its text ends inside a UTF-8 character.
+  std::shared_ptr<const std::vector<bool>> partial_utf8;
+};
+
 /// Model-independent controls for selecting a token from a logit row.
 ///
 /// Filters run in this order: penalties, temperature, top-k, top-p, min-p.
@@ -31,6 +46,8 @@ struct SamplingConfig {
   float frequency_penalty{0.0F};
   float presence_penalty{0.0F};
   std::shared_ptr<const TokenConstraint> constraint;
+  /// Set only for requests that start in their reasoning phase.
+  std::shared_ptr<const ReasoningBudget> reasoning_budget;
 
   void Validate() const;
 
@@ -49,6 +66,11 @@ struct TokenPenalty {
 struct Probability {
   TokenId token{0};
   double value{0.0};
+};
+
+struct LogitCandidate {
+  TokenId token;
+  float value;
 };
 
 /// A normalized, post-filter sampling distribution.
@@ -104,8 +126,12 @@ public:
                                      bool penalties_applied = false) const;
   /// A lazy tool grammar can admit the entire vocabulary before a call.
   /// Retain ordinary CPU/GPU sampling while its mask makes no restriction.
+  /// Also true while ForcedToken() is set, so GPU samplers defer to the host.
   [[nodiscard]] bool NeedsConstraintMask() const;
   [[nodiscard]] std::span<const TokenId> history() const noexcept;
+  /// The token every sampling path returns next, if any: an exhausted
+  /// reasoning budget forces its end sequence.
+  [[nodiscard]] std::optional<TokenId> ForcedToken() const noexcept;
   [[nodiscard]] std::span<const TokenPenalty> penalties() const noexcept {
     return penalty_counts_;
   }
@@ -137,6 +163,13 @@ public:
   /// Compact logits use token_ids for penalties; returned IDs index logits.
   [[nodiscard]] SamplingDistribution Distribution(
       std::span<const float> logits, std::span<const TokenId> token_ids) const;
+  /// Exact target top-k from a complete candidate union. The caller proves
+  /// that omitted tokens cannot enter the post-penalty top-k. Candidates
+  /// have unique vocabulary IDs; returned IDs are those vocabulary IDs.
+  /// Requires bounded top-k, positive temperature and no active constraint.
+  /// Retains the full-row sampler's FP64 filtering and normalization.
+  [[nodiscard]] SamplingDistribution DistributionFromCandidates(
+      std::span<const LogitCandidate> logits) const;
   /// Retain a speculative residual draw for the next Sample call. Copies
   /// preserve this draw along with the RNG; resetting history discards it.
   void DeferSample(TokenId token);
@@ -159,6 +192,11 @@ private:
   [[nodiscard]] SamplingDistribution LinearDistribution(
       std::span<const float> logits) const;
   void PrepareSelected(std::span<const float> logits);
+  void FilterSelected(double full_softmax_sum = 0,
+                      bool has_full_softmax_sum = false);
+  [[nodiscard]] SamplingDistribution SelectedDistribution();
+  void StartReasoning();
+  void AdvanceReasoning(TokenId token);
 
   SamplingConfig config_;
   JsonConstraint::State constraint_state_;
@@ -169,6 +207,15 @@ private:
   std::vector<Probability> candidate_scratch_;
   std::uint64_t rng_state_{0};
   std::optional<TokenId> pending_sample_;
+  enum class ReasoningPhase : std::uint8_t {
+    kOff,
+    kCounting,
+    kWaitingUtf8,
+    kForcing,
+  };
+  ReasoningPhase reasoning_phase_{ReasoningPhase::kOff};
+  std::size_t reasoning_remaining_{0};
+  std::size_t reasoning_forced_{0};
 };
 
 [[nodiscard]] std::uint64_t NextRandom(std::uint64_t* state);
