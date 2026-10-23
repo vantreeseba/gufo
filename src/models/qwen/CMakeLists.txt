@@ -76,11 +76,13 @@ if (ENGINE_ENABLE_HIP)
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/hipblas_gemm.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/hipblaslt_gemm.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/moe.hip
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/moe_decode_wave64.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/dflash_kernels.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/arena.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/batched_decode.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/decode.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/decode_step.cpp
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/moe_experiments.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/executor.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/model_loader.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/prefill.cpp
@@ -101,6 +103,7 @@ if (ENGINE_ENABLE_HIP)
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/small_batch_wave64.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/prefill_quant_wave64.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/attention_decode_verify_wave64.hip
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/moe_decode_wave64.hip
     TARGET_DIRECTORY gufo_core
     PROPERTIES COMPILE_OPTIONS -mwavefrontsize64)
   # Iterative ILP improves Q4/Q5 groups of sixteen without changing arithmetic.

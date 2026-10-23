@@ -14,6 +14,7 @@
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/ops.hpp"
 #include "src/models/qwen/hip/ops/moe.hpp"
+#include "src/models/qwen/hip/ops/moe_wave64.hpp"
 #include "src/models/qwen/modules/moe.hpp"
 
 namespace gufo::hip {
@@ -106,11 +107,12 @@ struct SsmControls {
 /// Batched routed MoE FFN (qwen35moe), decode batch <= kMaxDecodeBatch.
 /// Mirrors ExecuteMoeDecodeStep with the batch-aware kernels; the routed
 /// expert GEMMs keep the same MMQ quantization and reduction order as
-/// single-token decode.
+/// single-token decode. The GUFO_EXP_MOE_* switches apply here too.
 void LaunchMoeFfn(const models::QwenLayerWeights& layer,
                   const QwenGpuScratchView& scratch, std::size_t batch_size,
                   const core::ModelConfig& config, hipStream_t stream) {
   const auto view = models::qwen::MakeMoeView(layer, config);
+  const auto& experiments = detail::GetMoeDecodeExperiments();
   const auto& moe = scratch.moe;
   const std::size_t hidden = config.hidden_size;
   const std::uint32_t n_experts = config.expert_count;
@@ -118,15 +120,25 @@ void LaunchMoeFfn(const models::QwenLayerWeights& layer,
   const std::size_t expert_ff = config.expert_ff_length;
   const std::size_t shared_ff = config.expert_shared_ff_length;
   const std::uint32_t slots = static_cast<std::uint32_t>(batch_size) * n_used;
+  const auto tokens = static_cast<std::uint32_t>(batch_size);
 
-  LaunchProjection(view.router, scratch.decode.normed.data(),
-                   moe.router_logits.data(), batch_size, n_experts, hidden,
-                   stream);
-  LaunchProjection(view.shexp_gate_inp, scratch.decode.normed.data(),
-                   moe.shexp_gate.data(), batch_size, 1, hidden, stream);
-  LaunchMoeRouterTopK(
-      moe.router_logits.data(), n_experts, moe.ids.data(), moe.weights.data(),
-      static_cast<std::uint32_t>(batch_size), n_experts, n_used, stream);
+  const bool fused_router =
+      experiments.fuse_router &&
+      LaunchMoeFusedRouter(
+          view.router.data, view.router.type, view.shexp_gate_inp.data,
+          view.shexp_gate_inp.type, scratch.decode.normed.data(),
+          moe.router_logits.data(), moe.shexp_gate.data(), moe.ids.data(),
+          moe.weights.data(), moe.router_done.data(), tokens, n_experts,
+          static_cast<std::uint32_t>(hidden), n_used, stream);
+  if (!fused_router) {
+    LaunchProjection(view.router, scratch.decode.normed.data(),
+                     moe.router_logits.data(), batch_size, n_experts, hidden,
+                     stream);
+    LaunchProjection(view.shexp_gate_inp, scratch.decode.normed.data(),
+                     moe.shexp_gate.data(), batch_size, 1, hidden, stream);
+    LaunchMoeRouterTopK(moe.router_logits.data(), n_experts, moe.ids.data(),
+                        moe.weights.data(), tokens, n_experts, n_used, stream);
+  }
 
   LaunchProjection(view.shexp_gate, scratch.decode.normed.data(),
                    scratch.ffn.gate.data(), batch_size, shared_ff, hidden,
@@ -137,11 +149,26 @@ void LaunchMoeFfn(const models::QwenLayerWeights& layer,
   LaunchBatchedSwiGLUActivation(scratch.ffn.gate.data(), scratch.ffn.up.data(),
                                 moe.shexp_act.data(), nullptr,
                                 batch_size * shared_ff, stream);
-  LaunchProjection(view.shexp_down, moe.shexp_act.data(), moe.shexp_out.data(),
-                   batch_size, hidden, shared_ff, stream);
+  if (!experiments.fuse_combine) {
+    LaunchProjection(view.shexp_down, moe.shexp_act.data(),
+                     moe.shexp_out.data(), batch_size, hidden, shared_ff,
+                     stream);
+  }
 
-  if (view.gate_exps.type == view.up_exps.type &&
-      IsMmqMoeVecType(view.gate_exps.type, hidden)) {
+  const bool wave64_gate =
+      experiments.wave64 &&
+      LaunchMoeWave64SwigluGemv(
+          view.gate_exps.data, view.gate_exps.type, view.up_exps.data,
+          view.up_exps.type, scratch.decode.normed.data(), moe.ids.data(),
+          moe.gate_e.data(), expert_ff, hidden, slots, n_used, stream);
+  // Q6_K's experimental gated vector covers a single token only.
+  const bool mmq_gated =
+      view.gate_exps.type == view.up_exps.type &&
+      UseMmqMoeVec(view.gate_exps.type, hidden) &&
+      (view.gate_exps.type != core::GgmlType::kQ6_K || batch_size == 1);
+  if (wave64_gate) {
+    // The wave64 kernel already wrote gate_e.
+  } else if (mmq_gated) {
     // The gated vector kernel takes at most 8 token rows per launch
     // (MMVQ_MAX_BATCH_SIZE), or 64 for Q4_K (MMVQ_MAX_ROUTED_BATCH), where it
     // groups equal experts across the whole batch. Concurrent verification
@@ -168,7 +195,14 @@ void LaunchMoeFfn(const models::QwenLayerWeights& layer,
         view.up_exps.type, scratch.decode.normed.data(), moe.ids.data(),
         moe.gate_e.data(), expert_ff, hidden, slots, n_used, stream);
   }
-  if (IsMmqMoeVecType(view.down_exps.type, expert_ff)) {
+  const bool wave64_down =
+      experiments.wave64 &&
+      LaunchMoeWave64Gemv(view.down_exps.data, view.down_exps.type,
+                          moe.gate_e.data(), moe.ids.data(), moe.down_e.data(),
+                          hidden, expert_ff, slots, stream);
+  if (wave64_down) {
+    // The wave64 kernel already wrote down_e.
+  } else if (UseMmqMoeVec(view.down_exps.type, expert_ff)) {
     if (qfn_mmq_moe_vec(static_cast<int>(view.down_exps.type),
                         view.down_exps.data, moe.gate_e.data(), moe.ids.data(),
                         moe.down_e.data(), static_cast<int>(hidden),
@@ -182,10 +216,24 @@ void LaunchMoeFfn(const models::QwenLayerWeights& layer,
                       moe.gate_e.data(), moe.ids.data(), moe.down_e.data(),
                       hidden, expert_ff, slots, 1, stream);
   }
-  LaunchMoeEpilogue(moe.down_e.data(), moe.weights.data(), moe.shexp_out.data(),
-                    moe.shexp_gate.data(), scratch.ffn.out.data(),
-                    static_cast<std::uint32_t>(batch_size), n_used, hidden,
-                    stream);
+  const bool fused_combine =
+      experiments.fuse_combine &&
+      LaunchMoeSharedDownCombine(
+          view.shexp_down.data, view.shexp_down.type, moe.shexp_act.data(),
+          moe.down_e.data(), moe.weights.data(), moe.shexp_gate.data(),
+          scratch.ffn.out.data(), tokens, n_used,
+          static_cast<std::uint32_t>(hidden),
+          static_cast<std::uint32_t>(shared_ff), stream);
+  if (!fused_combine) {
+    if (experiments.fuse_combine) {
+      LaunchProjection(view.shexp_down, moe.shexp_act.data(),
+                       moe.shexp_out.data(), batch_size, hidden, shared_ff,
+                       stream);
+    }
+    LaunchMoeEpilogue(moe.down_e.data(), moe.weights.data(),
+                      moe.shexp_out.data(), moe.shexp_gate.data(),
+                      scratch.ffn.out.data(), tokens, n_used, hidden, stream);
+  }
 }
 
 SsmControls LaunchSsmControls(const models::QwenLayerWeights& layer,
