@@ -57,7 +57,8 @@ std::size_t MoeScratchBytes(const core::ModelConfig& config,
   const auto ints = [&](std::size_t n) {
     return ((CheckedMultiply(n, sizeof(std::int32_t)) + 255) / 256) * 256;
   };
-  std::size_t total = 0;
+  // Fixed-position fused-router counters first; see QwenMoeScratch.
+  std::size_t total = ints(kMoeRouterCounterSlots);
   total =
       CheckedSum(total, floats(CheckedMultiply(batch, config.expert_count)));
   total = CheckedSum(total, floats(batch));
@@ -84,7 +85,6 @@ std::size_t MoeScratchBytes(const core::ModelConfig& config,
         255) /
        256) *
           256);
-  total = CheckedSum(total, ints(batch));
   return total;
 }
 
@@ -111,6 +111,10 @@ QwenMoeScratch CarveMoeScratch(std::uint8_t* block,
     offset += ((n * sizeof(std::int32_t) + 255) / 256) * 256;
     return std::span<std::int32_t>(p, n);
   };
+  scratch.router_done = std::span<std::uint32_t>(
+      reinterpret_cast<std::uint32_t*>(block), kMoeRouterCounterSlots);
+  offset += ((kMoeRouterCounterSlots * sizeof(std::uint32_t) + 255) / 256) *
+            256;
   scratch.router_logits = take_floats(batch * config.expert_count);
   scratch.shexp_gate = take_floats(batch);
   scratch.ids = take_ints(slots);
@@ -133,9 +137,6 @@ QwenMoeScratch CarveMoeScratch(std::uint8_t* block,
   scratch.x_half = std::span<std::uint16_t>(
       reinterpret_cast<std::uint16_t*>(block + offset), batch * hidden);
   offset += ((batch * hidden * sizeof(std::uint16_t) + 255) / 256) * 256;
-  scratch.router_done = std::span<std::uint32_t>(
-      reinterpret_cast<std::uint32_t*>(block + offset), batch);
-  offset += ((batch * sizeof(std::uint32_t) + 255) / 256) * 256;
   return scratch;
 }
 

@@ -39,7 +39,7 @@ void ExecuteMoeDecodeStep(hipStream_t stream, const QwenMoeScratch& moe,
           view.router.data, view.router.type, view.shexp_gate_inp.data,
           view.shexp_gate_inp.type, x, moe.router_logits.data(),
           moe.shexp_gate.data(), moe.ids.data(), moe.weights.data(),
-          moe.router_done.data(), 1, n_experts,
+          moe.router_done.data(), moe.router_done.size(), 1, n_experts,
           static_cast<std::uint32_t>(hidden), n_used, stream);
   if (!fused_router) {
     LaunchGEMV(view.router.data, view.router.type, x, moe.router_logits.data(),

@@ -29,14 +29,15 @@ void LaunchMoeEpilogue(const float* expert_out, const float* weights,
                        std::uint32_t dim, hipStream_t stream = nullptr);
 
 /// Experimental (GUFO_EXP_MOE_FUSE=router): router logits, the shared-expert
-/// gate logit and LaunchMoeRouterTopK in one launch. `done` holds one counter
-/// per token and must be zero before the first launch; the kernel leaves it
-/// zero. Returns false, launching nothing, for unsupported formats or shapes.
+/// gate logit and LaunchMoeRouterTopK in one launch. `done` holds
+/// `done_slots` counters, one per token, which must be zero before the first
+/// launch; the kernel leaves them zero. Returns false, launching nothing, for
+/// unsupported formats or shapes, or more tokens than counters.
 [[nodiscard]] bool LaunchMoeFusedRouter(
     const void* router_w, core::GgmlType router_type, const void* gate_w,
     core::GgmlType gate_type, const float* x, float* logits,
     float* shared_gate, std::int32_t* ids, float* weights, std::uint32_t* done,
-    std::uint32_t n_tokens, std::uint32_t n_experts, std::uint32_t hidden,
+    std::size_t done_slots, std::uint32_t n_tokens, std::uint32_t n_experts, std::uint32_t hidden,
     std::uint32_t n_used, hipStream_t stream = nullptr);
 
 /// Experimental (GUFO_EXP_MOE_FUSE=combine): the shared expert's down
