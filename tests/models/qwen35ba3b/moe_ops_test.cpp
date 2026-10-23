@@ -22,6 +22,7 @@
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
 #include "src/models/qwen/hip/ops/moe.hpp"
+#include "src/models/qwen/hip/ops/moe_wave64.hpp"
 #include "src/models/qwen/hip/ops/swiglu.hpp"
 #include "src/models/qwen/modules/moe.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
@@ -597,9 +598,32 @@ constexpr RoutedFormat kRoutedFormats[] = {
      "Q4_K"},
 };
 
+/// Random block_q6_K payload for `rows` x `cols`: arbitrary codes, int8
+/// sub-block scales and a small F16 superblock scale.
+std::vector<std::uint8_t> RandomQ6K(std::size_t rows, std::size_t cols) {
+  constexpr std::size_t kBlockBytes = 210;
+  std::vector<std::uint8_t> out(rows * (cols / 256) * kBlockBytes);
+  for (std::size_t b = 0; b < out.size() / kBlockBytes; ++b) {
+    std::uint8_t* blk = out.data() + (b * kBlockBytes);
+    for (std::size_t i = 0; i < 192; ++i) {
+      blk[i] = static_cast<std::uint8_t>(Rnd() & 0xFFU);
+    }
+    for (std::size_t i = 192; i < 208; ++i) {
+      blk[i] = static_cast<std::uint8_t>(
+          static_cast<std::int8_t>(static_cast<int>(Rnd() % 81) - 40));
+    }
+    const std::uint16_t d = FloatToFp16Bits(RndFloat(0.0002F, 0.0012F));
+    std::memcpy(blk + 208, &d, sizeof(d));
+  }
+  return out;
+}
+
 /// Random expert weights `rows` x `cols` in `type`.
 std::vector<std::uint8_t> RandomExpertWeights(GgmlType type, std::size_t rows,
                                               std::size_t cols) {
+  if (type == GgmlType::kQ6_K) {
+    return RandomQ6K(rows, cols);
+  }
   if (type == GgmlType::kQ4_K || type == GgmlType::kQ5_K) {
     return RandomQ45K(type, rows, cols);
   }
@@ -960,6 +984,243 @@ void CheckMmqKQuants(hipStream_t stream) {
 
 }  // namespace
 
+/// Largest |got - ref| relative to the largest |ref|, and non-finite count.
+struct Agreement {
+  double rel;
+  std::size_t non_finite;
+};
+
+Agreement Compare(const std::vector<float>& ref, const std::vector<float>& got) {
+  double max_abs = 0.0;
+  double magnitude = 0.0;
+  std::size_t non_finite = 0;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    if (!std::isfinite(got[i])) {
+      ++non_finite;
+      continue;
+    }
+    max_abs = std::max(max_abs, std::fabs(static_cast<double>(got[i]) -
+                                          static_cast<double>(ref[i])));
+    magnitude = std::max(magnitude, std::fabs(static_cast<double>(ref[i])));
+  }
+  return {magnitude > 0.0 ? max_abs / magnitude : max_abs, non_finite};
+}
+
+// Experimental decode routes (GUFO_EXP_MOE_*; see
+// src/models/qwen/hip/detail/moe_experiments.hpp), each against the route it
+// would replace on the same weights. These call the kernels directly, so they
+// run whatever the environment says.
+void CheckExperimentalDecode(hipStream_t stream) {
+  constexpr std::uint32_t kExperts = 64;
+  constexpr std::uint32_t kUsed = 8;
+  constexpr std::size_t kHidden = 2048;
+  constexpr std::size_t kFf = 512;
+  constexpr std::size_t kSharedFf = 512;
+  const auto random_ids = [&](std::uint32_t tokens) {
+    std::vector<std::int32_t> ids(tokens * kUsed);
+    for (std::uint32_t t = 0; t < tokens; ++t) {
+      for (std::uint32_t s = 0; s < kUsed; ++s) {
+        ids[t * kUsed + s] =
+            static_cast<std::int32_t>((t * 7 + s * 5 + Rnd() % 3) % kExperts);
+      }
+    }
+    return ids;
+  };
+  const auto random_rows = [](std::size_t n) {
+    std::vector<float> x(n);
+    for (auto& v : x) {
+      v = RndFloat(-1.0F, 1.0F);
+    }
+    return x;
+  };
+
+  // Wave64 expert GEMVs (FP32 activations, same decode as the slot GEMV).
+  for (const GgmlType type : {GgmlType::kQ8_0, GgmlType::kQ4_K,
+                              GgmlType::kQ5_K, GgmlType::kQ6_K}) {
+    gufo::test::DeviceBuffer<std::uint8_t> d_gate(
+        RandomExpertWeights(type, kExperts * kFf, kHidden));
+    gufo::test::DeviceBuffer<std::uint8_t> d_up(
+        RandomExpertWeights(type, kExperts * kFf, kHidden));
+    gufo::test::DeviceBuffer<std::uint8_t> d_down(
+        RandomExpertWeights(type, kExperts * kHidden, kFf));
+    for (const std::uint32_t tokens : {1U, 4U}) {
+      const std::uint32_t slots = tokens * kUsed;
+      gufo::test::DeviceBuffer<std::int32_t> d_ids(random_ids(tokens));
+      gufo::test::DeviceBuffer<float> d_x(random_rows(tokens * kHidden));
+      gufo::test::DeviceBuffer<float> d_act_ref(slots * kFf);
+      gufo::test::DeviceBuffer<float> d_act_got(slots * kFf);
+      gufo::hip::LaunchMoeSlotSwigluGemv(
+          d_gate.data(), type, d_up.data(), type, d_x.data(), d_ids.data(),
+          d_act_ref.data(), kFf, kHidden, slots, kUsed, stream);
+      Expect(gufo::hip::LaunchMoeWave64SwigluGemv(
+                 d_gate.data(), type, d_up.data(), type, d_x.data(),
+                 d_ids.data(), d_act_got.data(), kFf, kHidden, slots, kUsed,
+                 stream),
+             "wave64 SwiGLU GEMV rejected the format");
+      gufo::test::DeviceBuffer<float> d_out_ref(slots * kHidden);
+      gufo::test::DeviceBuffer<float> d_out_got(slots * kHidden);
+      gufo::hip::LaunchMoeSlotGemv(d_down.data(), type, d_act_ref.data(),
+                                   d_ids.data(), d_out_ref.data(), kHidden,
+                                   kFf, slots, 1, stream);
+      Expect(gufo::hip::LaunchMoeWave64Gemv(d_down.data(), type,
+                                            d_act_ref.data(), d_ids.data(),
+                                            d_out_got.data(), kHidden, kFf,
+                                            slots, stream),
+             "wave64 GEMV rejected the format");
+      HIP_CHECK(hipStreamSynchronize(stream));
+      const auto act = Compare(d_act_ref.CopyToHost(), d_act_got.CopyToHost());
+      const auto down =
+          Compare(d_out_ref.CopyToHost(), d_out_got.CopyToHost());
+      std::cout << "wave64 type=" << static_cast<int>(type)
+                << " tokens=" << tokens << ": swiglu rel=" << act.rel
+                << " down rel=" << down.rel << "\n";
+      Expect(act.non_finite == 0 && down.non_finite == 0,
+             "wave64 GEMV left rows unwritten");
+      Expect(act.rel < 1e-4 && down.rel < 1e-4,
+             "wave64 GEMV disagrees with the slot GEMV");
+    }
+  }
+
+  // Q6_K experts on the MMQ int8 vector kernels (Q8_1 activations).
+  {
+    constexpr GgmlType kType = GgmlType::kQ6_K;
+    gufo::test::DeviceBuffer<std::uint8_t> d_gate(
+        RandomExpertWeights(kType, kExperts * kFf, kHidden));
+    gufo::test::DeviceBuffer<std::uint8_t> d_up(
+        RandomExpertWeights(kType, kExperts * kFf, kHidden));
+    gufo::test::DeviceBuffer<std::uint8_t> d_down(
+        RandomExpertWeights(kType, kExperts * kHidden, kFf));
+    gufo::test::DeviceBuffer<std::int32_t> d_ids(random_ids(1));
+    gufo::test::DeviceBuffer<float> d_x(random_rows(kHidden));
+    gufo::test::DeviceBuffer<float> d_act_ref(kUsed * kFf);
+    gufo::test::DeviceBuffer<float> d_act_got(kUsed * kFf);
+    gufo::hip::LaunchMoeSlotSwigluGemv(d_gate.data(), kType, d_up.data(),
+                                       kType, d_x.data(), d_ids.data(),
+                                       d_act_ref.data(), kFf, kHidden, kUsed,
+                                       kUsed, stream);
+    Expect(qfn_mmq_moe_gated_vec(static_cast<int>(kType), d_gate.data(),
+                                 d_up.data(), d_x.data(), d_ids.data(),
+                                 d_act_got.data(), kFf, kHidden, 1, kExperts,
+                                 kUsed, stream) == 0,
+           "Q6_K gated MMQ vector failed");
+    gufo::test::DeviceBuffer<float> d_out_ref(kUsed * kHidden);
+    gufo::test::DeviceBuffer<float> d_out_got(kUsed * kHidden);
+    gufo::hip::LaunchMoeSlotGemv(d_down.data(), kType, d_act_ref.data(),
+                                 d_ids.data(), d_out_ref.data(), kHidden, kFf,
+                                 kUsed, 1, stream);
+    Expect(qfn_mmq_moe_vec(static_cast<int>(kType), d_down.data(),
+                           d_act_ref.data(), d_ids.data(), d_out_got.data(),
+                           kHidden, kFf, kUsed, kExperts, 1, stream, nullptr,
+                           nullptr) == 0,
+           "Q6_K MMQ vector failed");
+    HIP_CHECK(hipStreamSynchronize(stream));
+    const auto act = Compare(d_act_ref.CopyToHost(), d_act_got.CopyToHost());
+    const auto down = Compare(d_out_ref.CopyToHost(), d_out_got.CopyToHost());
+    std::cout << "Q6_K MMQ vector: swiglu rel=" << act.rel
+              << " down rel=" << down.rel << "\n";
+    Expect(act.non_finite == 0 && down.non_finite == 0,
+           "Q6_K MMQ vector left rows unwritten");
+    // The int8 activation quantization is the only extra rounding.
+    Expect(act.rel < 2e-2 && down.rel < 2e-2,
+           "Q6_K MMQ vector disagrees with the slot GEMV");
+  }
+
+  // Fused router + shared gate + top-k against the three separate launches.
+  // Repeated launches check that the block counters return to zero.
+  for (const std::uint32_t tokens : {1U, 4U}) {
+    gufo::test::DeviceBuffer<float> d_router(random_rows(kExperts * kHidden));
+    gufo::test::DeviceBuffer<float> d_gate_inp(random_rows(kHidden));
+    gufo::test::DeviceBuffer<float> d_x(random_rows(tokens * kHidden));
+    gufo::test::DeviceBuffer<float> d_logits_ref(tokens * kExperts);
+    gufo::test::DeviceBuffer<float> d_gate_ref(tokens);
+    gufo::test::DeviceBuffer<std::int32_t> d_ids_ref(tokens * kUsed);
+    gufo::test::DeviceBuffer<float> d_w_ref(tokens * kUsed);
+    for (std::uint32_t t = 0; t < tokens; ++t) {
+      gufo::hip::LaunchGEMV(d_router.data(), GgmlType::kF32,
+                            d_x.data() + t * kHidden,
+                            d_logits_ref.data() + t * kExperts, kExperts,
+                            kHidden, stream);
+      gufo::hip::LaunchGEMV(d_gate_inp.data(), GgmlType::kF32,
+                            d_x.data() + t * kHidden, d_gate_ref.data() + t, 1,
+                            kHidden, stream);
+    }
+    gufo::hip::LaunchMoeRouterTopK(d_logits_ref.data(), kExperts,
+                                   d_ids_ref.data(), d_w_ref.data(), tokens,
+                                   kExperts, kUsed, stream);
+    gufo::test::DeviceBuffer<float> d_logits(tokens * kExperts);
+    gufo::test::DeviceBuffer<float> d_gate(tokens);
+    gufo::test::DeviceBuffer<std::int32_t> d_ids(tokens * kUsed);
+    gufo::test::DeviceBuffer<float> d_w(tokens * kUsed);
+    gufo::test::DeviceBuffer<std::uint32_t> d_done(
+        std::vector<std::uint32_t>(tokens, 0U));
+    for (int repeat = 0; repeat < 3; ++repeat) {
+      Expect(gufo::hip::LaunchMoeFusedRouter(
+                 d_router.data(), GgmlType::kF32, d_gate_inp.data(),
+                 GgmlType::kF32, d_x.data(), d_logits.data(), d_gate.data(),
+                 d_ids.data(), d_w.data(), d_done.data(), tokens, kExperts,
+                 static_cast<std::uint32_t>(kHidden), kUsed, stream),
+             "fused router rejected the shape");
+    }
+    HIP_CHECK(hipStreamSynchronize(stream));
+    const auto logits =
+        Compare(d_logits_ref.CopyToHost(), d_logits.CopyToHost());
+    const auto gate = Compare(d_gate_ref.CopyToHost(), d_gate.CopyToHost());
+    const auto weights = Compare(d_w_ref.CopyToHost(), d_w.CopyToHost());
+    const auto done = d_done.CopyToHost();
+    std::cout << "fused router tokens=" << tokens
+              << ": logits rel=" << logits.rel << " gate rel=" << gate.rel
+              << " weights rel=" << weights.rel << "\n";
+    Expect(std::all_of(done.begin(), done.end(),
+                       [](std::uint32_t v) { return v == 0; }),
+           "fused router left a block counter set");
+    Expect(d_ids_ref.CopyToHost() == d_ids.CopyToHost(),
+           "fused router picked different experts");
+    Expect(logits.rel < 1e-5 && gate.rel < 1e-5 && weights.rel < 1e-5,
+           "fused router disagrees with the separate launches");
+  }
+
+  // Shared-expert down projection fused with the combine epilogue.
+  for (const std::uint32_t tokens : {1U, 4U}) {
+    const auto down_q = RandomExpertWeights(GgmlType::kQ8_0, kHidden, kSharedFf);
+    gufo::test::DeviceBuffer<std::uint8_t> d_down(down_q);
+    gufo::test::DeviceBuffer<float> d_act(random_rows(tokens * kSharedFf));
+    gufo::test::DeviceBuffer<float> d_experts(
+        random_rows(tokens * kUsed * kHidden));
+    std::vector<float> weights(tokens * kUsed);
+    for (auto& v : weights) {
+      v = RndFloat(0.0F, 0.25F);
+    }
+    gufo::test::DeviceBuffer<float> d_weights(weights);
+    gufo::test::DeviceBuffer<float> d_gate(random_rows(tokens));
+    gufo::test::DeviceBuffer<float> d_shared(tokens * kHidden);
+    gufo::test::DeviceBuffer<float> d_ref(tokens * kHidden);
+    gufo::test::DeviceBuffer<float> d_got(tokens * kHidden);
+    for (std::uint32_t t = 0; t < tokens; ++t) {
+      gufo::hip::LaunchGEMV(d_down.data(), GgmlType::kQ8_0,
+                            d_act.data() + t * kSharedFf,
+                            d_shared.data() + t * kHidden, kHidden, kSharedFf,
+                            stream);
+    }
+    gufo::hip::LaunchMoeEpilogue(d_experts.data(), d_weights.data(),
+                                 d_shared.data(), d_gate.data(), d_ref.data(),
+                                 tokens, kUsed, kHidden, stream);
+    Expect(gufo::hip::LaunchMoeSharedDownCombine(
+               d_down.data(), GgmlType::kQ8_0, d_act.data(), d_experts.data(),
+               d_weights.data(), d_gate.data(), d_got.data(), tokens, kUsed,
+               static_cast<std::uint32_t>(kHidden),
+               static_cast<std::uint32_t>(kSharedFf), stream),
+           "fused combine rejected the format");
+    HIP_CHECK(hipStreamSynchronize(stream));
+    const auto combine = Compare(d_ref.CopyToHost(), d_got.CopyToHost());
+    std::cout << "fused combine tokens=" << tokens << ": rel=" << combine.rel
+              << "\n";
+    Expect(combine.non_finite == 0, "fused combine left rows unwritten");
+    // LaunchGEMV may quantize the activation for Q8_0; allow for that.
+    Expect(combine.rel < 2e-2, "fused combine disagrees with the epilogue");
+  }
+  std::cout << "experimental decode routes: OK\n";
+}
+
 int main() {
   const int gate = gufo::test::GateHipDevice(
       gufo::test::HipDeviceRequirement::kRequired, "qwen35ba3b_moe_ops_test");
@@ -977,6 +1238,7 @@ int main() {
     CheckRoutedF16(nullptr);
     CheckRoutedPair(nullptr);
     CheckMmqKQuants(nullptr);
+    CheckExperimentalDecode(nullptr);
   } catch (const std::exception& e) {
     std::cerr << "qwen35ba3b_moe_ops_test: " << e.what() << "\n";
     return 1;

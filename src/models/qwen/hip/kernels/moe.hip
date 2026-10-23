@@ -55,27 +55,44 @@ __device__ inline float MoeBlockMax(float v, float* shared) {
 /// per token; the first wave runs the k selection rounds. Mirrors the CPU
 /// reference: full-set softmax, lowest-index tie-break, renormalized weights
 /// with the sum floored at 2^-14.
-template<std::uint32_t MaxExperts>
-__global__ void MoeRouterTopKKernel(const float* __restrict__ logits,
-                                    std::uint32_t stride,
-                                    std::int32_t* __restrict__ ids,
-                                    float* __restrict__ weights,
-                                    std::uint32_t n_experts,
-                                    std::uint32_t k) {
+/// Logit read for the top-k body. Coherent reads go around the
+/// non-coherent caches, for logits other blocks of the same grid wrote.
+template<bool Coherent>
+__device__ inline float MoeLoadLogit(const float* p) {
+  if constexpr (Coherent) {
+    auto* bits = reinterpret_cast<unsigned int*>(const_cast<float*>(p));
+    return __uint_as_float(
+        __hip_atomic_load(bits, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT));
+  } else {
+    return *p;
+  }
+}
+
+/// Top-k body shared by the router kernels; the calling block must have at
+/// least one full wave of threads.
+template<std::uint32_t MaxExperts, bool Coherent>
+__device__ void MoeRouterTopKBlock(const float* __restrict__ src,
+                                   std::uint32_t t,
+                                   std::int32_t* __restrict__ ids,
+                                   float* __restrict__ weights,
+                                   std::uint32_t n_experts,
+                                   std::uint32_t k) {
   __shared__ float probs[MaxExperts];
   __shared__ float shared[32];
   __shared__ std::uint32_t chosen[32];
   __shared__ float chosen_p[32];
-  const std::uint32_t t = blockIdx.x;
-  const float* src = logits + static_cast<std::size_t>(t) * stride;
+  for (std::uint32_t e = threadIdx.x; e < n_experts; e += blockDim.x) {
+    probs[e] = MoeLoadLogit<Coherent>(src + e);
+  }
+  __syncthreads();
   float local_max = -INFINITY;
   for (std::uint32_t e = threadIdx.x; e < n_experts; e += blockDim.x) {
-    local_max = fmaxf(local_max, src[e]);
+    local_max = fmaxf(local_max, probs[e]);
   }
   const float max_logit = MoeBlockMax(local_max, shared);
   float local_sum = 0.0F;
   for (std::uint32_t e = threadIdx.x; e < n_experts; e += blockDim.x) {
-    probs[e] = __expf(src[e] - max_logit);
+    probs[e] = __expf(probs[e] - max_logit);
     local_sum += probs[e];
   }
   const float denom = MoeBlockSum(local_sum, shared);
@@ -136,6 +153,19 @@ __global__ void MoeRouterTopKKernel(const float* __restrict__ logits,
       weights[t * k + slot] = chosen_p[slot] / sum;
     }
   }
+}
+
+template<std::uint32_t MaxExperts>
+__global__ void MoeRouterTopKKernel(const float* __restrict__ logits,
+                                    std::uint32_t stride,
+                                    std::int32_t* __restrict__ ids,
+                                    float* __restrict__ weights,
+                                    std::uint32_t n_experts,
+                                    std::uint32_t k) {
+  const std::uint32_t t = blockIdx.x;
+  MoeRouterTopKBlock<MaxExperts, false>(
+      logits + static_cast<std::size_t>(t) * stride, t, ids, weights,
+      n_experts, k);
 }
 
 __device__ inline float MoeSigmoid(float x) {
@@ -297,6 +327,118 @@ __global__ void MoeSlotSwigluGemvKernel(const void* __restrict__ gate_w,
     act[static_cast<std::size_t>(slot) * expert_ff + row] =
         (g / (1.0F + __expf(-g))) * u;
   }
+}
+
+/// Formats MoeWarpRowDot decodes (QuantWarpBlockDot's branches plus the
+/// dense BF16/F32 rows); anything else would silently read as zero.
+bool IsMoeWarpRowDotType(core::GgmlType type) {
+  switch (type) {
+    case core::GgmlType::kF32:
+    case core::GgmlType::kBF16:
+    case core::GgmlType::kQ8_0:
+    case core::GgmlType::kQ8_K:
+    case core::GgmlType::kQ4_K:
+    case core::GgmlType::kQ5_K:
+    case core::GgmlType::kQ6_K:
+    case core::GgmlType::kQ3_K:
+    case core::GgmlType::kIQ4_NL:
+    case core::GgmlType::kIQ4_XS:
+    case core::GgmlType::kIQ3_S:
+      return true;
+    default:
+      return false;
+  }
+}
+
+constexpr std::uint32_t kFusedWaves = 4;
+
+// Experimental (GUFO_EXP_MOE_FUSE=router): router logits, the shared-expert
+// gate logit and top-k in one launch. One wave per output row over
+// n_experts + 1 rows (the last is the shared gate); the last block to finish
+// a token runs top-k on that token's logits and resets its counter, which
+// must start at zero.
+template<std::uint32_t MaxExperts>
+__launch_bounds__(kFusedWaves * kMoeWave) __global__
+    void MoeFusedRouterKernel(const void* __restrict__ router_w,
+                              core::GgmlType router_type,
+                              const void* __restrict__ gate_w,
+                              core::GgmlType gate_type,
+                              const float* __restrict__ x,
+                              float* __restrict__ logits,
+                              float* __restrict__ shared_gate,
+                              std::int32_t* __restrict__ ids,
+                              float* __restrict__ weights,
+                              std::uint32_t* __restrict__ done,
+                              std::uint32_t n_experts, std::uint32_t hidden,
+                              std::uint32_t k) {
+  const std::uint32_t t = blockIdx.y;
+  const std::uint32_t lane = threadIdx.x % kMoeWave;
+  const std::uint32_t row = (blockIdx.x * kFusedWaves) + (threadIdx.x / kMoeWave);
+  const float* x_row = x + static_cast<std::size_t>(t) * hidden;
+  if (row < n_experts) {
+    const float v = MoeWarpRowDot(router_type, router_w, row, x_row, hidden,
+                                  lane);
+    if (lane == 0) {
+      logits[static_cast<std::size_t>(t) * n_experts + row] = v;
+    }
+  } else if (row == n_experts) {
+    const float v = MoeWarpRowDot(gate_type, gate_w, 0, x_row, hidden, lane);
+    if (lane == 0) {
+      shared_gate[t] = v;
+    }
+  }
+  __threadfence();
+  __syncthreads();
+  __shared__ bool last;
+  if (threadIdx.x == 0) {
+    last = atomicAdd(done + t, 1U) == gridDim.x - 1;
+  }
+  __syncthreads();
+  if (!last) {
+    return;
+  }
+  __threadfence();
+  if (threadIdx.x == 0) {
+    done[t] = 0;
+  }
+  MoeRouterTopKBlock<MaxExperts, true>(
+      logits + static_cast<std::size_t>(t) * n_experts, t, ids, weights,
+      n_experts, k);
+}
+
+// Experimental (GUFO_EXP_MOE_FUSE=combine): the shared expert's down
+// projection fused with the MoE combine. One wave per output element:
+// out[t, i] = sum_s(w[t, s] * down_e[t*k + s, i])
+//           + sigmoid(gate[t]) * (W_down[i] . shared_act[t]).
+__launch_bounds__(kFusedWaves * kMoeWave) __global__
+    void MoeSharedDownCombineKernel(const void* __restrict__ down_w,
+                                    core::GgmlType down_type,
+                                    const float* __restrict__ shared_act,
+                                    const float* __restrict__ expert_out,
+                                    const float* __restrict__ weights,
+                                    const float* __restrict__ shared_gate,
+                                    float* __restrict__ out, std::uint32_t k,
+                                    std::uint32_t dim,
+                                    std::uint32_t shared_ff) {
+  const std::uint32_t t = blockIdx.y;
+  const std::uint32_t lane = threadIdx.x % kMoeWave;
+  const std::uint32_t i = (blockIdx.x * kFusedWaves) + (threadIdx.x / kMoeWave);
+  if (i >= dim) {
+    return;
+  }
+  const float shared = MoeWarpRowDot(
+      down_type, down_w, i, shared_act + static_cast<std::size_t>(t) * shared_ff,
+      shared_ff, lane);
+  if (lane != 0) {
+    return;
+  }
+  float acc = 0.0F;
+  const float* rows = expert_out + static_cast<std::size_t>(t) * k * dim + i;
+  for (std::uint32_t s = 0; s < k; ++s) {
+    acc += weights[t * k + s] * rows[static_cast<std::size_t>(s) * dim];
+  }
+  out[static_cast<std::size_t>(t) * dim + i] =
+      acc + (MoeSigmoid(shared_gate[t]) * shared);
 }
 
 constexpr std::uint32_t kMoeGemvWavesPerBlock = 4;
@@ -621,6 +763,48 @@ void LaunchMoeSlotSwigluGemv(const void* gate_w, core::GgmlType gate_type,
   MoeSlotSwigluGemvKernel<<<grid, kMoeGemvWavesPerBlock * kMoeWave, 0,
                             stream>>>(gate_w, gate_type, up_w, up_type, x, ids,
                                       act, expert_ff, hidden, x_token_divisor);
+}
+
+bool LaunchMoeFusedRouter(const void* router_w, core::GgmlType router_type,
+                          const void* gate_w, core::GgmlType gate_type,
+                          const float* x, float* logits, float* shared_gate,
+                          std::int32_t* ids, float* weights,
+                          std::uint32_t* done, std::uint32_t n_tokens,
+                          std::uint32_t n_experts, std::uint32_t hidden,
+                          std::uint32_t n_used, hipStream_t stream) {
+  if (done == nullptr || n_tokens == 0 || n_experts > 1024 || n_used > 32 ||
+      !IsMoeWarpRowDotType(router_type) || !IsMoeWarpRowDotType(gate_type)) {
+    return false;
+  }
+  const dim3 grid((n_experts + 1 + kFusedWaves - 1) / kFusedWaves, n_tokens);
+  constexpr std::uint32_t kThreads = kFusedWaves * kMoeWave;
+  if (n_experts <= 256) {
+    MoeFusedRouterKernel<256><<<grid, kThreads, 0, stream>>>(
+        router_w, router_type, gate_w, gate_type, x, logits, shared_gate, ids,
+        weights, done, n_experts, hidden, n_used);
+  } else {
+    MoeFusedRouterKernel<1024><<<grid, kThreads, 0, stream>>>(
+        router_w, router_type, gate_w, gate_type, x, logits, shared_gate, ids,
+        weights, done, n_experts, hidden, n_used);
+  }
+  return true;
+}
+
+bool LaunchMoeSharedDownCombine(const void* down_w, core::GgmlType down_type,
+                                const float* shared_act,
+                                const float* expert_out, const float* weights,
+                                const float* shared_gate, float* out,
+                                std::uint32_t n_tokens, std::uint32_t n_used,
+                                std::uint32_t dim, std::uint32_t shared_ff,
+                                hipStream_t stream) {
+  if (n_tokens == 0 || !IsMoeWarpRowDotType(down_type)) {
+    return false;
+  }
+  const dim3 grid((dim + kFusedWaves - 1) / kFusedWaves, n_tokens);
+  MoeSharedDownCombineKernel<<<grid, kFusedWaves * kMoeWave, 0, stream>>>(
+      down_w, down_type, shared_act, expert_out, weights, shared_gate, out,
+      n_used, dim, shared_ff);
+  return true;
 }
 
 }  // namespace gufo::hip

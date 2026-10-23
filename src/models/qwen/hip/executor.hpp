@@ -251,6 +251,9 @@ struct QwenMoeScratch {
   std::span<std::int32_t> rows_slot;       // [RoutedRows(slots, experts)]
   std::span<std::int32_t> routed_tiles;    // [RoutedTiles(slots, experts)]
   std::span<std::uint16_t> x_half;         // [batch, hidden] F16
+  // Experimental fused router: per-token block counters, zeroed at
+  // allocation and left zero by every launch.
+  std::span<std::uint32_t> router_done;    // [batch]
 };
 
 /// Row capacity of the routed buckets: each expert pads to 16 rows.
