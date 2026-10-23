@@ -22,17 +22,16 @@ MODEL=path/to/Qwen3.6-35B-A3B-MTP-UD-Q8_K_XL.gguf
 ```
 
 Text-only model; there is no matching `mmproj` projector in scope. In prefill,
-each routed-expert projection picks its route by format: Q8_0 / Q4_K / Q5_K
-take Flash-Next's routed F16 WMMA GEMM (Q4_K / Q5_K gate and up paired for
-chunks of 1024+ tokens when they share a format and the down projection takes
-it too), BF16 the grouped WMMA GEMM, and anything else, including Q6_K, the
-per-slot GEMV. The Q6_K and Q8_0 paths below were measured before the routed
-GEMM moved to upstream's kernel and need re-measuring. Decode runs
-the vendored llama.cpp-derived MMQ vector kernels for Q8_0 / Q4_K / Q5_K
-experts and the per-slot GEMV for the rest (Q6_K, BF16); their device context
-is bound at model load when the config reports an MoE architecture. The
-Q4_K / Q5_K routes cover UD-Q4_K_XL (Q4_K gate/up, Q5_K down, with Q5_K
-gate/up in one layer and Q6_K down in three). On October 8, 2026 that file
+each routed-expert projection picks its route by format: Q8_0 / Q4_K / Q5_K /
+Q6_K take Flash-Next's routed F16 WMMA GEMM, BF16 the grouped WMMA GEMM, and
+anything else the per-slot GEMV. Chunks of 1024+ tokens run gate and up as one
+paired launch when they share a format and the down projection takes the
+routed GEMM too. Decode runs the vendored llama.cpp-derived MMQ vector kernels
+for Q8_0 / Q4_K / Q5_K experts and the per-slot GEMV for the rest (Q6_K,
+BF16); their device context is bound at model load when the config reports an
+MoE architecture. The Q4_K / Q5_K routes cover UD-Q4_K_XL (Q4_K gate/up, Q5_K
+down, with Q5_K gate/up in one layer and Q6_K down in three).
+On October 8, 2026, on the pre-#299 branch, that file
 (21.3 GiB) ran at 3256 t/s for pp2048 and 60.2 t/s for tg128, and at 68.3 t/s
 with a DFlash2 draft; see [Benchmarks](BENCHMARKS.md#qwen36-35b-a3b-ud-q4_k_xl).
 Its MTP head has not been measured yet.
@@ -40,7 +39,7 @@ Its MTP head has not been measured yet.
 | Mode | Selection | Behavior |
 | --- | --- | --- |
 | AR | No speculative option | Target-only generation. |
-| MTP | `--speculative mtp --mtp-model PATH` (`gufo prompt`, `gufo bench`) | Drafts with the GGUF's own MTP head; pass the same file as the target. `--draft-tokens N --min-draft-tokens N` fixes the draft length. Not available through `gufo serve` yet. |
+| MTP | `--speculative mtp --mtp-model PATH` (`gufo prompt`, `gufo bench`, `gufo serve`) | Drafts with the GGUF's own MTP head; pass the same file as the target. `--draft-tokens N` caps the draft, `--min-draft-tokens N` sets its floor. In `gufo serve`, `--mtp-prime-chunk N` sets the rows per batched prompt-prime slice (default 1024; 0 restores the per-token prime). |
 | DFlash2 | `--speculative dflash2 --dflash-model PATH` (`gufo prompt`, `gufo bench`, `gufo serve`) | Block-diffusion draft converted to GGUF (below); it taps 8 target layers. `--draft-tokens N` caps proposals, `--draft-policy fixed` fixes them. |
 
 ### Speculative decoding (MTP)
@@ -55,6 +54,13 @@ In the September 26, 2026 sweep n=2 was fastest for both quants: tg128
 68.39 t/s on UD-Q6_K_XL and 65.01 t/s on UD-Q8_K_XL, versus 54.02 and 51.59
 without MTP (+26%). An earlier UD-Q8_K_XL run favoured n=1, and acceptance
 depends on the generated text, so re-check n on your own workload.
+
+As in Qwen3.8 Flash-Next, each MTP draft token scores only the first 98,304
+output rows plus a per-request table of 1,024 output rows (about 2–4 MB per
+session, depending on the head's quant): the special tokens and the request's
+own rarer tokens. A request that keeps bringing new rare tokens drafts over the
+full head. Only proposals change; the target still verifies over the full
+vocabulary.
 
 ### Speculative decoding (DFlash2)
 
@@ -87,36 +93,47 @@ agree with each other, but verifying a batch of tokens takes a different
 MoE numeric route than single-token decode, so near-tied tokens can flip late
 in a long answer. The Qwen3.8 27B keeps that contract; this model does not yet.
 
-### Serving with DFlash2
+### Serving
 
 ```sh
 ./result/bin/gufo serve --sessions 4 llm --model "$MODEL" --context 262144 \
   --speculative dflash2 --dflash-model Qwen3.6-35B-A3B-DFlash2-Q8_0.gguf \
-  --draft-tokens 7 --draft-policy adaptive --prefill-chunk 1024
+  --draft-tokens 7 --draft-policy adaptive \
+  --prefill-chunk 2048 --prefill-decode-rounds 8
 ```
+
+For MTP, replace the draft arguments with
+`--speculative mtp --mtp-model "$MODEL" --draft-tokens 2`.
 
 Concurrent requests share one batched verification step. Each extra row reads
 mostly different experts, so a step costs close to one decode step per
-stacked row; the server therefore shortens drafts as more requests are active
-(3 draft tokens at 2 requests, 2 at 3, 1 at 4 or more) and a lone request
-keeps the full draft. Prefill is not batched across sessions: requests take
-turns, and while other sessions decode, a prompt is prefilled in
-`--prefill-chunk` token slices. 1024 cut a 6.5K-token prompt's time to first
-token by ~20% against the 512 default, at the cost of a ~0.5 s pause for the
-streaming sessions. Each session holds its own KV/SSM state: at context
-262144, one session used 38.7 GiB of device memory in total and four 59.7 GiB.
-See [Benchmarks](BENCHMARKS.md#serving-with-dflash2).
+stacked row; the server therefore shortens DFlash2 drafts as more requests are
+active (2 draft tokens at 2 requests, 1 at 3 or more) and a lone request keeps
+the full draft. MTP takes the same batched step, with the sessions' drafts
+proposed in one batch, and keeps 1 draft token at 2 requests and none at 3 or
+more, where one draft token no longer pays for its row; there it decodes within
+3% of the plain rate, the cost of keeping each session's draft context current.
+
+Prefill is not batched across sessions: requests take turns, and while other
+sessions decode, a prompt is prefilled in `--prefill-chunk` token slices.
+`--prefill-decode-rounds N` gives the decoding sessions N rounds between two
+slices, so a larger chunk does not lengthen their stalls in proportion. Each
+session holds its own KV/SSM state: at context 262144, one session used
+38.7 GiB of device memory in total and four 59.7 GiB. On this hardware DFlash2
+decodes faster than MTP at most depths and under concurrency, while MTP
+prefills short and medium prompts slightly faster; see
+[Benchmarks](BENCHMARKS.md#serving).
 
 Thinking/template controls and HTTP sampling defaults are described in
 [the server guide](../../SERVER.md#reasoning-controls).
 
 ## Scope
 
-- Quantized MoE expert GEMM (Q8_0 / Q5_K / Q4_K routed, Q6_K per-slot) and the fused gate/up/down expert
+- Quantized MoE expert GEMM (Q8_0 / Q6_K / Q5_K / Q4_K) and the fused gate/up/down expert
   path; dense attention and GDN layers are shared with the other Qwen runners.
-- No vision, no audio. Speculative decoding is MTP or a converted DFlash2
-  draft. `gufo serve` runs DFlash2; it rejects MTP for this architecture (it
-  wires MTP for Flash-Next only), so MTP is `gufo prompt` / `gufo bench` only.
+- No vision, no audio. Speculative decoding is MTP (the GGUF's own head) or a
+  converted DFlash2 draft; both run in `gufo prompt`, `gufo bench` and
+  `gufo serve`.
 - The prefill attention kernel is compiled only for head shapes listed in
   `detail/attention_policy.hpp`; unsupported shapes fall back to the baseline
   path (see [Experiments](EXPERIMENTS.md)).

@@ -251,6 +251,9 @@ struct QwenMoeScratch {
   std::span<std::int32_t> rows_slot;       // [RoutedRows(slots, experts)]
   std::span<std::int32_t> routed_tiles;    // [RoutedTiles(slots, experts)]
   std::span<std::uint16_t> x_half;         // [batch, hidden] F16
+  // The FFN or GDN pre-layer norm output as BF16 [hidden / 64][batch][64],
+  // read by the router and the stacked alpha/beta GEMMs.
+  std::span<std::uint16_t> x_bf16_tiled;
   // Experimental fused router: per-token block counters, zeroed at
   // allocation and left zero by every launch. They sit at the start of the
   // block with a fixed capacity, because the other spans move with the batch
@@ -322,6 +325,8 @@ template<typename T>
 /// Preallocated, zero-allocation GPU execution arena on gfx1151.
 class QwenGpuArena {
 public:
+  /// Most prompt tokens one prefill chunk processes.
+  static constexpr std::uint32_t kMaxPromptBatch = 4096;
   explicit QwenGpuArena(
       const core::ModelConfig& config, std::uint32_t max_context = 4096,
       QwenExecutionPolicy policy = QwenExecutionPolicy::Production());
@@ -680,6 +685,11 @@ private:
       const sampling::SamplerState& sampler);
 
   [[nodiscard]] tokenization::TokenId ForwardPromptChunk(
+      std::span<const tokenization::TokenId> prompt_tokens,
+      std::uint32_t start_pos, bool compute_logits);
+  /// Prompt chunks up to this many tokens run on the verification forward.
+  static constexpr std::size_t kSmallPromptChunkRows = 8;
+  [[nodiscard]] tokenization::TokenId ForwardSmallPromptChunk(
       std::span<const tokenization::TokenId> prompt_tokens,
       std::uint32_t start_pos, bool compute_logits);
   [[nodiscard]] std::vector<tokenization::TokenId>

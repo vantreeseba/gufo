@@ -6,6 +6,9 @@
 extern "C" {
 int qfn_mmq_init(int device);
 
+// Frees the scratch arena of a stream about to be destroyed (waits for its queued work).
+void qfn_mmq_release_stream(hipStream_t stream);
+
 void qfn_mmq_set_routed_max_expert_rows(int rows);
 
 void qfn_mmq_set_routed_tile_cols(int cols);
@@ -68,9 +71,26 @@ int qfn_mmq_build_ids_maps(
         int n_experts, int n_tokens, int n_expert_used, int nchannels_y, int si1, int sis1, hipStream_t stream);
 
 int qfn_mmq_q8_0_moe_raw(
-    const void * W, const float * X_f32, const int32_t * ids, float * out,
+    const void * W, const float * X, const int32_t * ids, float * out,
     int M, int K, int n_tokens, int n_experts, int n_expert_used,
     hipStream_t stream);
+
+// Paired variant sharing one activation quantization; both weights use the
+// same shape and routing, and both outputs are [n_tokens*n_expert_used][M].
+int qfn_mmq_q8_0_moe_pair(
+    const void * W_a, const void * W_b, const float * X, const int32_t * ids,
+    float * out_a, float * out_b, int M, int K, int n_tokens, int n_experts,
+    int n_expert_used, hipStream_t stream);
+
+int qfn_mmq_q6_K_moe_raw(
+    const void * W, const float * X, const int32_t * ids, float * out,
+    int M, int K, int n_tokens, int n_experts, int n_expert_used,
+    hipStream_t stream);
+
+int qfn_mmq_q6_K_moe_pair(
+    const void * W_a, const void * W_b, const float * X, const int32_t * ids,
+    float * out_a, float * out_b, int M, int K, int n_tokens, int n_experts,
+    int n_expert_used, hipStream_t stream);
 
 int qfn_mmq_q4_K_moe_raw(
     const void * W, const float * X_f32, const int32_t * ids, float * out,

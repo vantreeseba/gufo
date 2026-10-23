@@ -12,7 +12,7 @@ namespace gufo::hip::detail {
 // Split-K fp16 attention partials for verification rows > 1, packaged as
 // three wave64 per pair of KV heads. Requires num_heads == 6 * num_kv_heads,
 // an even num_kv_heads and head_dim 256. Writes the scratch layout of
-// QwenDecodeSplitKAttentionHalfPartialsKernel<6, 16> with the same
+// QwenDecodeSplitKAttentionHalfPartialsKernel<true, 16> with the same
 // per-head arithmetic, so QwenDecodeSplitKAttentionReduceKernel follows.
 void LaunchVerifySplitKAttentionHalfPartialsWave64(
     const float* q, const __half* k_cache, const __half* v_cache,

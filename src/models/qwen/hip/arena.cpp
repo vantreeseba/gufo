@@ -9,6 +9,7 @@
 #include <type_traits>
 #include <utility>
 
+#include "qfn_mmq.h"
 #include "src/core/hip/hip_utils.hpp"
 #include "src/core/hip/snapshot_transfer.hpp"
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
@@ -18,7 +19,6 @@
 namespace gufo::hip {
 namespace {
 
-constexpr std::uint32_t kMaxPromptBatch = 4096;
 /// Target hidden-layer taps a DFlash2 draft may request: the Qwen3.8 27B draft
 /// uses 5, the Qwen3.6 35B-A3B draft 8. Each tap costs one hidden row.
 constexpr std::size_t kMaxTargetLayerTaps = 16;
@@ -79,12 +79,14 @@ std::size_t MoeScratchBytes(const core::ModelConfig& config,
   total = CheckedSum(total, ints(RoutedRows(slots, experts)));
   total = CheckedSum(total, ints(RoutedRows(slots, experts)));
   total = CheckedSum(total, ints(RoutedTiles(slots, experts)));
-  total = CheckedSum(
-      total,
-      ((CheckedMultiply(CheckedMultiply(batch, hidden), sizeof(std::uint16_t)) +
-        255) /
-       256) *
-          256);
+  // x_half and x_bf16_tiled.
+  for (int i = 0; i < 2; ++i) {
+    total = CheckedSum(total, ((CheckedMultiply(CheckedMultiply(batch, hidden),
+                                                sizeof(std::uint16_t)) +
+                                255) /
+                               256) *
+                                  256);
+  }
   return total;
 }
 
@@ -135,6 +137,9 @@ QwenMoeScratch CarveMoeScratch(std::uint8_t* block,
   scratch.rows_slot = take_ints(RoutedRows(slots, experts));
   scratch.routed_tiles = take_ints(RoutedTiles(slots, experts));
   scratch.x_half = std::span<std::uint16_t>(
+      reinterpret_cast<std::uint16_t*>(block + offset), batch * hidden);
+  offset += ((batch * hidden * sizeof(std::uint16_t) + 255) / 256) * 256;
+  scratch.x_bf16_tiled = std::span<std::uint16_t>(
       reinterpret_cast<std::uint16_t*>(block + offset), batch * hidden);
   offset += ((batch * hidden * sizeof(std::uint16_t) + 255) / 256) * 256;
   return scratch;
@@ -441,7 +446,8 @@ QwenGpuMemoryUsage QwenGpuArena::EstimateMemoryUsage(
     const core::ModelConfig& config, std::uint32_t max_context,
     QwenExecutionPolicy policy) {
   const std::size_t context = std::max(max_context, 1U);
-  const std::size_t batch = std::min<std::size_t>(context, kMaxPromptBatch);
+  const std::size_t batch =
+      std::min<std::size_t>(context, QwenGpuArena::kMaxPromptBatch);
   const std::size_t hidden = config.hidden_size;
   const std::size_t intermediate = config.intermediate_size;
   const std::size_t attention = config.AttentionSize();
@@ -1061,12 +1067,12 @@ QwenGpuArena::QwenGpuArena(QwenGpuArena&& other) noexcept
   d_scratch_q8_act = other.d_scratch_q8_act;
   d_split_k_attention = other.d_split_k_attention;
   d_weights_bf16 = other.d_weights_bf16;
-  d_moe_scratch = other.d_moe_scratch;
   d_ssm_conv_buffers_ = other.d_ssm_conv_buffers_;
   d_ssm_deltanet_buffers_ = other.d_ssm_deltanet_buffers_;
   live_recurrent_ = other.live_recurrent_;
   saved_recurrent_ = other.saved_recurrent_;
   source_recurrent_ = other.source_recurrent_;
+  d_moe_scratch = other.d_moe_scratch;
   d_ssm_replay_qkv_ = other.d_ssm_replay_qkv_;
   d_ssm_replay_alpha_ = other.d_ssm_replay_alpha_;
   d_ssm_replay_beta_ = other.d_ssm_replay_beta_;
@@ -1108,12 +1114,12 @@ QwenGpuArena::QwenGpuArena(QwenGpuArena&& other) noexcept
   other.d_scratch_q8_act = nullptr;
   other.d_split_k_attention = nullptr;
   other.d_weights_bf16 = nullptr;
-  other.d_moe_scratch = nullptr;
   other.d_ssm_conv_buffers_ = {};
   other.d_ssm_deltanet_buffers_ = {};
   other.live_recurrent_ = 0;
   other.saved_recurrent_ = 0;
   other.source_recurrent_ = 0;
+  other.d_moe_scratch = nullptr;
   other.d_ssm_replay_qkv_ = nullptr;
   other.d_ssm_replay_alpha_ = nullptr;
   other.d_ssm_replay_beta_ = nullptr;
@@ -1165,12 +1171,12 @@ QwenGpuArena& QwenGpuArena::operator=(QwenGpuArena&& other) noexcept {
     d_scratch_q8_act = other.d_scratch_q8_act;
     d_split_k_attention = other.d_split_k_attention;
     d_weights_bf16 = other.d_weights_bf16;
-    d_moe_scratch = other.d_moe_scratch;
     d_ssm_conv_buffers_ = other.d_ssm_conv_buffers_;
     d_ssm_deltanet_buffers_ = other.d_ssm_deltanet_buffers_;
     live_recurrent_ = other.live_recurrent_;
     saved_recurrent_ = other.saved_recurrent_;
     source_recurrent_ = other.source_recurrent_;
+    d_moe_scratch = other.d_moe_scratch;
     d_ssm_replay_qkv_ = other.d_ssm_replay_qkv_;
     d_ssm_replay_alpha_ = other.d_ssm_replay_alpha_;
     d_ssm_replay_beta_ = other.d_ssm_replay_beta_;
@@ -1212,12 +1218,12 @@ QwenGpuArena& QwenGpuArena::operator=(QwenGpuArena&& other) noexcept {
     other.d_scratch_q8_act = nullptr;
     other.d_split_k_attention = nullptr;
     other.d_weights_bf16 = nullptr;
-    other.d_moe_scratch = nullptr;
     other.d_ssm_conv_buffers_ = {};
     other.d_ssm_deltanet_buffers_ = {};
     other.live_recurrent_ = 0;
     other.saved_recurrent_ = 0;
     other.source_recurrent_ = 0;
+    other.d_moe_scratch = nullptr;
     other.d_ssm_replay_qkv_ = nullptr;
     other.d_ssm_replay_alpha_ = nullptr;
     other.d_ssm_replay_beta_ = nullptr;
@@ -1343,8 +1349,11 @@ void QwenGpuArena::FreeAll() noexcept {
   if (hipblas_handle != nullptr)
     LogCleanupError(hipblasDestroy(hipblas_handle));
   hipblaslt_gemm.reset();
-  if (stream != nullptr)
+  if (stream != nullptr) {
+    // Free the routed-expert MMQ scratch this stream may own (gufo-org#707).
+    qfn_mmq_release_stream(stream);
     LogCleanupError(hipStreamDestroy(stream));
+  }
 
   d_hidden = nullptr;
   d_normed = nullptr;
@@ -1379,6 +1388,7 @@ void QwenGpuArena::FreeAll() noexcept {
   live_recurrent_ = 0;
   saved_recurrent_ = 0;
   source_recurrent_ = 0;
+  d_moe_scratch = nullptr;
   d_ssm_replay_qkv_ = nullptr;
   d_ssm_replay_alpha_ = nullptr;
   d_ssm_replay_beta_ = nullptr;

@@ -510,6 +510,49 @@ void CheckGroupedBf16(hipStream_t stream) {
   std::cout << "grouped BF16 experts: OK\n";
 }
 
+/// The tiled-activation GEMM must reproduce LaunchBf16WmmaGemm bit for bit:
+/// the same BF16 operands in the same WMMA chain, only a different layout.
+void CheckDenseBf16Tiled(hipStream_t stream) {
+  constexpr std::size_t kK = 2048;
+  for (const std::size_t m : {256U, 64U, 192U}) {
+    std::vector<std::uint16_t> w(m * kK);
+    for (auto& v : w) {
+      v = FloatToBf16Bits(RndFloat(-0.05F, 0.05F));
+    }
+    gufo::test::DeviceBuffer<std::uint16_t> d_w(w);
+    for (const std::uint32_t rows : {1U, 100U, 129U, 512U, 4096U}) {
+      std::vector<float> x(rows * kK);
+      for (auto& v : x) {
+        v = RndFloat(-1.0F, 1.0F);
+      }
+      std::vector<std::uint16_t> x_tiled(rows * kK);
+      for (std::size_t r = 0; r < rows; ++r) {
+        for (std::size_t c = 0; c < kK; ++c) {
+          x_tiled[((((c / 64) * rows) + r) * 64) + (c % 64)] =
+              FloatToBf16Bits(x[(r * kK) + c]);
+        }
+      }
+      gufo::test::DeviceBuffer<float> d_x(x);
+      gufo::test::DeviceBuffer<std::uint16_t> d_x_tiled(x_tiled);
+      const std::vector<float> nan_fill(
+          rows * m, std::numeric_limits<float>::quiet_NaN());
+      gufo::test::DeviceBuffer<float> d_ref(nan_fill);
+      gufo::test::DeviceBuffer<float> d_got(nan_fill);
+      gufo::hip::LaunchBf16WmmaGemm(d_w.data(), d_x.data(), d_ref.data(), rows,
+                                    m, kK, stream);
+      gufo::hip::LaunchBf16WmmaGemmTiled(d_w.data(), d_x_tiled.data(),
+                                         d_got.data(), rows, m, kK, stream);
+      HIP_CHECK(hipStreamSynchronize(stream));
+      const auto ref = d_ref.CopyToHost();
+      const auto got = d_got.CopyToHost();
+      Expect(
+          std::memcmp(ref.data(), got.data(), ref.size() * sizeof(float)) == 0,
+          "tiled BF16 WMMA GEMM differs from LaunchBf16WmmaGemm");
+    }
+  }
+  std::cout << "tiled dense BF16 WMMA: OK\n";
+}
+
 /// Dense mode of the same WMMA kernel (BF16 dense projections in prefill),
 /// against the per-slot GEMV with every row routed to one matrix.
 void CheckDenseBf16(hipStream_t stream) {
@@ -561,6 +604,26 @@ void CheckDenseBf16(hipStream_t stream) {
   std::cout << "dense BF16 WMMA: OK\n";
 }
 
+/// Random block_q6_K payload for `rows` x `cols`: arbitrary codes, int8
+/// sub-block scales and a small F16 superblock scale.
+std::vector<std::uint8_t> RandomQ6K(std::size_t rows, std::size_t cols) {
+  constexpr std::size_t kBlockBytes = 210;
+  std::vector<std::uint8_t> out(rows * (cols / 256) * kBlockBytes);
+  for (std::size_t b = 0; b < out.size() / kBlockBytes; ++b) {
+    std::uint8_t* blk = out.data() + (b * kBlockBytes);
+    for (std::size_t i = 0; i < 192; ++i) {
+      blk[i] = static_cast<std::uint8_t>(Rnd() & 0xFFU);
+    }
+    for (std::size_t i = 192; i < 208; ++i) {
+      blk[i] = static_cast<std::uint8_t>(
+          static_cast<std::int8_t>(static_cast<int>(Rnd() % 81) - 40));
+    }
+    const std::uint16_t d = FloatToFp16Bits(RndFloat(0.0002F, 0.0012F));
+    std::memcpy(blk + 208, &d, sizeof(d));
+  }
+  return out;
+}
+
 /// Random block_q4_K / block_q5_K payload for `rows` x `cols`: arbitrary
 /// codes and 6-bit sub-block scales/mins, with small F16 superblock scales.
 /// Q5_K carries 32 bytes of high bits ahead of the 128 nibble bytes.
@@ -592,31 +655,13 @@ struct RoutedFormat {
 constexpr RoutedFormat kRoutedFormats[] = {
     {GgmlType::kQ8_0, gufo::models::qwen38_flash_next::rocm::WeightType::kQ8_0,
      "Q8_0"},
+    {GgmlType::kQ6_K, gufo::models::qwen38_flash_next::rocm::WeightType::kQ6_K,
+     "Q6_K"},
     {GgmlType::kQ5_K, gufo::models::qwen38_flash_next::rocm::WeightType::kQ5_K,
      "Q5_K"},
     {GgmlType::kQ4_K, gufo::models::qwen38_flash_next::rocm::WeightType::kQ4_K,
      "Q4_K"},
 };
-
-/// Random block_q6_K payload for `rows` x `cols`: arbitrary codes, int8
-/// sub-block scales and a small F16 superblock scale.
-std::vector<std::uint8_t> RandomQ6K(std::size_t rows, std::size_t cols) {
-  constexpr std::size_t kBlockBytes = 210;
-  std::vector<std::uint8_t> out(rows * (cols / 256) * kBlockBytes);
-  for (std::size_t b = 0; b < out.size() / kBlockBytes; ++b) {
-    std::uint8_t* blk = out.data() + (b * kBlockBytes);
-    for (std::size_t i = 0; i < 192; ++i) {
-      blk[i] = static_cast<std::uint8_t>(Rnd() & 0xFFU);
-    }
-    for (std::size_t i = 192; i < 208; ++i) {
-      blk[i] = static_cast<std::uint8_t>(
-          static_cast<std::int8_t>(static_cast<int>(Rnd() % 81) - 40));
-    }
-    const std::uint16_t d = FloatToFp16Bits(RndFloat(0.0002F, 0.0012F));
-    std::memcpy(blk + 208, &d, sizeof(d));
-  }
-  return out;
-}
 
 /// Random expert weights `rows` x `cols` in `type`.
 std::vector<std::uint8_t> RandomExpertWeights(GgmlType type, std::size_t rows,
@@ -785,10 +830,6 @@ void CheckRoutedPair(hipStream_t stream) {
   constexpr std::size_t kM = 512;
   constexpr std::size_t kK = 2048;
   for (const RoutedFormat& format : kRoutedFormats) {
-    // Flash-Next pairs only its K-quant formats.
-    if (format.type != GgmlType::kQ4_K && format.type != GgmlType::kQ5_K) {
-      continue;
-    }
     const GgmlType type = format.type;
     const auto weight_type = format.weight_type;
     const char* type_name = format.name;
@@ -1236,6 +1277,7 @@ int main() {
     CheckDecodeMoe(f, nullptr, /*force_fallback=*/true);
     CheckGroupedBf16(nullptr);
     CheckDenseBf16(nullptr);
+    CheckDenseBf16Tiled(nullptr);
     CheckRoutedF16(nullptr);
     CheckRoutedPair(nullptr);
     CheckMmqKQuants(nullptr);

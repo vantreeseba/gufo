@@ -16,7 +16,7 @@ namespace {
 // Verification rows > 1 in wave64: two KV heads, twelve query heads of
 // sixteen lanes, four heads per wave, 192 threads per block. The per-head
 // arithmetic and scratch layout are SplitKAttentionHead's, as in
-// QwenDecodeSplitKAttentionHalfPartialsKernel<6, 16>; the score tree
+// QwenDecodeSplitKAttentionHalfPartialsKernel<true, 16>; the score tree
 // runs on DPP row exchanges because a 16-lane head is one DPP row.
 __launch_bounds__(192) __global__
     void QwenVerifySplitKAttentionHalfPartialsWave64Kernel(
