@@ -10,6 +10,7 @@
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/ops.hpp"
 #include "src/models/qwen/hip/ops/moe.hpp"
+#include "src/models/qwen/hip/ops/moe_wave64.hpp"
 #include "src/models/qwen/modules/modules.hpp"
 #include "src/models/qwen/modules/moe.hpp"
 
@@ -17,37 +18,62 @@ namespace gufo::hip {
 
 /// Single-token routed MoE FFN (qwen35moe): router + top-k, routed experts
 /// (MMQ Q8_0 kernels where possible, per-slot GEMV fallback otherwise),
-/// sigmoid-gated shared expert, weighted combine into `out`.
+/// sigmoid-gated shared expert, weighted combine into `out`. The
+/// GUFO_EXP_MOE_* switches (detail/moe_experiments.hpp) select experimental
+/// routes; each falls back to the default when it does not cover the layer.
 void ExecuteMoeDecodeStep(hipStream_t stream, const QwenMoeScratch& moe,
                           const models::QwenLayerWeights& layer,
                           const core::ModelConfig& config, const float* x,
                           float* out) {
   const auto view = models::qwen::MakeMoeView(layer, config);
+  const auto& experiments = detail::GetMoeDecodeExperiments();
   const std::size_t hidden = config.hidden_size;
   const std::uint32_t n_experts = config.expert_count;
   const std::uint32_t n_used = config.expert_used_count;
   const std::size_t expert_ff = config.expert_ff_length;
   const std::size_t shared_ff = config.expert_shared_ff_length;
 
-  LaunchGEMV(view.router.data, view.router.type, x, moe.router_logits.data(),
-             n_experts, hidden, stream);
-  LaunchGEMV(view.shexp_gate_inp.data, view.shexp_gate_inp.type, x,
-             moe.shexp_gate.data(), 1, hidden, stream);
-  LaunchMoeRouterTopK(moe.router_logits.data(), n_experts, moe.ids.data(),
-                      moe.weights.data(), 1, n_experts, n_used, stream);
+  const bool fused_router =
+      experiments.fuse_router &&
+      LaunchMoeFusedRouter(
+          view.router.data, view.router.type, view.shexp_gate_inp.data,
+          view.shexp_gate_inp.type, x, moe.router_logits.data(),
+          moe.shexp_gate.data(), moe.ids.data(), moe.weights.data(),
+          moe.router_done.data(), 1, n_experts,
+          static_cast<std::uint32_t>(hidden), n_used, stream);
+  if (!fused_router) {
+    LaunchGEMV(view.router.data, view.router.type, x, moe.router_logits.data(),
+               n_experts, hidden, stream);
+    LaunchGEMV(view.shexp_gate_inp.data, view.shexp_gate_inp.type, x,
+               moe.shexp_gate.data(), 1, hidden, stream);
+    LaunchMoeRouterTopK(moe.router_logits.data(), n_experts, moe.ids.data(),
+                        moe.weights.data(), 1, n_experts, n_used, stream);
+  }
 
-  // Shared expert: plain dense SwiGLU FFN of width shared_ff.
+  // Shared expert: plain dense SwiGLU FFN of width shared_ff. With the
+  // combine fusion its down projection runs in the final launch instead.
   LaunchFusedSwiGLUGEMV(view.shexp_gate.data, view.shexp_gate.type,
                         view.shexp_up.data, view.shexp_up.type, x,
                         moe.shexp_act.data(), shared_ff, hidden, stream);
-  LaunchGEMV(view.shexp_down.data, view.shexp_down.type, moe.shexp_act.data(),
-             moe.shexp_out.data(), hidden, shared_ff, stream);
+  if (!experiments.fuse_combine) {
+    LaunchGEMV(view.shexp_down.data, view.shexp_down.type,
+               moe.shexp_act.data(), moe.shexp_out.data(), hidden, shared_ff,
+               stream);
+  }
 
   // Routed experts. The MMQ gated kernel fuses gate+up+SwiGLU for the formats
   // it covers; anything else takes the per-slot warp GEMV.
+  const bool wave64_gate =
+      experiments.wave64 &&
+      LaunchMoeWave64SwigluGemv(view.gate_exps.data, view.gate_exps.type,
+                                view.up_exps.data, view.up_exps.type, x,
+                                moe.ids.data(), moe.gate_e.data(), expert_ff,
+                                hidden, n_used, n_used, stream);
   const bool mmq_gated = view.gate_exps.type == view.up_exps.type &&
-                         IsMmqMoeVecType(view.gate_exps.type, hidden);
-  if (mmq_gated) {
+                         UseMmqMoeVec(view.gate_exps.type, hidden);
+  if (wave64_gate) {
+    // The wave64 kernel already wrote act; the defaults below are skipped.
+  } else if (mmq_gated) {
     if (qfn_mmq_moe_gated_vec(
             static_cast<int>(view.gate_exps.type), view.gate_exps.data,
             view.up_exps.data, x, moe.ids.data(), moe.gate_e.data(),
@@ -62,7 +88,14 @@ void ExecuteMoeDecodeStep(hipStream_t stream, const QwenMoeScratch& moe,
                             moe.ids.data(), moe.gate_e.data(), expert_ff,
                             hidden, n_used, n_used, stream);
   }
-  if (IsMmqMoeVecType(view.down_exps.type, expert_ff)) {
+  const bool wave64_down =
+      experiments.wave64 &&
+      LaunchMoeWave64Gemv(view.down_exps.data, view.down_exps.type,
+                          moe.gate_e.data(), moe.ids.data(), moe.down_e.data(),
+                          hidden, expert_ff, n_used, stream);
+  if (wave64_down) {
+    // The wave64 kernel already wrote down_e.
+  } else if (UseMmqMoeVec(view.down_exps.type, expert_ff)) {
     // Each (token, slot) pair carries its own activation row, so the down
     // projection runs as U independent rows with one expert id each.
     if (qfn_mmq_moe_vec(static_cast<int>(view.down_exps.type),
@@ -78,8 +111,23 @@ void ExecuteMoeDecodeStep(hipStream_t stream, const QwenMoeScratch& moe,
                       moe.gate_e.data(), moe.ids.data(), moe.down_e.data(),
                       hidden, expert_ff, n_used, 1, stream);
   }
-  LaunchMoeEpilogue(moe.down_e.data(), moe.weights.data(), moe.shexp_out.data(),
-                    moe.shexp_gate.data(), out, 1, n_used, hidden, stream);
+  const bool fused_combine =
+      experiments.fuse_combine &&
+      LaunchMoeSharedDownCombine(
+          view.shexp_down.data, view.shexp_down.type, moe.shexp_act.data(),
+          moe.down_e.data(), moe.weights.data(), moe.shexp_gate.data(), out, 1,
+          n_used, static_cast<std::uint32_t>(hidden),
+          static_cast<std::uint32_t>(shared_ff), stream);
+  if (!fused_combine) {
+    if (experiments.fuse_combine) {
+      LaunchGEMV(view.shexp_down.data, view.shexp_down.type,
+                 moe.shexp_act.data(), moe.shexp_out.data(), hidden, shared_ff,
+                 stream);
+    }
+    LaunchMoeEpilogue(moe.down_e.data(), moe.weights.data(),
+                      moe.shexp_out.data(), moe.shexp_gate.data(), out, 1,
+                      n_used, hidden, stream);
+  }
 }
 
 void EmitDecodeRouteTelemetry(const models::QwenModelWeights& weights,

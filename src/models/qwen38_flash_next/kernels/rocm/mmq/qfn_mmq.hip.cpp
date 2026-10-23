@@ -358,8 +358,11 @@ static int moe_vector_projection(int weight_type, const void* W,
                                  const void* X_q8 = nullptr) {
   constexpr const char* tag = "qfn_mmq_moe_vec";
   const auto type = static_cast<ggml_type>(weight_type);
+  // Q6_K is experimental (GUFO_EXP_MOE_Q6K_MMVQ): ungated rows, or a
+  // single-token gated row.
   if (type != GGML_TYPE_Q4_K && type != GGML_TYPE_Q5_K &&
-      type != GGML_TYPE_Q5_1 && type != GGML_TYPE_Q8_0) {
+      type != GGML_TYPE_Q5_1 && type != GGML_TYPE_Q8_0 &&
+      type != GGML_TYPE_Q6_K) {
     fprintf(stderr, "%s: unsupported weight type %d\n", tag, weight_type);
     return -1;
   }
@@ -388,8 +391,9 @@ static int moe_vector_projection(int weight_type, const void* W,
                                  ? MMVQ_MAX_ROUTED_BATCH
                                  : MMVQ_MAX_BATCH_SIZE;
   if (gated && (n_tokens > max_gated_rows || n_expert_used > 32 ||
+                (type == GGML_TYPE_Q6_K && n_tokens != 1) ||
                 (type != GGML_TYPE_Q4_K && type != GGML_TYPE_Q5_K &&
-                 type != GGML_TYPE_Q8_0))) {
+                 type != GGML_TYPE_Q8_0 && type != GGML_TYPE_Q6_K))) {
     fprintf(stderr,
             "%s: gated vector exceeds its format's row or expert limit\n",
             tag);

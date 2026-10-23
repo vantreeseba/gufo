@@ -300,6 +300,10 @@ void QwenMtpGpuExecutor::Allocate() {
   if (config.IsMoE()) {
     const std::size_t moe_bytes = MoeScratchBytes(config, 1);
     d_moe_ = static_cast<std::uint8_t*>(detail::AllocateDevice(moe_bytes));
+    // The fused router's counters must start at zero.
+    if (hipMemset(d_moe_, 0, moe_bytes) != hipSuccess) {
+      throw std::runtime_error("MTP MoE scratch clear failed");
+    }
     moe_ = CarveMoeScratch(d_moe_, config, 1);
     scratch_bytes_ += moe_bytes;
   } else {

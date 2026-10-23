@@ -5,6 +5,7 @@
 #include <cstdint>
 
 #include "src/core/gguf_reader.hpp"
+#include "src/models/qwen/hip/detail/moe_experiments.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime.h>
@@ -27,6 +28,26 @@ void LaunchMoeEpilogue(const float* expert_out, const float* weights,
                        float* out, std::uint32_t n_tokens, std::uint32_t n_used,
                        std::uint32_t dim, hipStream_t stream = nullptr);
 
+/// Experimental (GUFO_EXP_MOE_FUSE=router): router logits, the shared-expert
+/// gate logit and LaunchMoeRouterTopK in one launch. `done` holds one counter
+/// per token and must be zero before the first launch; the kernel leaves it
+/// zero. Returns false, launching nothing, for unsupported formats or shapes.
+[[nodiscard]] bool LaunchMoeFusedRouter(
+    const void* router_w, core::GgmlType router_type, const void* gate_w,
+    core::GgmlType gate_type, const float* x, float* logits,
+    float* shared_gate, std::int32_t* ids, float* weights, std::uint32_t* done,
+    std::uint32_t n_tokens, std::uint32_t n_experts, std::uint32_t hidden,
+    std::uint32_t n_used, hipStream_t stream = nullptr);
+
+/// Experimental (GUFO_EXP_MOE_FUSE=combine): the shared expert's down
+/// projection fused with LaunchMoeEpilogue. Returns false, launching nothing,
+/// when the down projection's format is not covered.
+[[nodiscard]] bool LaunchMoeSharedDownCombine(
+    const void* down_w, core::GgmlType down_type, const float* shared_act,
+    const float* expert_out, const float* weights, const float* shared_gate,
+    float* out, std::uint32_t n_tokens, std::uint32_t n_used, std::uint32_t dim,
+    std::uint32_t shared_ff, hipStream_t stream = nullptr);
+
 /// Whether the MMQ MoE vector kernels (qfn_mmq_moe_vec and, for a gate/up
 /// pair of one format, qfn_mmq_moe_gated_vec) decode `type` with whole weight
 /// blocks over `k` inputs.
@@ -34,6 +55,14 @@ constexpr bool IsMmqMoeVecType(core::GgmlType type, std::size_t k) {
   return (type == core::GgmlType::kQ8_0 && k % 32 == 0) ||
          ((type == core::GgmlType::kQ4_K || type == core::GgmlType::kQ5_K) &&
           k % 256 == 0);
+}
+
+/// IsMmqMoeVecType plus the experimental Q6_K route
+/// (GUFO_EXP_MOE_Q6K_MMVQ). Q6_K's gated vector covers one token only.
+inline bool UseMmqMoeVec(core::GgmlType type, std::size_t k) {
+  return IsMmqMoeVecType(type, k) ||
+         (type == core::GgmlType::kQ6_K && k % 256 == 0 &&
+          detail::GetMoeDecodeExperiments().q6k_mmvq);
 }
 
 /// Routed per-slot GEMV fallback for formats the MMQ MoE kernels do not cover

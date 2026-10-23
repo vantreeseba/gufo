@@ -254,7 +254,15 @@ struct QwenMoeScratch {
   // The FFN or GDN pre-layer norm output as BF16 [hidden / 64][batch][64],
   // read by the router and the stacked alpha/beta GEMMs.
   std::span<std::uint16_t> x_bf16_tiled;
+  // Experimental fused router: per-token block counters, zeroed at
+  // allocation and left zero by every launch. They sit at the start of the
+  // block with a fixed capacity, because the other spans move with the batch
+  // size the view is carved for.
+  std::span<std::uint32_t> router_done;    // [kMoeRouterCounterSlots]
 };
+
+/// Fused-router counter capacity: the most tokens one launch can route.
+inline constexpr std::size_t kMoeRouterCounterSlots = 1024;
 
 /// Row capacity of the routed buckets: each expert pads to 16 rows.
 [[nodiscard]] constexpr std::size_t RoutedRows(std::size_t slots,
