@@ -1345,6 +1345,13 @@ Qwen GGUF weights default to a host copy registered with the device, which
 counts against host RAM. `GUFO_QWEN_WEIGHT_MEMORY=device` uploads them into
 device allocations instead and keeps no host copy; use it when a fixed
 dedicated GPU memory reservation leaves the host short. `host` is the default.
+With `device`, every other GPU allocation also stays in device memory: MTP
+and DFlash2 draft weights, their KV and scratch, and the routed-expert MMQ
+scratch, which otherwise fall back to managed system memory when the device
+heap runs short. A shortfall then fails with an out-of-memory error at load
+or allocation time instead; raise `ttm.pages_limit` (or the BIOS carve-out)
+if it does. Retained cache checkpoints and the DFlash2 prompt-feature capture
+are only copied, not read by kernels, and stay in host RAM.
 With disk caching enabled, `phase=artifact_identity` identifies full-file
 SHA-256 work. Digests are cached against the open file's identity, size and
 modification/change timestamps; unchanged artifacts avoid another scan.

@@ -6,6 +6,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <string_view>
 
 #include "src/core/hip/heap_placement.hpp"
 
@@ -42,12 +44,28 @@ namespace gufo::hip {
   return status;
 }
 
+/// GUFO_QWEN_WEIGHT_MEMORY=device asks for every GPU allocation in device
+/// memory, not only the weights: AllocateDevice then never falls back to
+/// managed (system) memory and reports an out-of-memory error instead.
+/// Read once per process.
+[[nodiscard]] inline bool DeviceMemoryRequired() {
+  static const bool required = [] {
+    const char* value = std::getenv("GUFO_QWEN_WEIGHT_MEMORY");
+    return value != nullptr && std::string_view(value) == "device";
+  }();
+  return required;
+}
+
 /// Session state and scratch. On the gfx1151 APU the device heap is a cap
 /// below physical unified memory (ttm.pages_limit, half of RAM by default)
 /// while managed allocations draw on the whole system pool. Both are the
-/// same DRAM, so kernels see identical memory either way.
+/// same DRAM, so kernels see identical memory either way. Under
+/// DeviceMemoryRequired() the allocation is always hipMalloc.
 [[nodiscard]] inline hipError_t AllocateDevice(void** pointer,
                                                std::size_t bytes) {
+  if (DeviceMemoryRequired()) {
+    return hipMalloc(pointer, bytes);
+  }
   std::size_t free_bytes = 0;
   std::size_t total_bytes = 0;
   if (hipMemGetInfo(&free_bytes, &total_bytes) != hipSuccess ||

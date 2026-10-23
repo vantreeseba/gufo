@@ -40,6 +40,7 @@
 #include "src/core/hip/heap_placement.hpp"
 #include "src/core/hip/hip_utils.hpp"
 #include "src/core/hip/host_allocations.hpp"
+#include "src/core/hip/managed_alloc.hpp"
 #include "src/core/speculative/speculative_verifier.hpp"
 #include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
@@ -3360,8 +3361,11 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     SetError(error, e.what());
     return false;
   }
-  Logger::Info("loader", "event=load_phase phase=target_weights " +
-                             Logger::MemoryStatus());
+  Logger::Info("loader", std::string("event=load_phase phase=target_weights "
+                                      "gpu_memory=") +
+                             (hip::DeviceMemoryRequired() ? "device"
+                                                          : "default") +
+                             " " + Logger::MemoryStatus());
   auto model =
       hip::QwenGpuModel::CreateFromGguf(reader, &load_error, std::move(vision));
   if (model == nullptr) {
