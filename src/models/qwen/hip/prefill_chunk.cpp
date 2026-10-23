@@ -427,10 +427,16 @@ void ExecuteMoePrefillChunk(QwenGpuArena& arena, const QwenMoeScratch& moe,
                                    nullptr, nullptr, down_half, hidden,
                                    expert_ff, stream);
     };
-    if (!(pair ? (down(moe.routed_tiles.data() + n_tiles, n_pair, kPairRows) &&
-                  down(moe.routed_tiles.data() + n_tiles + n_pair, n_narrow,
-                       kNarrowRows))
-               : down(moe.routed_tiles.data(), n_tiles, tile_rows))) {
+    // The unpaired routed GEMM decodes Q4_K/Q5_K only in tiles of up to 48
+    // rows (UD-Q4_K_XL's down projections are Q5_K), so those formats keep
+    // the narrow map even when gate/up was paired.
+    const bool down_wide_tiles = *down_type != routed::WeightType::kQ4_K &&
+                                 *down_type != routed::WeightType::kQ5_K;
+    if (!(pair && down_wide_tiles
+              ? (down(moe.routed_tiles.data() + n_tiles, n_pair, kPairRows) &&
+                 down(moe.routed_tiles.data() + n_tiles + n_pair, n_narrow,
+                      kNarrowRows))
+              : down(moe.routed_tiles.data(), n_tiles, tile_rows))) {
       throw std::runtime_error("routed F16 expert down GEMM failed");
     }
     routed::MoeEpilogueVec4F16(
