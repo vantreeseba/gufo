@@ -2,10 +2,13 @@ name: Publish runtime image
 
 # Builds the upstream gufo-runtime OCI image (gufo-org/toolboxes) with this
 # repository's engine in place of the pinned one, and publishes it to this
-# repository's GitHub Container Registry package.
+# repository's GitHub Container Registry package. Pull requests into the
+# branch run the same build as a HIP compile check and publish nothing.
 
 on:
   push:
+    branches: [ feat/qwen35moe-35b-a3b ]
+  pull_request:
     branches: [ feat/qwen35moe-35b-a3b ]
   workflow_dispatch:
     inputs:
@@ -42,14 +45,18 @@ jobs:
       - name: Build image
         env:
           TOOLBOXES_REF: ${{ inputs.toolboxes-ref || 'main' }}
+          # A pull request's GITHUB_SHA is a merge commit the flake input
+          # cannot fetch; build the head commit instead.
+          ENGINE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           nix run "github:gufo-org/toolboxes/${TOOLBOXES_REF}#stream-gufo-runtime" \
-            --override-input gufo-engine "github:${GITHUB_REPOSITORY}/${GITHUB_SHA}" \
+            --override-input gufo-engine "github:${GITHUB_REPOSITORY}/${ENGINE_SHA}" \
             --no-write-lock-file --print-build-logs \
             | docker load
           df -h /
 
       - name: Push image
+        if: github.event_name != 'pull_request'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |

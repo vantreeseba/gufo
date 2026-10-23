@@ -1,6 +1,7 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <stdexcept>
 #include <thread>
 
@@ -44,10 +45,13 @@ tokenization::TokenId QwenGpuExecutor::ForwardSmallPromptChunk(
   // verification forward reads each weight once per row group instead.
   const auto predictions =
       ForwardDecodeEquivalentVerificationChunk(prompt_tokens, start_pos, false);
-  if (capture_prompt_hidden_)
-    h_prompt_hidden_.insert(h_prompt_hidden_.end(),
-                            h_verification_hidden_.begin(),
-                            h_verification_hidden_.end());
+  if (capture_prompt_hidden_ && !h_verification_hidden_.empty()) {
+    const std::size_t old_size = h_prompt_hidden_.Size();
+    h_prompt_hidden_.Resize(old_size + h_verification_hidden_.size());
+    std::memcpy(h_prompt_hidden_.Data() + old_size,
+                h_verification_hidden_.data(),
+                h_verification_hidden_.size() * sizeof(float));
+  }
   h_verification_hidden_.clear();
   last_verification_rows_ = 0;
   if (!compute_logits)

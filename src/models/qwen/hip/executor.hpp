@@ -66,7 +66,9 @@ struct QwenGpuWeightRegion {
   // Original reader address for tensor offsets; host_copy owns GPU-visible
   // immutable bytes, backed by transparent huge pages when available. With
   // GUFO_QWEN_WEIGHT_MEMORY=device, device_data is instead a device
-  // allocation owned by the region and host_copy stays null.
+  // allocation owned by the region and host_copy stays null; the same
+  // setting keeps every AllocateDevice allocation in device memory
+  // (DeviceMemoryRequired in src/core/hip/managed_alloc.hpp).
   const void* host_data{nullptr};
   void* device_data{nullptr};
   void* host_copy{nullptr};
