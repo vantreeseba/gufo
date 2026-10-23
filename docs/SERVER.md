@@ -250,6 +250,17 @@ Qwen requests retain this checkpoint with thinking enabled or disabled.
 Warm continuations preserve the reused frontier before prefill and save the
 new stable boundary too. A second full-prompt checkpoint enables exact retries
 without prefill; all copies share the same snapshot-memory budget.
+Two optional checkpoint kinds on the component cache (Qwen27B, Qwen3.6 MoE and
+Flash-Next) have their own environment variables. `GUFO_CACHE_RETRY_CHECKPOINTS`
+covers the full-prompt copy for exact retries. `GUFO_CACHE_GRID_CHECKPOINTS`
+covers intermediate prefill checkpoints about every 2048 tokens, which serve
+edits to earlier messages. Each takes `evict` (the default: capture it and evict
+by the usual order), `yield` (capture it only when redundant copies and covered
+history can make room, never another conversation's checkpoint) or `off`. With
+`off`, the full-prompt copy is skipped only when the turn already has an earlier
+checkpoint. Append-only agent loops rarely restore either kind; clients that
+regenerate or edit earlier messages do. An unknown value fails at startup, and
+the startup log reports both as `event=checkpoint_modes`.
 Exact live continuations reuse generated tokens. The server reports cached
 and newly processed tokens separately; resuming from the checkpoint processes
 the short suffix. System instructions, tool definitions and image identities

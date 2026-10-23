@@ -22,6 +22,7 @@
 #include <utility>
 #include <vector>
 
+#include "src/cli/serve/cache_checkpoint_modes.hpp"
 #include "src/core/json.hpp"
 #include "src/models/qwen/control_tokens.hpp"
 #include "src/models/qwen/vision/prompt.hpp"
@@ -2548,7 +2549,37 @@ void TestServerInstructionsAreFraming() {
 
 }  // namespace
 
+void TestCacheCheckpointModes() {
+  using gufo::server::CacheCheckpointMode;
+  using gufo::server::MaxVictimRank;
+  using gufo::server::ParseCacheCheckpointMode;
+  Expect(ParseCacheCheckpointMode("X", nullptr) == CacheCheckpointMode::kEvict,
+         "unset checkpoint mode should keep eviction");
+  Expect(ParseCacheCheckpointMode("X", "") == CacheCheckpointMode::kEvict,
+         "empty checkpoint mode should keep eviction");
+  Expect(ParseCacheCheckpointMode("X", "evict") == CacheCheckpointMode::kEvict,
+         "evict checkpoint mode should parse");
+  Expect(ParseCacheCheckpointMode("X", "yield") == CacheCheckpointMode::kYield,
+         "yield checkpoint mode should parse");
+  Expect(ParseCacheCheckpointMode("X", "off") == CacheCheckpointMode::kOff,
+         "off checkpoint mode should parse");
+  bool rejected = false;
+  try {
+    (void)ParseCacheCheckpointMode("GUFO_CACHE_GRID_CHECKPOINTS", "Off");
+  } catch (const std::invalid_argument& error) {
+    rejected = std::string_view(error.what())
+                   .starts_with("GUFO_CACHE_GRID_CHECKPOINTS");
+  }
+  Expect(rejected, "unknown checkpoint mode should name its variable");
+  Expect(MaxVictimRank(CacheCheckpointMode::kYield) == 1u,
+         "yield should evict only redundant copies and covered history");
+  Expect(!MaxVictimRank(CacheCheckpointMode::kEvict) &&
+             !MaxVictimRank(CacheCheckpointMode::kOff),
+         "evict and off should keep the usual eviction order");
+}
+
 int main() {
+  TestCacheCheckpointModes();
   TestPromptCountingValidatesCapabilitiesBeforeInference();
   TestServerInstructionsAreFraming();
   TestPreparedConstraintVocabularyKeepsGrammarBehavior();

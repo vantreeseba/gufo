@@ -14,6 +14,7 @@
 
 #include "src/cache/disk_catalog.hpp"
 #include "src/cache/retention.hpp"
+#include "src/cli/serve/cache_checkpoint_modes.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
 #include "src/core/crypto/sha256.hpp"
@@ -687,7 +688,13 @@ struct ComponentTextCache::Lease::Impl {
         .protected_checkpoints =
             std::span(edit_boundaries).first(edit_boundary_count),
         .reused = cached != 0,
-        .reused_tokens = cached};
+        .reused_tokens = cached,
+        .max_victim_rank =
+            MaxVictimRank(purpose == SnapshotPurpose::kHistory
+                              ? CacheCheckpointModesFromEnv().grid
+                          : purpose == SnapshotPurpose::kRetry
+                              ? CacheCheckpointModesFromEnv().retry
+                              : CacheCheckpointMode::kEvict)};
   }
   std::unique_ptr<TextRunnerSnapshot> CaptureDurable();
 };
@@ -928,7 +935,18 @@ ComponentTextCache::ComponentTextCache(
     std::size_t ceiling)
     : impl_(std::make_unique<Impl>(std::move(runner), count, ram,
                                    std::max(ram, ceiling), disk,
-                                   automatic_ram)) {}
+                                   automatic_ram)) {
+  // Fail at startup on an unknown value rather than on the first capture.
+  const auto& modes = CacheCheckpointModesFromEnv();
+  const auto name = [](CacheCheckpointMode mode) {
+    return mode == CacheCheckpointMode::kYield ? "yield"
+           : mode == CacheCheckpointMode::kOff ? "off"
+                                               : "evict";
+  };
+  Logger::Info("cache", std::string("schema=component-cache-v1 "
+                                    "event=checkpoint_modes grid=") +
+                            name(modes.grid) + " retry=" + name(modes.retry));
+}
 ComponentTextCache::~ComponentTextCache() = default;
 std::size_t ComponentTextCache::capacity() const noexcept {
   return impl_->entries.size();
@@ -1743,7 +1761,7 @@ std::vector<std::size_t> ComponentTextCache::Lease::PlannedCaptures(
        impl_->cached,
        stable,
        0,
-       true,
+       CacheCheckpointModesFromEnv().grid != CacheCheckpointMode::kOff,
        false,
        {},
        cache::GridLimit(impl_->cache->budget, private_bytes)});

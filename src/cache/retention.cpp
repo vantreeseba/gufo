@@ -382,6 +382,8 @@ std::size_t RetentionPolicy::Victim(const RetentionRequest& r,
             r.protected_checkpoints.end())
       return false;
     const auto level = priority(i);
+    if (r.max_victim_rank && level > *r.max_victim_rank)
+      return false;
     if (level <= maximum)
       return true;
     const auto& checkpoint = *records_[i].checkpoint;
@@ -433,7 +435,8 @@ std::size_t RetentionPolicy::Victim(const RetentionRequest& r,
       target = i;
     }
   }
-  if (target == limit_ && replaces_source)
+  if (target == limit_ && replaces_source &&
+      (!r.max_victim_rank || priority(source) <= *r.max_victim_rank))
     return source;
   // preserve_source protects byte admission while capture is incomplete. At
   // full-record publication, advance a redundant source before another
