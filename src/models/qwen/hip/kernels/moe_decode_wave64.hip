@@ -4,9 +4,14 @@
 // llama.cpp's Vulkan backend decodes Qwen3.6-35B-A3B faster than the HIP
 // route on gfx1151; its mat-vec shaders dequantize the weights and dot them
 // with float activations in wide subgroups. This unit tries the same shape:
-// one wave64 (or a 32/16-lane slice of one, for short rows) per output row,
-// every lane owning whole 16-element sub-blocks, FP32 activations read
-// straight from the token row.
+// wave64 blocks with a 32- or 16-lane slice of a wave per output row, every
+// lane owning whole 16-element sub-blocks, FP32 activations read straight
+// from the token row.
+//
+// Reductions stay inside 32-lane halves, as in the other wave64 units here:
+// on RDNA a wave64 runs as two 32-lane halves, and a shuffle across them
+// (XOR 32) does not reach the other half. A first version reduced over all
+// 64 lanes and produced garbage expert outputs.
 #include <hip/hip_runtime.h>
 
 #include <cstddef>
@@ -19,7 +24,6 @@
 namespace gufo::hip {
 namespace {
 
-constexpr std::uint32_t kWave = 64;
 constexpr std::uint32_t kThreads = 256;
 
 /// Bytes of one row of `k` elements; the formats this unit decodes.
@@ -65,7 +69,9 @@ __device__ inline float RowDot(const std::uint8_t* __restrict__ row,
     }
     sum += (sub.scale * dot) - (sub.offset * xsum);
   }
-  // XOR offsets below Lanes stay inside the lane's slice of the wave.
+  // XOR offsets below Lanes stay inside the lane's slice of the wave, and
+  // Lanes <= 32 keeps every exchange inside one 32-lane half.
+  static_assert(Lanes == 16 || Lanes == 32);
 #pragma unroll
   for (std::uint32_t offset = Lanes / 2; offset > 0; offset >>= 1) {
     sum += __shfl_xor(sum, static_cast<int>(offset));
@@ -127,26 +133,16 @@ __launch_bounds__(kThreads) __global__
   }
 }
 
-/// Lanes per row: a whole wave64 once every lane gets two or more
-/// sub-blocks, narrower slices (more rows per wave) for short rows.
+/// Lanes per row: a 32-lane half wave once every lane gets a sub-block,
+/// 16-lane slices (four rows per wave) for short rows.
 std::uint32_t LanesFor(std::size_t k) {
-  const std::size_t subs = k / 16;
-  if (subs >= 2 * kWave) {
-    return 64;
-  }
-  if (subs >= 32) {
-    return 32;
-  }
-  return 16;
+  return k / 16 >= 32 ? 32 : 16;
 }
 
 template<typename Launch>
 bool DispatchType(core::GgmlType type, std::size_t k, Launch&& launch) {
   const auto by_lanes = [&]<core::GgmlType Type>() {
     switch (LanesFor(k)) {
-      case 64:
-        launch.template operator()<Type, 64>();
-        break;
       case 32:
         launch.template operator()<Type, 32>();
         break;

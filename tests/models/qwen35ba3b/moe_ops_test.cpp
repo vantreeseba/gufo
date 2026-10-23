@@ -1157,7 +1157,8 @@ void CheckExperimentalDecode(hipStream_t stream) {
       Expect(gufo::hip::LaunchMoeFusedRouter(
                  d_router.data(), GgmlType::kF32, d_gate_inp.data(),
                  GgmlType::kF32, d_x.data(), d_logits.data(), d_gate.data(),
-                 d_ids.data(), d_w.data(), d_done.data(), tokens, kExperts,
+                 d_ids.data(), d_w.data(), d_done.data(), tokens, tokens,
+                 kExperts,
                  static_cast<std::uint32_t>(kHidden), kUsed, stream),
              "fused router rejected the shape");
     }

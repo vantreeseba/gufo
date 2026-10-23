@@ -12,7 +12,7 @@ stderr listing the active settings.
 | Variable | Effect | Falls back when |
 | --- | --- | --- |
 | `GUFO_EXP_MOE_Q6K_MMVQ=1` | Q6_K experts use the MMQ int8 vector kernels (Q8_1 activations) instead of the per-slot FP32 GEMV. Gate/up uses it for single-token decode; down uses it for any batch. | The tensor is not Q6_K, or K is not a multiple of 256 |
-| `GUFO_EXP_MOE_WAVE64=1` | Routed expert gate/up (fused SwiGLU) and down run on wave64 kernels that decode Q8_0/Q4_K/Q5_K/Q6_K with the format fixed at compile time and dot with FP32 activations. A whole wave64 handles each long row; short rows use 32- or 16-lane slices. No activation quantize launch. Takes precedence over the MMQ route. | Other formats, or gate and up in different formats |
+| `GUFO_EXP_MOE_WAVE64=1` | Routed expert gate/up (fused SwiGLU) and down run on wave64 kernels that decode Q8_0/Q4_K/Q5_K/Q6_K with the format fixed at compile time and dot with FP32 activations. Each row gets a 32-lane half of a wave64 (16 lanes for short rows); reductions never cross the two halves. No activation quantize launch. Takes precedence over the MMQ route. | Other formats, or gate and up in different formats |
 | `GUFO_EXP_MOE_FUSE=router` | Router logits, the shared-expert gate logit and top-k in one launch (3 → 1 per MoE layer). | Router or shared-gate format not decoded by the warp row dot |
 | `GUFO_EXP_MOE_FUSE=combine` | The shared expert's down projection is fused into the MoE combine (2 → 1 per MoE layer). | Shared-down format not decoded by the warp row dot |
 | `GUFO_EXP_MOE_FUSE=router,combine` or `all` | Both fusions. | |
