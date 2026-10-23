@@ -109,6 +109,10 @@ struct RetentionRequest {
   // Frontier actually reused by this turn, before its new prefill. This
   // distinguishes a short retry tail from a larger continuation/compaction.
   Rows reused_tokens{};
+  // An optional capture that yields instead of displacing retained work.
+  // When set, admission and reclaim remove only records at or below this
+  // rank (see Rank); otherwise the capture is refused.
+  std::optional<std::uint32_t> max_victim_rank{};
 };
 // Caller serializes policy, index and history operations. Ledger and index
 // outlive this object; sink, if present, does too. Callbacks/sinks cannot

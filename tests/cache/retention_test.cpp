@@ -429,6 +429,53 @@ void RetryCopyReplacesItsNearbySource() {
   distant.source = other;
   assert(!f.policy.Reclaim(distant));
 }
+void YieldingCapturesKeepConversations() {
+  // A yielding optional capture refuses rather than evicting a conversation's
+  // checkpoint, but still reclaims a redundant retry copy.
+  Fixture f(4);
+  const auto first = f.Add({9, 9});
+  f.Add({8, 8});
+  std::vector<Token> history{1, 2};
+  RetentionRequest request{history, {1}, {}, RetentionPurpose::kHistory};
+  request.max_victim_rank = 1;
+  unsigned attempts = 0;
+  const auto exhausted = [&]() -> decltype(IndexCheckpoint(f.ledger, history)) {
+    ++attempts;
+    throw ResourceExhausted();
+  };
+  assert(!f.policy.Admit(request, exhausted));
+  assert(attempts == 1 && f.Cached({9, 9, 1}) == 2 && f.Cached({8, 8, 1}) == 2);
+  assert(f.log.events.back().action == RetentionAction::kRefused &&
+         f.log.events.back().reason == RetentionReason::kByteCapacity);
+  assert(f.policy.Rank(first) == 3);
+  const auto copy = f.Add({8, 8, 5}, RetentionPurpose::kRetry, 2);
+  assert(f.policy.Rank(copy) == 0);
+  attempts = 0;
+  assert(f.policy.Admit(request, [&] {
+    if (!attempts++)
+      throw ResourceExhausted();
+    return IndexCheckpoint(f.ledger, history);
+  }));
+  assert(attempts == 2 && f.Cached({1, 2, 3}) == 2);
+  assert(f.Cached({9, 9, 1}) == 2 && f.Cached({8, 8, 1}) == 2);
+  assert(f.log.events[f.log.events.size() - 2].checkpoint == copy);
+
+  // A yielding retry cannot replace its nearby stable source either.
+  PressureFixture p;
+  p.Add(Conversation(1, 16));
+  const auto stable = Conversation(2, 7);
+  const auto source = p.Add(stable);
+  auto retry = stable;
+  retry.push_back(5);
+  RetentionRequest yielding{retry, {1}, {}, RetentionPurpose::kRetry, 7};
+  yielding.source = source;
+  yielding.max_victim_rank = 1;
+  assert(!p.policy.Reclaim(yielding));
+  assert(p.Cached(stable) == stable.size());
+  yielding.max_victim_rank.reset();
+  assert(p.policy.Reclaim(yielding));
+  assert(p.log.events.back().checkpoint == source);
+}
 void ResumedRetryReclaimsCoveredHistory() {
   PressureFixture f;
   const auto old = Conversation(1, 16);
@@ -1086,6 +1133,7 @@ int main() {
   ReusedCheapCheckpointKeepsRecency();
   PersistingCheckpointIsNotAVictim();
   RetryCopyReplacesItsNearbySource();
+  YieldingCapturesKeepConversations();
   ResumedRetryReclaimsCoveredHistory();
   LongResumedRetryReclaimsOnlyOwnAncestors();
   SharedShortPrefixIsNotCheap();

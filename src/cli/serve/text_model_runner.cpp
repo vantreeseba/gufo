@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <utility>
 
+#include "src/cli/serve/cache_checkpoint_modes.hpp"
 #include "src/cli/serve/component_text_cache.hpp"
 #include "src/cli/serve/continuation_disk_store.hpp"
 #include "src/cli/serve/logging.hpp"
@@ -963,11 +964,31 @@ struct TextRunnerPool::Request::Impl {
     prompt_snapshot_attempted = false;
   }
 
+  // GUFO_CACHE_RETRY_CHECKPOINTS=off. Once this turn has targeted an earlier
+  // fallback or stable boundary, the complete prompt only adds assistant
+  // framing, which serves an identical resend and not the next turn.
+  [[nodiscard]] bool SkipsRetryCopy() const noexcept {
+    if (!lease.component() || !retain_fallback || fallback_position == 0 ||
+        fallback_position >= prompt.size() ||
+        snapshot_tokens.size() != prompt.size()) {
+      return false;
+    }
+    try {
+      return CacheCheckpointModesFromEnv().retry == CacheCheckpointMode::kOff;
+    } catch (...) {
+      // ComponentTextCache rejects unknown values at startup.
+      return false;
+    }
+  }
+
   void StartPromptSnapshot(bool wait) noexcept {
     if (prompt_snapshot_attempted || prefill_offset != snapshot_tokens.size()) {
       return;
     }
     prompt_snapshot_attempted = true;
+    if (SkipsRetryCopy()) {
+      return;
+    }
 
     TextRunnerCapabilities capabilities;
     try {
