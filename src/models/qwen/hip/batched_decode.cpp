@@ -126,7 +126,8 @@ void LaunchMoeFfn(const models::QwenLayerWeights& layer,
           view.router.data, view.router.type, view.shexp_gate_inp.data,
           view.shexp_gate_inp.type, scratch.decode.normed.data(),
           moe.router_logits.data(), moe.shexp_gate.data(), moe.ids.data(),
-          moe.weights.data(), moe.router_done.data(), tokens, n_experts,
+          moe.weights.data(), moe.router_done.data(), moe.router_done.size(),
+          tokens, n_experts,
           static_cast<std::uint32_t>(hidden), n_used, stream);
   if (!fused_router) {
     LaunchProjection(view.router, scratch.decode.normed.data(),

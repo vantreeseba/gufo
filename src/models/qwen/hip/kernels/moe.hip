@@ -930,10 +930,12 @@ bool LaunchMoeFusedRouter(const void* router_w, core::GgmlType router_type,
                           const void* gate_w, core::GgmlType gate_type,
                           const float* x, float* logits, float* shared_gate,
                           std::int32_t* ids, float* weights,
-                          std::uint32_t* done, std::uint32_t n_tokens,
+                          std::uint32_t* done, std::size_t done_slots,
+                          std::uint32_t n_tokens,
                           std::uint32_t n_experts, std::uint32_t hidden,
                           std::uint32_t n_used, hipStream_t stream) {
-  if (done == nullptr || n_tokens == 0 || n_experts > 1024 || n_used > 32 ||
+  if (done == nullptr || n_tokens == 0 || n_tokens > done_slots ||
+      n_experts > 1024 || n_used > 32 ||
       !IsMoeWarpRowDotType(router_type) || !IsMoeWarpRowDotType(gate_type)) {
     return false;
   }
