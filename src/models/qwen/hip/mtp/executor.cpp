@@ -487,6 +487,14 @@ void QwenMtpGpuExecutor::Reset() noexcept {
   next_position_ = 0;
 }
 
+void QwenMtpGpuExecutor::Synchronize() {
+  const auto status = hipStreamSynchronize(stream_);
+  if (status != hipSuccess) {
+    throw std::runtime_error(std::string("MTP stream synchronize failed: ") +
+                             hipGetErrorString(status));
+  }
+}
+
 void QwenMtpGpuExecutor::Rewind(std::uint32_t position) {
   RequireChainIdle();
   if (position > next_position_) {

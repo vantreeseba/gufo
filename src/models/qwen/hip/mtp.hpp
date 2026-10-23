@@ -156,6 +156,9 @@ public:
   }
   void Reset() noexcept;
   void Rewind(std::uint32_t position);
+  /// Waits for queued work, including host-to-device copies whose source
+  /// the caller may reuse once this returns.
+  void Synchronize();
 
   /// `small_head` scores the prefix rows and this executor's draft table
   /// instead of the full output head; it needs HasDraftVocab().
