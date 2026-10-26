@@ -34,8 +34,9 @@
 | BF16 draft gate/up reuse and tiled argmax | Retained; complete head, finite filtering and lowest-ID ties; no extra persistent buffer. |
 | Large-chunk KV packing | Retained at shallow and long depths in idle FFN scratch with bounded head groups; exact attention output/log-sum-exp, cache bytes unchanged. |
 | BF16 target projection reduction | Fixed per-row FP32 order retained for chunk/cache/continued-image equivalence. |
-| Register-cached vision softmax | Retained; byte-identical embeddings with the shared Q4/Q8 projector, unchanged reduction order and memory allocation. |
-| 4096-patch vision attention tiles | Retained; byte-identical full embeddings, lower latency and 24 MiB less attention scratch. |
+| Register-cached vision softmax | Superseded by fused vision attention; byte-identical embeddings with the shared Q4/Q8 projector, unchanged reduction order and memory allocation. |
+| 4096-patch vision attention tiles | Superseded by fused vision attention; byte-identical full embeddings, lower latency and 24 MiB less attention scratch. |
+| Fused vision attention | Retained: replaces the tiled hipBLAS score/softmax/value chain (and the two rows above) with one BF16 WMMA kernel that normalizes probabilities before narrowing them; about 5.7x faster at 14,400 patches. 27B embeddings stay within the oracle bounds on three images; see [Qwen3.6 35B-A3B experiments](../qwen3.6-35b-a3b/EXPERIMENTS.md) and [quality](../qwen3.6-35b-a3b/QUALITY.md#vision). |
 | Alternate tiles/waves/pipeline depths (2026-09-19) | Rejected: no release throughput improvement. |
 | Dynamic verification chunk/controller alternatives | No new default retained; seeded private-acceptance policy remains. |
 | Parallel mapped-weight reads and larger DFlash packing chunks | Retained: faster cold startup, unchanged encoded weights. |

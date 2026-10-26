@@ -91,6 +91,39 @@ an RMSE of 0.087 / 0.564 / 1.85 against 0.086 / 0.523 / 2.10 for the FP32 route.
 Both artifacts pass the target test. This bounds a loss to about one MMLU point;
 it does not measure long generations, tool calling or speculative decoding.
 
+## Vision
+
+The F16 `mmproj` widens to BF16 exactly (all 443,510,784 weights round-trip).
+[`tools/qwen27b/vision_reference.py`](../../../tools/qwen27b/vision_reference.py)
+compares Gufo's encoder trace with the pinned Transformers `qwen3_5_moe`
+vision operators on the same weights, and both with an FP32 run of those
+operators. Its pass condition: every stage within 5% relative L2 of the BF16
+reference, each re-run layer within 1.5%, and the final embedding no further
+from FP32 than 1.25x the reference's own BF16 error plus 0.001. Synthetic
+screenshots of 1280x704, 1024x1024 and 2560x1440 resized pixels, October 26,
+2026; relative L2 of the final embedding against FP32, and the largest
+re-run layer difference:
+
+| Image | Encoder | Embedding vs FP32 | Bound | Re-run layer | Pass |
+| --- | --- | ---: | ---: | ---: | --- |
+| 35B-A3B 1280x704 | before fused attention | 0.0747 | 0.0844 | 0.00154 | no (embedding 5.12% from BF16) |
+| 35B-A3B 1280x704 | fused attention | 0.0621 | 0.0844 | 0.00148 | yes |
+| 35B-A3B 1024x1024 | before | 0.0910 | 0.0943 | 0.00162 | no (6.93%) |
+| 35B-A3B 1024x1024 | fused | 0.0562 | 0.0943 | 0.00149 | no (5.55%) |
+| 35B-A3B 2560x1440 | before | 0.0696 | 0.0749 | 0.00188 | yes |
+| 35B-A3B 2560x1440 | fused | 0.0607 | 0.0749 | 0.00159 | yes |
+| 27B 1280x704 | before | 0.0622 | 0.0742 | 0.00154 | yes |
+| 27B 1280x704 | fused | 0.0611 | 0.0742 | 0.00140 | yes |
+| 27B 1024x1024 | before | 0.0413 | 0.0390 | 0.00155 | no |
+| 27B 1024x1024 | fused | 0.0344 | 0.0390 | 0.00139 | yes |
+| 27B 2560x1440 | before | 0.0345 | 0.0477 | 0.00183 | yes |
+| 27B 2560x1440 | fused | 0.0366 | 0.0477 | 0.00150 | yes |
+
+The reference's own BF16 run is 6-7.5% from FP32 on this projector, so the
+5% stage limit, set on the 27B, is not met by the earlier encoder either on two
+of three images; it is left unchanged. Served answers about the 2560x1440 image
+match in content before and after.
+
 ## Reproduce
 
 Build the `gpu-test` preset and run the binaries inside the ROCm container:

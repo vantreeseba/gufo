@@ -219,8 +219,11 @@ __global__ void Activate(const float* input, const float* bias, Bf16* output,
   output[i] = Bf16(gelu);
 }
 
+// Q and K are head-major rows; V is written transposed (head, dim, token) with
+// a token stride padded to whole attention key tiles.
 __global__ void QkvRope(const float* input, const float* bias, Bf16* q, Bf16* k,
-                        Bf16* v, unsigned count, unsigned grid_width) {
+                        Bf16* v, unsigned count, unsigned grid_width,
+                        unsigned value_stride) {
   const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= count * kHidden)
     return;
@@ -250,98 +253,240 @@ __global__ void QkvRope(const float* input, const float* bias, Bf16* q, Bf16* k,
                                     : q1 * cosine + q0 * sine);
   k[target] = Bf16(d < kHeadDim / 2 ? k0 * cosine - k1 * sine
                                     : k1 * cosine + k0 * sine);
-  v[target] = Bf16(input[base + 2 * kHidden + head * kHeadDim + d] +
-                   bias[2 * kHidden + head * kHeadDim + d]);
+  v[(head * kHeadDim + d) * value_stride + token] =
+      Bf16(input[base + 2 * kHidden + head * kHeadDim + d] +
+           bias[2 * kHidden + head * kHeadDim + d]);
 }
 
-// Keep bounded rows in registers through normalization. Larger rows retain
-// the streaming path; caching them would spill and reread private memory.
-template<unsigned kValues>
-__global__ void Softmax(const float* scores, Bf16* probabilities,
-                        unsigned length) {
-  const unsigned row = blockIdx.x;
-  __shared__ float reduce[kThreads];
-  float values[kValues != 0 ? kValues : 1];
-  float maximum = -INFINITY;
-  if constexpr (kValues != 0) {
+constexpr unsigned kFlashQueries = 128;  // 8 waves x 16 queries
+constexpr unsigned kFlashKeys = 32;
+constexpr unsigned kKeySubtiles = kFlashKeys / 16;
+constexpr unsigned kPaddedHeadDim = 80;  // five 16-wide WMMA steps
+// LDS row strides in BF16 elements; 16-byte fragment reads stay conflict-free.
+constexpr unsigned kKeyStride = 88;
+constexpr unsigned kValueStride = kFlashKeys + 8;
+
+using Fragment = __attribute__((ext_vector_type(16))) unsigned short;
+using Accumulator = __attribute__((ext_vector_type(8))) float;
+
+__device__ __forceinline__ Fragment LoadFragment(const std::uint16_t* x) {
+  union {
+    Fragment fragment;
+    uint4 words[2];
+  } value;
+  value.words[0] = *reinterpret_cast<const uint4*>(x);
+  value.words[1] = *reinterpret_cast<const uint4*>(x + 8);
+  return value.fragment;
+}
+
+// Round-to-nearest-even to BF16 as three integer operations. Identical to
+// hip_bfloat16 for every non-NaN input and for the canonical NaN, the only NaN
+// arithmetic produces; its exec-mask branches dominated the softmax loop.
+__device__ __forceinline__ std::uint32_t Bf16RoundBits(float x) {
+  const std::uint32_t bits = __float_as_uint(x);
+  return (bits + 0x7fffU + ((bits >> 16) & 1U)) & 0xffff0000U;
+}
+
+__device__ __forceinline__ float RoundFast(float x) {
+  return __uint_as_float(Bf16RoundBits(x));
+}
+
+__device__ __forceinline__ std::uint16_t Bf16Bits(float x) {
+  return Bf16RoundBits(x) >> 16;
+}
+
+// Full image attention without materializing scores, in two sweeps over the
+// keys: the first finds each row's maximum and exponential sum, the second
+// forms the normalized probabilities and the value product. Rounding follows
+// the reference: BF16 product, BF16 scaled score, FP32 softmax normalized
+// before its BF16 narrowing, BF16 output. Scores are computed transposed
+// (keys x queries) so each lane owns one query, and its row statistics need
+// one exchange with the other half-wave.
+__launch_bounds__(256) __global__
+    void FlashAttention(const std::uint16_t* q, const std::uint16_t* k,
+                        const std::uint16_t* v, Bf16* output, unsigned count,
+                        unsigned value_stride) {
+  // Two tile buffers: the next tile is written while the current one is read.
+  __shared__ std::uint16_t keys[2][kFlashKeys][kKeyStride];
+  __shared__ std::uint16_t values[2][kPaddedHeadDim][kValueStride];
+  const unsigned lane = threadIdx.x % 32, wave = threadIdx.x / 32;
+  const unsigned half = lane / 16, head = blockIdx.y;
+  const unsigned query = blockIdx.x * kFlashQueries + wave * 16 + lane % 16;
+  q += std::size_t{head} * count * kHeadDim;
+  k += std::size_t{head} * count * kHeadDim;
+  v += std::size_t{head} * kHeadDim * value_stride;
+
+  // Padding columns and rows stay zero; tiles only overwrite real elements.
+  for (unsigned i = threadIdx.x; i < 2 * kFlashKeys * kKeyStride; i += 256)
+    (&keys[0][0][0])[i] = 0;
+  for (unsigned i = threadIdx.x; i < 2 * kPaddedHeadDim * kValueStride;
+       i += 256)
+    (&values[0][0][0])[i] = 0;
+
+  // Each thread moves at most two 16-byte words of each tile.
+  constexpr unsigned kKeyWords = kFlashKeys * 9;
+  constexpr unsigned kValueWords = kHeadDim * (kFlashKeys / 8);
+  static_assert(kKeyWords <= 512 && kValueWords <= 512);
+  uint4 key_words[2], value_words[2];
+  const auto fetch = [&](unsigned base, bool with_values) {
 #pragma unroll
-    for (unsigned j = 0; j < kValues; ++j) {
-      const unsigned i = threadIdx.x + j * kThreads;
-      values[j] =
-          i < length
-              ? Round(Round(scores[row * length + i]) * 0.1178511301977579F)
-              : -INFINITY;
-      maximum = fmaxf(maximum, values[j]);
+    for (unsigned j = 0; j < 2; ++j) {
+      const unsigned i = threadIdx.x + j * 256;
+      key_words[j] = uint4{};
+      value_words[j] = uint4{};
+      if (i < kKeyWords && base + i / 9 < count)
+        key_words[j] = *reinterpret_cast<const uint4*>(
+            k + std::size_t{base + i / 9} * kHeadDim + (i % 9) * 8);
+      if (with_values && i < kValueWords)
+        value_words[j] = *reinterpret_cast<const uint4*>(
+            v + std::size_t{i / (kFlashKeys / 8)} * value_stride + base +
+            (i % (kFlashKeys / 8)) * 8);
     }
-  } else {
-    for (unsigned i = threadIdx.x; i < length; i += kThreads) {
-      maximum = fmaxf(maximum, Round(Round(scores[row * length + i]) *
-                                     0.1178511301977579F));
-    }
-  }
-  reduce[threadIdx.x] = maximum;
-  __syncthreads();
-  for (unsigned stride = kThreads / 2; stride; stride /= 2) {
-    if (threadIdx.x < stride)
-      reduce[threadIdx.x] =
-          fmaxf(reduce[threadIdx.x], reduce[threadIdx.x + stride]);
-    __syncthreads();
-  }
-  maximum = reduce[0];
-  __syncthreads();
-  float sum = 0;
-  if constexpr (kValues != 0) {
+  };
+  const auto store = [&](unsigned buffer, bool with_values) {
 #pragma unroll
-    for (unsigned j = 0; j < kValues; ++j) {
-      if (threadIdx.x + j * kThreads < length) {
-        values[j] = expf(values[j] - maximum);
-        sum += values[j];
-        // Limit overlapping exponential temporaries without changing their
-        // order. Wider shapes otherwise spill registers on gfx1151.
-        if constexpr (kValues > 16)
-          __builtin_amdgcn_sched_barrier(0);
+    for (unsigned j = 0; j < 2; ++j) {
+      const unsigned i = threadIdx.x + j * 256;
+      if (i < kKeyWords)
+        *reinterpret_cast<uint4*>(&keys[buffer][i / 9][(i % 9) * 8]) =
+            key_words[j];
+      if (with_values && i < kValueWords)
+        *reinterpret_cast<uint4*>(
+            &values[buffer][i / (kFlashKeys / 8)]
+                   [(i % (kFlashKeys / 8)) * 8]) = value_words[j];
+    }
+  };
+
+  Fragment query_fragment[5];
+#pragma unroll
+  for (unsigned c = 0; c < 5; ++c) {
+    query_fragment[c] = Fragment{};
+    if (query < count) {
+      const auto* row = q + std::size_t{query} * kHeadDim + c * 16;
+      if (c < 4) {
+        query_fragment[c] = LoadFragment(row);
+      } else {
+        union {
+          Fragment fragment;
+          uint4 words[2];
+        } value{};
+        value.words[0] = *reinterpret_cast<const uint4*>(row);
+        query_fragment[c] = value.fragment;
       }
     }
-  } else {
-    for (unsigned i = threadIdx.x; i < length; i += kThreads)
-      sum += expf(Round(Round(scores[row * length + i]) * 0.1178511301977579F) -
-                  maximum);
   }
-  reduce[threadIdx.x] = sum;
-  __syncthreads();
-  for (unsigned stride = kThreads / 2; stride; stride /= 2) {
-    if (threadIdx.x < stride)
-      reduce[threadIdx.x] += reduce[threadIdx.x + stride];
-    __syncthreads();
-  }
-  const float inverse = 1.0F / reduce[0];
-  if constexpr (kValues != 0) {
-#pragma unroll
-    for (unsigned j = 0; j < kValues; ++j) {
-      const unsigned i = threadIdx.x + j * kThreads;
-      if (i < length)
-        probabilities[row * length + i] = Bf16(values[j] * inverse);
-    }
-  } else {
-    for (unsigned i = threadIdx.x; i < length; i += kThreads) {
-      probabilities[row * length + i] = Bf16(
-          expf(Round(Round(scores[row * length + i]) * 0.1178511301977579F) -
-               maximum) *
-          inverse);
-    }
-  }
-}
 
-__global__ void AttentionRows(const float* input, Bf16* output, unsigned begin,
-                              unsigned rows) {
-  const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= rows * kHidden)
+  // Scaled, masked scores of one key tile; lane holds keys 2i + half of each
+  // 16-key subtile for its query.
+  const auto tile_scores = [&](unsigned buffer, unsigned base,
+                               Accumulator(&scores)[kKeySubtiles]) {
+#pragma unroll
+    for (unsigned sub = 0; sub < kKeySubtiles; ++sub) {
+      scores[sub] = Accumulator{};
+#pragma unroll
+      for (unsigned c = 0; c < 5; ++c)
+        scores[sub] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(
+            LoadFragment(&keys[buffer][sub * 16 + lane % 16][c * 16]),
+            query_fragment[c], scores[sub]);
+      // Without a fence every subtile's key fragments are hoisted at once,
+      // which exhausts the register file.
+      __builtin_amdgcn_sched_barrier(0);
+#pragma unroll
+      for (unsigned i = 0; i < 8; ++i) {
+        const unsigned key = base + sub * 16 + 2 * i + half;
+        scores[sub][i] =
+            key < count
+                ? RoundFast(RoundFast(scores[sub][i]) * 0.1178511301977579F)
+                : -INFINITY;
+      }
+    }
+  };
+
+  // The next tile's loads are in flight while the current one computes.
+  // Every wave has finished with the other buffer at the previous barrier.
+  const auto sweep = [&](bool with_values, auto&& consume) {
+    __syncthreads();
+    fetch(0, with_values);
+    store(0, with_values);
+    __syncthreads();
+    unsigned buffer = 0;
+    for (unsigned base = 0; base < count; base += kFlashKeys) {
+      const bool more = base + kFlashKeys < count;
+      if (more)
+        fetch(base + kFlashKeys, with_values);
+      Accumulator scores[kKeySubtiles];
+      tile_scores(buffer, base, scores);
+      consume(buffer, scores);
+      if (more)
+        store(buffer ^ 1, with_values);
+      __syncthreads();
+      buffer ^= 1;
+    }
+  };
+
+  float maximum = -INFINITY, sum = 0;
+  sweep(false, [&](unsigned, Accumulator(&scores)[kKeySubtiles]) {
+    float tile_maximum = -INFINITY;
+#pragma unroll
+    for (unsigned sub = 0; sub < kKeySubtiles; ++sub)
+#pragma unroll
+      for (unsigned i = 0; i < 8; ++i)
+        tile_maximum = fmaxf(tile_maximum, scores[sub][i]);
+    tile_maximum = fmaxf(tile_maximum, __shfl_xor(tile_maximum, 16));
+    const float next = fmaxf(maximum, tile_maximum);
+    float tile_sum = 0;
+#pragma unroll
+    for (unsigned sub = 0; sub < kKeySubtiles; ++sub)
+#pragma unroll
+      for (unsigned i = 0; i < 8; ++i)
+        tile_sum += __expf(scores[sub][i] - next);
+    tile_sum += __shfl_xor(tile_sum, 16);
+    sum = sum * __expf(maximum - next) + tile_sum;
+    maximum = next;
+  });
+
+  const float inverse = 1.0F / sum;
+  Accumulator out[5] = {};
+  sweep(true, [&](unsigned buffer, Accumulator(&scores)[kKeySubtiles]) {
+#pragma unroll
+    for (unsigned sub = 0; sub < kKeySubtiles; ++sub) {
+      // This lane holds keys 2i + half; the other half-wave holds the rest.
+      // Both halves build the same 16-key fragment.
+      Fragment probabilities;
+#pragma unroll
+      for (unsigned i = 0; i < 8; i += 2) {
+        const unsigned own =
+            Bf16Bits(__expf(scores[sub][i] - maximum) * inverse) |
+            (unsigned{Bf16Bits(__expf(scores[sub][i + 1] - maximum) *
+                                inverse)}
+             << 16);
+        const unsigned other = __shfl_xor(own, 16);
+        const unsigned even = half ? other : own;
+        const unsigned odd = half ? own : other;
+        probabilities[2 * i] = even & 0xffff;
+        probabilities[2 * i + 1] = odd & 0xffff;
+        probabilities[2 * i + 2] = even >> 16;
+        probabilities[2 * i + 3] = odd >> 16;
+      }
+#pragma unroll
+      for (unsigned t = 0; t < 5; ++t)
+        out[t] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(
+            LoadFragment(&values[buffer][t * 16 + lane % 16][sub * 16]),
+            probabilities, out[t]);
+      __builtin_amdgcn_sched_barrier(0);
+    }
+  });
+  if (query >= count)
     return;
-  const unsigned token = i / kHidden;
-  const unsigned head = (i % kHidden) / kHeadDim;
-  const unsigned d = i % kHeadDim;
-  output[(begin + token) * kHidden + head * kHeadDim + d] =
-      Bf16(input[(head * rows + token) * kHeadDim + d]);
+#pragma unroll
+  for (unsigned t = 0; t < 5; ++t)
+#pragma unroll
+    for (unsigned i = 0; i < 8; ++i) {
+      const unsigned d = t * 16 + 2 * i + half;
+      if (d < kHeadDim)
+        output[std::size_t{query} * kHidden + head * kHeadDim + d] =
+            Bf16(out[t][i]);
+    }
 }
 
 __global__ void Finish(float* output, const float* bias, unsigned size,
@@ -699,15 +844,13 @@ std::shared_ptr<const Encoder::Embedding> Encoder::Encode(
                   sizeof(float));
   Allocation normalized(std::size_t{count} * std::max(kFfn, kPatchDim) *
                         sizeof(Bf16));
-  Allocation qkv(std::size_t{3} * count * kHidden * sizeof(Bf16));
+  // V is stored transposed with whole key tiles; the zero tail keeps masked
+  // keys out of the value product.
+  const unsigned value_stride =
+      (count + kFlashKeys - 1) / kFlashKeys * kFlashKeys;
+  Allocation qkv((std::size_t{2} * count + value_stride) * kHidden *
+                 sizeof(Bf16));
   Allocation attention(std::size_t{count} * kHidden * sizeof(Bf16));
-  // Smaller attention tiles reduce scratch traffic for the 4096-patch
-  // shape while preserving its BLAS reductions. Ragged tails require
-  // their existing GEMM shapes to preserve rounding.
-  const unsigned tile = std::min(count, count == 4096 ? 64U : 128U);
-  Allocation scores(std::size_t{kHeads} * tile * count * sizeof(float));
-  Allocation probabilities(std::size_t{kHeads} * tile * count * sizeof(Bf16));
-  Allocation output_tile(std::size_t{tile} * kHidden * sizeof(float));
   {
     // The input image can outlive encoding as part of a cached prompt.
     // Do not leave its pageable vector in ROCr's implicit SVM copy cache.
@@ -745,47 +888,21 @@ std::shared_ptr<const Encoder::Embedding> Encoder::Encode(
     impl_->Gemm(prefix + "attn_qkv.weight", normalized.As<Bf16>(),
                 work.As<float>(), count, 3 * kHidden, kHidden);
     auto* q = qkv.As<Bf16>();
-    auto* k = q + count * kHidden;
-    auto* v = k + count * kHidden;
+    auto* k = q + std::size_t{count} * kHidden;
+    auto* v = k + std::size_t{count} * kHidden;
+    if (layer == 0)
+      Check(hipMemsetAsync(v, 0, std::size_t{value_stride} * kHidden *
+                                     sizeof(Bf16), stream));
     QkvRope<<<(count * kHidden + kThreads - 1) / kThreads, kThreads, 0,
               stream>>>(work.As<float>(),
                         impl_->FloatWeight(prefix + "attn_qkv.bias"), q, k, v,
-                        count, image.width / 16);
-    for (unsigned begin = 0; begin < count; begin += tile) {
-      check_cancelled();
-      const unsigned rows = std::min(tile, count - begin);
-      constexpr float zero = 0, one = 1;
-      CheckBlas(hipblasGemmStridedBatchedEx(
-          impl_->blas, HIPBLAS_OP_T, HIPBLAS_OP_N, count, rows, kHeadDim, &one,
-          k, HIP_R_16BF, kHeadDim, count * kHeadDim, q + begin * kHeadDim,
-          HIP_R_16BF, kHeadDim, count * kHeadDim, &zero, scores.data, HIP_R_32F,
-          count, rows * count, kHeads, HIPBLAS_COMPUTE_32F,
-          HIPBLAS_GEMM_DEFAULT));
-      if (count <= 1024)
-        Softmax<4><<<kHeads * rows, kThreads, 0, stream>>>(
-            scores.As<float>(), probabilities.As<Bf16>(), count);
-      else if (count <= 2048)
-        Softmax<8><<<kHeads * rows, kThreads, 0, stream>>>(
-            scores.As<float>(), probabilities.As<Bf16>(), count);
-      else if (count <= 4096)
-        Softmax<16><<<kHeads * rows, kThreads, 0, stream>>>(
-            scores.As<float>(), probabilities.As<Bf16>(), count);
-      else if (count <= 8192)
-        Softmax<32><<<kHeads * rows, kThreads, 0, stream>>>(
-            scores.As<float>(), probabilities.As<Bf16>(), count);
-      else
-        Softmax<0><<<kHeads * rows, kThreads, 0, stream>>>(
-            scores.As<float>(), probabilities.As<Bf16>(), count);
-      CheckBlas(hipblasGemmStridedBatchedEx(
-          impl_->blas, HIPBLAS_OP_N, HIPBLAS_OP_N, kHeadDim, rows, count, &one,
-          v, HIP_R_16BF, kHeadDim, count * kHeadDim, probabilities.data,
-          HIP_R_16BF, count, rows * count, &zero, output_tile.data, HIP_R_32F,
-          kHeadDim, rows * kHeadDim, kHeads, HIPBLAS_COMPUTE_32F,
-          HIPBLAS_GEMM_DEFAULT));
-      AttentionRows<<<(rows * kHidden + kThreads - 1) / kThreads, kThreads, 0,
-                      stream>>>(output_tile.As<float>(), attention.As<Bf16>(),
-                                begin, rows);
-    }
+                        count, image.width / 16, value_stride);
+    FlashAttention<<<dim3((count + kFlashQueries - 1) / kFlashQueries, kHeads),
+                     256, 0, stream>>>(
+        reinterpret_cast<const std::uint16_t*>(q),
+        reinterpret_cast<const std::uint16_t*>(k),
+        reinterpret_cast<const std::uint16_t*>(v), attention.As<Bf16>(), count,
+        value_stride);
     impl_->Gemm(prefix + "attn_out.weight", attention.As<Bf16>(),
                 work.As<float>(), count, kHidden, kHidden);
     BiasResidual<<<(count * kHidden + kThreads - 1) / kThreads, kThreads, 0,

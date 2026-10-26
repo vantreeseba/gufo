@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Check both Qwen3.8 vision encoders against pinned, unmodified HF operators.
+"""Check the Qwen vision encoders against pinned, unmodified HF operators.
 
-The same BF16 GGUF weights are used on both sides. This validates operator
+Covers Qwen3.8-27B (5120), Flash-Next (2560) and Qwen3.6-35B-A3B (2048). The
+same GGUF weights are used on both sides; F16 sidecars widen to BF16 exactly. This validates operator
 execution and binding, not the upstream GGUF conversion or language quantization.
 No model or source download is implicit. Run inside nix develop.
 """
@@ -30,6 +31,7 @@ SOURCE_HASHES = {
     "vision_utils.py": "bcecd5a92b3266b9926272a549d2b1a0f1fe7646c698c0fa19bd96f976085356",
     "models/qwen3_5/modeling_qwen3_5.py": "832e14a5c8d193f0904cf0f41f891a121eddeffd46201ccc044d0f86d527ce30",
     "models/qwen4_exp/modeling_qwen4_exp.py": "797a18fd6dd76c574d237a5643759acdeb1c4d0f1c2508693f8fdabce0a19057",
+    "models/qwen3_5_moe/modeling_qwen3_5_moe.py": "49a9dd705b459f5284f79d7f560411e702de384784ae8e222165126da3ac28e6",
     "models/qwen2_vl/image_processing_qwen2_vl.py": "4e1da45f9e7e157ca08aa88243fcc1495ea6a333e40e0c5035ef17ef2747a97d",
 }
 
@@ -85,8 +87,9 @@ def source_model(source, output_width):
     for name, expected in SOURCE_HASHES.items():
         if hashlib.sha256((directory / name).read_bytes()).hexdigest() != expected:
             raise ValueError(f"{name} differs from Transformers {REVISION}")
-    prefix = "Qwen3_5" if output_width == 5120 else "Qwen4Exp"
-    family = "qwen3_5" if output_width == 5120 else "qwen4_exp"
+    prefix, family = {5120: ("Qwen3_5", "qwen3_5"),
+                      2560: ("Qwen4Exp", "qwen4_exp"),
+                      2048: ("Qwen3_5Moe", "qwen3_5_moe")}[output_width]
     environment = dict(
         torch=torch, nn=nn, F=F, GradientCheckpointingLayer=nn.Module,
         ACT2FN={"gelu_pytorch_tanh": lambda value: F.gelu(value, approximate="tanh")},
@@ -122,8 +125,8 @@ def load_weights(path, source):
     metadata = codec.parse_gguf(path)
     tensors = {tensor["name"]: tensor for tensor in metadata["tensors"]}
     width = metadata["user_kv"]["clip.vision.projection_dim"]
-    if width not in (2560, 5120):
-        raise ValueError("expected a Qwen3.8-27B or Flash-Next BF16 vision sidecar")
+    if width not in (2048, 2560, 5120):
+        raise ValueError("expected a Qwen3.8-27B, Flash-Next or Qwen3.6-35B-A3B vision sidecar")
     environment, prefix = source_model(source, width)
     config = SimpleNamespace(
         hidden_size=1152, intermediate_size=4304, hidden_act="gelu_pytorch_tanh",
@@ -137,16 +140,19 @@ def load_weights(path, source):
 
     def read(name):
         tensor = tensors[name]
-        dtype = np.float32 if tensor["type"] == 0 else np.uint16
-        if tensor["type"] not in (0, 30):
-            raise ValueError("the vision reference requires an unquantized BF16 sidecar")
+        dtype = {0: np.float32, 1: np.float16, 30: np.uint16}.get(tensor["type"])
+        if dtype is None:
+            raise ValueError("the vision reference requires an unquantized F32/F16/BF16 sidecar")
         values = np.memmap(path, mode="r", dtype=dtype,
                            offset=metadata["data_offset"] + tensor["offset"],
                            shape=tuple(tensor["shape"]))
         value = torch.from_numpy(np.array(values))
         if dtype == np.uint16:
             value = value.view(torch.bfloat16)
-        return value.to(device="cuda", dtype=torch.bfloat16)
+        widened = value.to(device="cuda", dtype=torch.bfloat16)
+        if dtype == np.float16 and not torch.equal(widened.to(torch.float16), value.cuda()):
+            raise ValueError(f"{name} does not convert exactly from F16 to BF16")
+        return widened
 
     state = {}
     for name in model.state_dict():

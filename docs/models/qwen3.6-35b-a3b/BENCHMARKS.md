@@ -268,6 +268,23 @@ Confirms the shared attention/GDN path is unchanged by the MoE work.
 | 2048 | 268.88 ± 0.57 |
 | 8192 | 265.06 ± 0.53 |
 
+## Image input
+
+October 26, 2026, Gufo `95caa9c3` (before) and the fused vision attention
+(after), both production builds with the same flags: UD-Q4_K_XL, DFlash2 with
+32 draft tokens, four sessions, F16 `mmproj` beside the model, no other GPU
+work. Time to first token for one uncached image and a short question, median
+of three:
+
+| Image | Prompt tokens | Before | After | Gain |
+| --- | ---: | ---: | ---: | ---: |
+| 1280x720 | 898 | 1.20 s | 0.65 s | 1.9x |
+| 1920x1080 | 2,058 | 4.56 s | 1.59 s | 2.9x |
+| 2560x1440 | 3,618 | 13.59 s | 3.34 s | 4.1x |
+
+The same prompt length as text prefills in about 1.4 s at 3,600 tokens, so the
+vision encoder is still about two thirds of a 2560x1440 request.
+
 ## Reproduce
 
 ```sh
