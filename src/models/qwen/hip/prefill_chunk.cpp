@@ -1093,10 +1093,10 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
               layer.ffn_up.data, arena_.d_scratch_bf16, arena_.d_ffn_up,
               output_rows, intermediate_size, hidden_size, arena_.stream);
           if (!paired) {
-            LaunchBatchedQuantGEMMFp16(
-                layer.ffn_gate.type, layer.ffn_gate.data,
-                arena_.d_scratch_bf16, arena_.d_ffn_gate, output_rows,
-                intermediate_size, hidden_size, arena_.stream);
+            LaunchBatchedQuantGEMMFp16(layer.ffn_gate.type, layer.ffn_gate.data,
+                                       arena_.d_scratch_bf16, arena_.d_ffn_gate,
+                                       output_rows, intermediate_size,
+                                       hidden_size, arena_.stream);
             LaunchBatchedQuantGEMMSwiGLUFp16(
                 layer.ffn_up.type, layer.ffn_up.data, arena_.d_scratch_bf16,
                 arena_.d_ffn_gate, arena_.d_ffn_up, output_rows,
