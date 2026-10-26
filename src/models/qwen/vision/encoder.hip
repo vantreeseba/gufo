@@ -355,6 +355,33 @@ std::uint16_t ToBf16(float value) {
   const auto bits = std::bit_cast<std::uint32_t>(value);
   return static_cast<std::uint16_t>((bits + 0x7fff + ((bits >> 16) & 1)) >> 16);
 }
+
+float FromF16(std::uint16_t half) {
+  const std::uint32_t sign = std::uint32_t{half & 0x8000U} << 16;
+  std::uint32_t exponent = (half >> 10) & 0x1f;
+  std::uint32_t mantissa = half & 0x3ff;
+  if (exponent == 0x1f)
+    return std::bit_cast<float>(sign | 0x7f800000U | (mantissa << 13));
+  if (exponent == 0) {
+    if (mantissa == 0)
+      return std::bit_cast<float>(sign);
+    // Normalize the subnormal into a float exponent.
+    exponent = 113;
+    while ((mantissa & 0x400) == 0) {
+      mantissa <<= 1;
+      --exponent;
+    }
+    mantissa &= 0x3ff;
+    return std::bit_cast<float>(sign | (exponent << 23) | (mantissa << 13));
+  }
+  return std::bit_cast<float>(sign | ((exponent + 112) << 23) |
+                              (mantissa << 13));
+}
+
+// Matrices are stored as BF16 or F16; patch embeddings as F32 or F16.
+bool IsMatrixType(core::GgmlType type) {
+  return type == core::GgmlType::kBF16 || type == core::GgmlType::kF16;
+}
 }  // namespace
 
 struct Encoder::Impl {
@@ -389,7 +416,7 @@ struct Encoder::Impl {
     expect("clip.vision.attention.head_count", kHeads);
     expect("clip.vision.spatial_merge_size", 2);
     expect("clip.vision.image_size", 768);
-    if ((width != 5120 && width != 2560) ||
+    if ((width != 5120 && width != 2560 && width != 2048) ||
         reader->GetMetadataString("general.architecture") != "clip" ||
         reader->GetMetadataString("general.type") != "mmproj" ||
         reader->GetMetadataBool("clip.has_vision_encoder") != true ||
@@ -422,17 +449,24 @@ struct Encoder::Impl {
     if (reader->GetMetadataString("clip.projector_type") != "qwen3vl_merger") {
       throw std::invalid_argument("unsupported Qwen vision projector");
     }
+    // F16 sidecars convert to BF16 on upload. Qwen publishes BF16 weights, so
+    // an F16 export of them converts back exactly.
+    enum class Kind { kF32, kMatrix, kPatch };
     const auto require = [&](const std::string& name,
                              std::initializer_list<std::uint64_t> shape,
-                             core::GgmlType type) {
+                             Kind kind) {
       const auto* tensor = reader->FindTensor(name);
-      if (tensor == nullptr ||
-          tensor->dimensions != std::vector<std::uint64_t>(shape) ||
-          tensor->type != type) {
-        throw std::invalid_argument("invalid BF16 Qwen vision tensor: " + name);
+      const bool typed =
+          tensor != nullptr &&
+          (kind == Kind::kMatrix  ? IsMatrixType(tensor->type)
+           : kind == Kind::kPatch ? tensor->type == core::GgmlType::kF32 ||
+                                        tensor->type == core::GgmlType::kF16
+                                  : tensor->type == core::GgmlType::kF32);
+      if (!typed || tensor->dimensions != std::vector<std::uint64_t>(shape)) {
+        throw std::invalid_argument("invalid Qwen vision tensor: " + name);
       }
-      const auto bytes =
-          tensor->ElementCount() * (type == core::GgmlType::kF32 ? 4 : 2);
+      const auto bytes = tensor->ElementCount() *
+                         (tensor->type == core::GgmlType::kF32 ? 4 : 2);
       const auto address = reinterpret_cast<std::uintptr_t>(tensor->data);
       const bool mapped = std::any_of(
           reader->GetMappedRegions().begin(), reader->GetMappedRegions().end(),
@@ -447,29 +481,28 @@ struct Encoder::Impl {
     for (unsigned layer = 0; layer < 27; ++layer) {
       const auto prefix = "v.blk." + std::to_string(layer) + ".";
       for (const auto* norm : {"ln1", "ln2"}) {
-        require(prefix + norm + ".weight", {kHidden}, core::GgmlType::kF32);
-        require(prefix + norm + ".bias", {kHidden}, core::GgmlType::kF32);
+        require(prefix + norm + ".weight", {kHidden}, Kind::kF32);
+        require(prefix + norm + ".bias", {kHidden}, Kind::kF32);
       }
       for (const auto& [name, in, out] :
            std::array{std::tuple{"attn_qkv", kHidden, 3 * kHidden},
                       std::tuple{"attn_out", kHidden, kHidden},
                       std::tuple{"ffn_up", kHidden, kFfn},
                       std::tuple{"ffn_down", kFfn, kHidden}}) {
-        require(prefix + name + ".weight", {in, out}, core::GgmlType::kBF16);
-        require(prefix + name + ".bias", {out}, core::GgmlType::kF32);
+        require(prefix + name + ".weight", {in, out}, Kind::kMatrix);
+        require(prefix + name + ".bias", {out}, Kind::kF32);
       }
     }
-    require("v.patch_embd.weight", {16, 16, 3, kHidden}, core::GgmlType::kF32);
-    require("v.patch_embd.weight.1", {16, 16, 3, kHidden},
-            core::GgmlType::kF32);
-    require("v.patch_embd.bias", {kHidden}, core::GgmlType::kF32);
-    require("v.position_embd.weight", {kHidden, 2304}, core::GgmlType::kF32);
-    require("v.post_ln.weight", {kHidden}, core::GgmlType::kF32);
-    require("v.post_ln.bias", {kHidden}, core::GgmlType::kF32);
-    require("mm.0.weight", {kMergeHidden, kMergeHidden}, core::GgmlType::kBF16);
-    require("mm.0.bias", {kMergeHidden}, core::GgmlType::kF32);
-    require("mm.2.weight", {kMergeHidden, width}, core::GgmlType::kBF16);
-    require("mm.2.bias", {width}, core::GgmlType::kF32);
+    require("v.patch_embd.weight", {16, 16, 3, kHidden}, Kind::kPatch);
+    require("v.patch_embd.weight.1", {16, 16, 3, kHidden}, Kind::kPatch);
+    require("v.patch_embd.bias", {kHidden}, Kind::kF32);
+    require("v.position_embd.weight", {kHidden, 2304}, Kind::kF32);
+    require("v.post_ln.weight", {kHidden}, Kind::kF32);
+    require("v.post_ln.bias", {kHidden}, Kind::kF32);
+    require("mm.0.weight", {kMergeHidden, kMergeHidden}, Kind::kMatrix);
+    require("mm.0.bias", {kMergeHidden}, Kind::kF32);
+    require("mm.2.weight", {kMergeHidden, width}, Kind::kMatrix);
+    require("mm.2.bias", {width}, Kind::kF32);
     if (reader->GetTensorCount() != 334) {
       throw std::invalid_argument(
           "unexpected tensors in Qwen vision projector");
@@ -510,13 +543,33 @@ struct Encoder::Impl {
           tensor.ElementCount() * (tensor.type == core::GgmlType::kF32 ? 4 : 2);
       Allocation buffer = Allocation::Weight(bytes);
       bytes_uploaded += bytes;
-      upload.Copy(buffer.data, tensor.data, bytes);
+      if (tensor.type == core::GgmlType::kF16) {
+        const auto* half = static_cast<const std::uint16_t*>(tensor.data);
+        std::vector<std::uint16_t> converted(tensor.ElementCount());
+        for (std::size_t i = 0; i < converted.size(); ++i)
+          converted[i] = ToBf16(FromF16(half[i]));
+        upload.Copy(buffer.data, converted.data(), bytes);
+      } else {
+        upload.Copy(buffer.data, tensor.data, bytes);
+      }
       weights.emplace(tensor.name, std::move(buffer));
     }
-    const auto* first = static_cast<const float*>(
-        reader->FindTensor("v.patch_embd.weight")->data);
-    const auto* second = static_cast<const float*>(
-        reader->FindTensor("v.patch_embd.weight.1")->data);
+    const auto patch_values = [&](const char* name) {
+      const auto* tensor = reader->FindTensor(name);
+      std::vector<float> values(tensor->ElementCount());
+      if (tensor->type == core::GgmlType::kF16) {
+        const auto* half = static_cast<const std::uint16_t*>(tensor->data);
+        for (std::size_t i = 0; i < values.size(); ++i)
+          values[i] = FromF16(half[i]);
+      } else {
+        std::memcpy(values.data(), tensor->data, values.size() * sizeof(float));
+      }
+      return values;
+    };
+    const auto first_values = patch_values("v.patch_embd.weight");
+    const auto second_values = patch_values("v.patch_embd.weight.1");
+    const float* first = first_values.data();
+    const float* second = second_values.data();
     std::vector<std::uint16_t> patch(kHidden * kPatchDim);
     for (unsigned h = 0; h < kHidden; ++h) {
       for (unsigned c = 0; c < 3; ++c) {
@@ -564,12 +617,26 @@ std::shared_ptr<Encoder> Encoder::Open(const std::filesystem::path& target,
     return std::make_shared<Encoder>(sidecar, width);
   auto directory = target.parent_path();
   for (unsigned level = 0; level < 2; ++level) {
-    const auto path = directory / "mmproj-BF16.gguf";
-    if (std::filesystem::is_regular_file(path))
-      return std::make_shared<Encoder>(path, width);
+    for (const auto* name : {"mmproj-BF16.gguf", "mmproj-F16.gguf"}) {
+      const auto path = directory / name;
+      if (std::filesystem::is_regular_file(path))
+        return std::make_shared<Encoder>(path, width);
+    }
     directory = directory.parent_path();
   }
   return {};
+}
+std::uint32_t Encoder::TargetWidth(const core::GgufReader& target) {
+  const auto architecture = target.GetMetadataString("general.architecture");
+  if (!architecture)
+    return 0;
+  const auto width = target.GetMetadataUint64(std::string(*architecture) +
+                                              ".embedding_length");
+  if (*architecture == "qwen35" && width == 5120)
+    return 5120;  // Qwen3.8-27B
+  if (*architecture == "qwen35moe" && width == 2048)
+    return 2048;  // Qwen3.6-35B-A3B
+  return 0;
 }
 const std::string& Encoder::identity() const {
   std::call_once(impl_->identity_once, [&] {

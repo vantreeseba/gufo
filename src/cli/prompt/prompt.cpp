@@ -54,9 +54,10 @@ static void RegisterImageOptions(ArgParser& parser, PromptOptions& opt) {
   parser.AddFlag("", "--add-vision-id",
                  "Prefix image inputs with Picture N: in the chat template",
                  "Prompt", &opt.add_vision_id);
-  parser.AddOption("", "--mmproj", "PATH",
-                   "Qwen BF16 vision sidecar (auto-discovered beside model)",
-                   "Model", &opt.vision_model_path);
+  parser.AddOption(
+      "", "--mmproj", "PATH",
+      "Qwen BF16 or F16 vision sidecar (auto-discovered beside model)", "Model",
+      &opt.vision_model_path);
   parser.AddCustomOption(
       "", "--image", "PATH",
       "PNG/JPEG attached before text in the first user turn; repeat for "
@@ -621,15 +622,16 @@ std::shared_ptr<models::qwen::vision::Encoder> LoadQwenVision(
     const PromptOptions& opt, const core::GgufReader& reader) {
   if (opt.image_paths.empty() && opt.vision_model_path.empty())
     return {};
-  if (reader.GetMetadataUint64("qwen35.embedding_length") != 5120) {
+  const auto width = models::qwen::vision::Encoder::TargetWidth(reader);
+  if (width == 0) {
     throw std::invalid_argument(
-        "image input supports Qwen3.8-27B and Flash-Next");
+        "image input supports Qwen3.8-27B, Qwen3.6-35B-A3B and Flash-Next");
   }
   auto encoder = models::qwen::vision::Encoder::Open(
-      opt.model_path, opt.vision_model_path, 5120);
+      opt.model_path, opt.vision_model_path, width);
   if (!encoder)
     throw std::invalid_argument(
-        "image input requires a matching --mmproj BF16 sidecar");
+        "image input requires a matching --mmproj sidecar");
   return encoder;
 }
 
@@ -639,7 +641,7 @@ std::shared_ptr<const models::qwen::vision::Prompt> PrepareVision(
     const std::shared_ptr<models::qwen::vision::Encoder>& encoder) {
   if (!encoder)
     throw std::invalid_argument(
-        "image input requires a matching --mmproj BF16 sidecar");
+        "image input requires a matching --mmproj sidecar");
   const auto reasoning = PromptReasoningOptions(opt);
   return std::make_shared<models::qwen::vision::Prompt>(
       models::qwen::vision::Prepare(

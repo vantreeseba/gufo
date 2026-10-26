@@ -170,7 +170,7 @@ TextPreparedPrompt PrepareQwenPrompt(
     return {std::move(prompt->tokens), {}, cache_prefix};
   if (!encoder)
     throw std::invalid_argument(
-        "image input requires a matching --mmproj BF16 sidecar");
+        "image input requires a matching --mmproj sidecar");
   auto context = std::make_shared<QwenImageContext>();
   context->cache_identity = prompt->cache_identity;
   for (const auto& image : prompt->images) {
@@ -3346,22 +3346,23 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
   }
   std::shared_ptr<models::qwen::vision::Encoder> vision;
   try {
-    if (reader->GetMetadataUint64("qwen35.embedding_length") == 5120) {
+    if (const auto width =
+            models::qwen::vision::Encoder::TargetWidth(*reader)) {
       vision = models::qwen::vision::Encoder::Open(model_path,
-                                                   vision_model_path, 5120);
+                                                   vision_model_path, width);
     } else if (!vision_model_path.empty()) {
       throw std::invalid_argument(
-          "image input supports Qwen3.8-27B and Flash-Next");
+          "image input supports Qwen3.8-27B, Qwen3.6-35B-A3B and Flash-Next");
     }
   } catch (const std::exception& e) {
     SetError(error, e.what());
     return false;
   }
-  Logger::Info("loader", std::string("event=load_phase phase=target_weights "
-                                      "gpu_memory=") +
-                             (hip::DeviceMemoryRequired() ? "device"
-                                                          : "default") +
-                             " " + Logger::MemoryStatus());
+  Logger::Info("loader",
+               std::string("event=load_phase phase=target_weights "
+                           "gpu_memory=") +
+                   (hip::DeviceMemoryRequired() ? "device" : "default") + " " +
+                   Logger::MemoryStatus());
   auto model =
       hip::QwenGpuModel::CreateFromGguf(reader, &load_error, std::move(vision));
   if (model == nullptr) {
