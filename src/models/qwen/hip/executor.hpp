@@ -73,7 +73,10 @@ struct QwenGpuWeightRegion {
   void* device_data{nullptr};
   void* host_copy{nullptr};
   std::size_t size{0};
-  bool device_owned{false};
+  // Device placement (GUFO_QWEN_WEIGHT_MEMORY=device, or wherever mapped
+  // registration is refused, such as Windows): device_data is a hipMalloc
+  // allocation uploaded from the shard, and host_copy stays null.
+  bool owns_device_allocation{false};
 };
 
 struct QwenGpuMemoryUsage {
@@ -260,7 +263,7 @@ struct QwenMoeScratch {
   // allocation and left zero by every launch. They sit at the start of the
   // block with a fixed capacity, because the other spans move with the batch
   // size the view is carved for.
-  std::span<std::uint32_t> router_done;    // [kMoeRouterCounterSlots]
+  std::span<std::uint32_t> router_done;  // [kMoeRouterCounterSlots]
 };
 
 /// Fused-router counter capacity: the most tokens one launch can route.
