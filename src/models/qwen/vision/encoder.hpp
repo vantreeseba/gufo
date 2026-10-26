@@ -11,6 +11,10 @@
 
 #include "src/core/image.hpp"
 
+namespace gufo::core {
+class GgufReader;
+}
+
 namespace gufo::models::qwen::vision {
 
 /// Shared Qwen3.8 ViT operator graph. Each model supplies and validates its
@@ -38,8 +42,12 @@ public:
       std::function<void(std::string_view, std::span<const float>)>;
   using CancellationCheck = std::function<bool()>;
   Encoder(const std::filesystem::path& path, std::uint32_t output_width);
+  /// Projector output width for a Qwen text target with a supported vision
+  /// sidecar (Qwen3.8-27B or Qwen3.6-35B-A3B), or 0 when it has none.
+  [[nodiscard]] static std::uint32_t TargetWidth(
+      const core::GgufReader& target);
   /// An explicit sidecar is required to exist. Otherwise discover the canonical
-  /// sidecar beside the target or its quantization subdirectory.
+  /// BF16 or F16 sidecar beside the target or its quantization subdirectory.
   [[nodiscard]] static std::shared_ptr<Encoder> Open(
       const std::filesystem::path& target, const std::filesystem::path& sidecar,
       std::uint32_t output_width);

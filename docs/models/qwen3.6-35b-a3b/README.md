@@ -21,7 +21,13 @@ MODEL=path/to/Qwen3.6-35B-A3B-MTP-UD-Q8_K_XL.gguf
 ./result/bin/gufo prompt --model "$MODEL" --prompt "Explain virtual memory." --temperature 0
 ```
 
-Text-only model; there is no matching `mmproj` projector in scope. In prefill,
+Images use the matching `mmproj-BF16.gguf` or `mmproj-F16.gguf` beside the
+target, or `--mmproj PATH`. The vision tower is shared with Qwen3.8-27B; only
+the projector width (2048) differs. F16 sidecars convert to BF16 on upload,
+which is exact for Qwen's BF16 weights. Requests take images as described in
+[Qwen3.8-27B](../qwen3.8-27b/README.md).
+
+In prefill,
 each routed-expert projection picks its route by format: Q8_0 / Q4_K / Q5_K /
 Q6_K take Flash-Next's routed F16 WMMA GEMM, BF16 the grouped WMMA GEMM, and
 anything else the per-slot GEMV. Chunks of 1024+ tokens run gate and up as one
@@ -131,7 +137,7 @@ Thinking/template controls and HTTP sampling defaults are described in
 
 - Quantized MoE expert GEMM (Q8_0 / Q6_K / Q5_K / Q4_K) and the fused gate/up/down expert
   path; dense attention and GDN layers are shared with the other Qwen runners.
-- No vision, no audio. Speculative decoding is MTP (the GGUF's own head) or a
+- Image input through the shared Qwen vision encoder; no audio. Speculative decoding is MTP (the GGUF's own head) or a
   converted DFlash2 draft; both run in `gufo prompt`, `gufo bench` and
   `gufo serve`.
 - The prefill attention kernel is compiled only for head shapes listed in
