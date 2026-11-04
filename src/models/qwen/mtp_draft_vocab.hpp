@@ -11,8 +11,8 @@
 #include <utility>
 #include <vector>
 
-#include "src/models/qwen/tokenizer.hpp"
-#include "src/models/qwen38_flash_next/draft_vocab.hpp"
+#include "src/families/qwen/draft_vocab/draft_vocab.hpp"
+#include "src/families/qwen/text/tokenizer.hpp"
 
 namespace gufo::speculative {
 

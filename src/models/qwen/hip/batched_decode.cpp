@@ -3,16 +3,17 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <gufo/ext/experimental/hip_utils.hpp>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
 
 #include "qfn_mmq.h"
-#include "src/core/hip/hip_utils.hpp"
-#include "src/models/qwen/hip/detail/attention_policy.hpp"
+#include "src/families/qwen/hip_common/attention_policy.hpp"
+#include "src/families/qwen/kernels/ops.hpp"
+#include "src/families/qwen/kernels/verify_gemm_27b.hpp"
 #include "src/models/qwen/hip/detail/decode_step.hpp"
 #include "src/models/qwen/hip/executor.hpp"
-#include "src/models/qwen/hip/ops.hpp"
 #include "src/models/qwen/hip/ops/moe.hpp"
 #include "src/models/qwen/hip/ops/moe_wave64.hpp"
 #include "src/models/qwen/modules/moe.hpp"
@@ -33,6 +34,9 @@ void LaunchProjection(const models::QwenTensorRef& weight, const float* input,
                       float* output, std::size_t batch_size,
                       std::size_t output_size, std::size_t input_size,
                       hipStream_t stream) {
+  if (TryLaunchVerifyGemm27(weight.type, weight.data, input, output, batch_size,
+                            output_size, input_size, stream))
+    return;
   if (SupportsExactSharedProjection(weight.type)) {
     LaunchBatchedQuantGEMMFp32(weight.type, weight.data, input, output,
                                batch_size, output_size, input_size, stream);
@@ -127,8 +131,8 @@ void LaunchMoeFfn(const models::QwenLayerWeights& layer,
           view.shexp_gate_inp.type, scratch.decode.normed.data(),
           moe.router_logits.data(), moe.shexp_gate.data(), moe.ids.data(),
           moe.weights.data(), moe.router_done.data(), moe.router_done.size(),
-          tokens, n_experts,
-          static_cast<std::uint32_t>(hidden), n_used, stream);
+          tokens, n_experts, static_cast<std::uint32_t>(hidden), n_used,
+          stream);
   if (!fused_router) {
     LaunchProjection(view.router, scratch.decode.normed.data(),
                      moe.router_logits.data(), batch_size, n_experts, hidden,
@@ -217,12 +221,12 @@ void LaunchMoeFfn(const models::QwenLayerWeights& layer,
   }
   const bool fused_combine =
       experiments.fuse_combine &&
-      LaunchMoeSharedDownCombine(
-          view.shexp_down.data, view.shexp_down.type, moe.shexp_act.data(),
-          moe.down_e.data(), moe.weights.data(), moe.shexp_gate.data(),
-          scratch.ffn.out.data(), tokens, n_used,
-          static_cast<std::uint32_t>(hidden),
-          static_cast<std::uint32_t>(shared_ff), stream);
+      LaunchMoeSharedDownCombine(view.shexp_down.data, view.shexp_down.type,
+                                 moe.shexp_act.data(), moe.down_e.data(),
+                                 moe.weights.data(), moe.shexp_gate.data(),
+                                 scratch.ffn.out.data(), tokens, n_used,
+                                 static_cast<std::uint32_t>(hidden),
+                                 static_cast<std::uint32_t>(shared_ff), stream);
   if (!fused_combine) {
     if (experiments.fuse_combine) {
       LaunchProjection(view.shexp_down, moe.shexp_act.data(),
@@ -593,6 +597,10 @@ QwenGpuExecutor::ForwardVerificationBatch(
   const bool capture_prompt_hidden_ = coordinator.capture_prompt_hidden_;
   const auto policy = coordinator.policy_.Fingerprint();
   constexpr std::size_t kMaxRows = kMaxDecodeBatch * kMaxDecodeBatch;
+  static_assert(kMaxWideVerificationRows <= kMaxRows);
+  // One session may verify a wide chain; batched sessions keep eight rows.
+  const std::size_t max_tokens =
+      items.size() == 1 ? kMaxWideVerificationRows : kMaxDecodeBatch;
   std::array<std::size_t, kMaxDecodeBatch> offsets{};
   std::size_t batch_size = 0;
   for (std::size_t index = 0; index < items.size(); ++index) {
@@ -603,7 +611,7 @@ QwenGpuExecutor::ForwardVerificationBatch(
         executor->capture_prompt_hidden_ != capture_prompt_hidden_ ||
         !std::ranges::equal(executor->arena_.GetTargetLayerCapture(),
                             arena_.GetTargetLayerCapture()) ||
-        item.tokens.empty() || item.tokens.size() > kMaxDecodeBatch) {
+        item.tokens.empty() || item.tokens.size() > max_tokens) {
       throw std::invalid_argument(
           "Qwen verification has incompatible sessions or token counts");
     }
@@ -622,6 +630,10 @@ QwenGpuExecutor::ForwardVerificationBatch(
     throw std::length_error(
         "Qwen verification exceeds coordinator scratch capacity");
   }
+  // Rollback replays every committed row of a chain from the pinned state.
+  for (const auto& item : items)
+    if (item.executor->arena_.EnsureSsmReplayCapacity(item.tokens.size()))
+      item.executor->graph_executor_.Reset();
   std::array<models::qwen::ContinuationWrite, kMaxDecodeBatch> writes;
   for (std::size_t i = 0; i < items.size(); ++i)
     if (auto* hooks = items[i].executor->continuation_hooks_)
@@ -762,12 +774,22 @@ QwenGpuExecutor::ForwardVerificationBatch(
         }
       }
 
-      for (std::size_t index = 0; index < items.size(); ++index) {
+      // Attention runs in segments of at most eight rows, each with the start
+      // position (split-K count, online route) of an ordinary verification of
+      // those rows. Only a wide single-session chain has more than one.
+      for (std::size_t index = 0, item_row = 0; index < items.size();) {
         const auto& item = items[index];
         auto& state_arena = item.executor->arena_;
-        const std::size_t offset = offsets[index];
-        const std::size_t sequence_size = item.tokens.size();
-        const std::uint32_t start_pos = item.position;
+        const std::size_t offset = offsets[index] + item_row;
+        const std::size_t sequence_size =
+            std::min(kMaxDecodeBatch, item.tokens.size() - item_row);
+        const std::uint32_t start_pos =
+            item.position + static_cast<std::uint32_t>(item_row);
+        item_row += sequence_size;
+        if (item_row == item.tokens.size()) {
+          ++index;
+          item_row = 0;
+        }
         const std::size_t total_k = state_arena.GetAttentionKvPlaneElements();
         if (fused_qknorm_rope_kv) {
           LaunchBatchedFusedQKNormRoPEKvWrite(

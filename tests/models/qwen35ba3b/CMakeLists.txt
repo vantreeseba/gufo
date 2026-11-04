@@ -5,14 +5,14 @@ if (ENGINE_ENABLE_HIP)
   add_executable(qwen35ba3b_moe_ops_test
     ${CMAKE_CURRENT_SOURCE_DIR}/moe_ops_test.cpp)
   target_link_libraries(qwen35ba3b_moe_ops_test
-    PRIVATE gufo_core gufo_qwen38_flash_next_mmq)
+    PRIVATE gufo_core ${GUFO_QWEN_LIBRARIES})
   add_test(NAME qwen35ba3b_moe_ops_test COMMAND qwen35ba3b_moe_ops_test)
   set_tests_properties(qwen35ba3b_moe_ops_test PROPERTIES
     LABELS "qwen35ba3b;gpu;hip;moe;kernels;correctness")
 
   add_executable(qwen35ba3b_target_test
     ${CMAKE_CURRENT_SOURCE_DIR}/target_test.cpp)
-  target_link_libraries(qwen35ba3b_target_test PRIVATE gufo_core)
+  target_link_libraries(qwen35ba3b_target_test PRIVATE gufo_core ${GUFO_QWEN_LIBRARIES})
   add_test(NAME qwen35ba3b_target_test COMMAND qwen35ba3b_target_test)
   set_tests_properties(qwen35ba3b_target_test PROPERTIES
     LABELS "qwen35ba3b;gpu;hip;target;external-model" SKIP_RETURN_CODE 77)
@@ -22,10 +22,10 @@ endif()
 if (ENGINE_ENABLE_HIP)
   add_executable(qwen35ba3b_verify_bench
     ${CMAKE_CURRENT_SOURCE_DIR}/verify_bench.cpp)
-  target_link_libraries(qwen35ba3b_verify_bench PRIVATE gufo_core)
+  target_link_libraries(qwen35ba3b_verify_bench PRIVATE gufo_core ${GUFO_QWEN_LIBRARIES})
 endif()
 if (ENGINE_ENABLE_HIP)
   add_executable(qwen35ba3b_prefill_chunk_bench
     ${CMAKE_CURRENT_SOURCE_DIR}/prefill_chunk_bench.cpp)
-  target_link_libraries(qwen35ba3b_prefill_chunk_bench PRIVATE gufo_core)
+  target_link_libraries(qwen35ba3b_prefill_chunk_bench PRIVATE gufo_core ${GUFO_QWEN_LIBRARIES})
 endif()

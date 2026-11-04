@@ -134,10 +134,34 @@ bool TruncateAndNormalize(std::span<const float> full, std::size_t dimensions,
   return true;
 }
 
-bool IsKnownField(std::string_view name, bool native) {
-  return name == "input" || name == "model" || name == "encoding_format" ||
-         name == "dimensions" || name == "user" || name == "truncate" ||
-         (native && (name == "content" || name == "embd_normalize"));
+/// Whether a base64 `multimodal_data` file looks like audio, as llama.cpp's
+/// mtmd helper decides (`is_audio_file`): WAV, MP3 (an ID3 tag or an MPEG
+/// sync word) or FLAC. Ogg, which Gufo's audio decoder also reads, is sniffed
+/// too. Anything else, including undecodable base64, goes to the image reader.
+bool LooksLikeAudio(std::string_view base64) {
+  constexpr std::string_view kDigits =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  if (base64.size() < 16)
+    return false;
+  std::array<unsigned char, 12> head{};
+  for (std::size_t i = 0; i < 16; i += 4) {
+    std::uint32_t bits = 0;
+    for (std::size_t j = 0; j < 4; ++j) {
+      const auto digit = kDigits.find(base64[i + j]);
+      if (digit == std::string_view::npos)
+        return false;
+      bits = (bits << 6) | static_cast<std::uint32_t>(digit);
+    }
+    head[i / 4 * 3] = static_cast<unsigned char>(bits >> 16);
+    head[i / 4 * 3 + 1] = static_cast<unsigned char>(bits >> 8);
+    head[i / 4 * 3 + 2] = static_cast<unsigned char>(bits);
+  }
+  const auto starts = [&](std::size_t offset, std::string_view magic) {
+    return std::equal(magic.begin(), magic.end(), head.begin() + offset);
+  };
+  return (starts(0, "RIFF") && starts(8, "WAVE")) || starts(0, "ID3") ||
+         (head[0] == 0xFF && (head[1] & 0xE0) == 0xE0) || starts(0, "fLaC") ||
+         starts(0, "OggS");
 }
 
 /// The member's value, or nullptr when it is absent or null.
@@ -159,36 +183,32 @@ HttpResponse Embed(const HttpRequest& request, EmbeddingService& service,
     return BadRequest("request body must be a JSON object",
                       "invalid_request_body");
   }
-  for (const auto& [name, unused] : root.members()) {
-    (void)unused;
-    if (!IsKnownField(name, native)) {
-      return BadRequest("unsupported embeddings parameter: " + name,
-                        "unsupported_field");
-    }
-  }
+  // As in llama.cpp, TEI, vLLM and Ollama, unknown members are ignored.
 
   if (const json::Value* model = Optional(root, "model"); model != nullptr) {
     if (!model->is_string()) {
       return BadRequest("'model' must be a string", "invalid_parameter_type");
     }
-    if (model->str() != service.model_id()) {
+    if (!service.serves_model(model->str())) {
       return Error(404, "requested embedding model is not loaded",
                    "model_not_found");
     }
   }
 
   const json::Value* input = Optional(root, "input");
-  // As in llama.cpp, `input` takes precedence over the legacy `content`.
-  if (input == nullptr && native)
-    input = Optional(root, "content");
+  // As in llama.cpp, `input` takes precedence over the legacy `content`, and
+  // `content` selects the native form on either route.
   if (input == nullptr) {
-    return BadRequest(
-        native ? "'input' or 'content' is required" : "'input' is required",
-        "missing_input");
+    input = Optional(root, "content");
+    native = native || input != nullptr;
+  }
+  if (input == nullptr) {
+    return BadRequest("'input' or 'content' is required", "missing_input");
   }
   std::vector<EmbeddingInput> inputs;
   std::size_t image_count = 0;
   std::size_t audio_count = 0;
+  std::size_t video_count = 0;
   const auto parse_item = [&](const json::Value& item) -> HttpResponse {
     EmbeddingInput parsed;
     if (item.is_string()) {
@@ -234,13 +254,23 @@ HttpResponse Embed(const HttpRequest& request, EmbeddingService& service,
         if (!file.is_string() || file.str().empty())
           return BadRequest("'multimodal_data' items must be base64 strings",
                             "invalid_parameter_type");
-        if (++image_count > EmbeddingService::kMaxImages)
-          return BadRequest("embedding requests accept at most 32 images",
-                            "too_many_images");
-        // The image reader identifies PNG, JPEG and WebP by their bytes.
-        parsed.content.push_back(
-            {EmbeddingPart::Type::kImage,
-             "data:image/jpeg;base64," + std::string(file.str())});
+        if (LooksLikeAudio(file.str())) {
+          if (++audio_count > EmbeddingService::kMaxAudio)
+            return BadRequest(
+                "embedding requests accept at most 32 audio clips",
+                "too_many_audio");
+          // The audio reader takes raw base64; the decoder checks the bytes.
+          parsed.content.push_back(
+              {EmbeddingPart::Type::kAudio, std::string(file.str())});
+        } else {
+          if (++image_count > EmbeddingService::kMaxImages)
+            return BadRequest("embedding requests accept at most 32 images",
+                              "too_many_images");
+          // The image reader identifies PNG, JPEG and WebP by their bytes.
+          parsed.content.push_back(
+              {EmbeddingPart::Type::kImage,
+               "data:image/jpeg;base64," + std::string(file.str())});
+        }
         begin = end + kMediaMarker.size();
       }
       if (parsed.content.empty())
@@ -275,6 +305,28 @@ HttpResponse Embed(const HttpRequest& request, EmbeddingService& service,
             return BadRequest("embedding requests accept at most 32 images",
                               "too_many_images");
           parsed.content.push_back({EmbeddingPart::Type::kImage, url->str()});
+        } else if (type == "input_video") {
+          const auto* video = part.find("input_video");
+          if (part.size() != 2 || !video || !video->is_object())
+            return BadRequest("video parts require an 'input_video' object",
+                              "invalid_parameter_type");
+          for (const auto& [key, value] : video->members()) {
+            if ((key != "data" && key != "url") || !value.is_string())
+              return BadRequest(
+                  "input_video accepts string data and url fields",
+                  "invalid_parameter_type");
+          }
+          const auto* source = video->find("data");
+          if (!source)
+            source = video->find("url");
+          if (!source || source->str().empty())
+            return BadRequest("input_video requires nonempty data or url",
+                              "invalid_parameter_type");
+          if (++video_count > EmbeddingService::kMaxVideos)
+            return BadRequest("embedding requests accept at most 32 videos",
+                              "too_many_videos");
+          parsed.content.push_back(
+              {EmbeddingPart::Type::kVideo, source->str()});
         } else if (type == "input_audio") {
           const auto* audio = part.find("input_audio");
           if (part.size() != 2 || !audio || !audio->is_object())
@@ -379,7 +431,89 @@ HttpResponse Embed(const HttpRequest& request, EmbeddingService& service,
     return BadRequest("'user' must be a string", "invalid_parameter_type");
   }
 
+  std::string prompt_name = service.default_prompt_name();
+  bool requested_prompt = false;
+  if (const json::Value* value = Optional(root, "prompt_name");
+      value != nullptr) {
+    if (!value->is_string()) {
+      return BadRequest("'prompt_name' must be a string",
+                        "invalid_parameter_type");
+    }
+    prompt_name = value->str();
+    requested_prompt = true;
+  }
+  if (!prompt_name.empty()) {
+    const std::string* prefix = service.prompt(prompt_name);
+    if (prefix == nullptr) {
+      return BadRequest("unknown prompt_name '" + prompt_name + "'",
+                        "invalid_prompt_name");
+    }
+    // A leading text part: the service joins adjacent text before
+    // tokenizing, so this equals a client-side prefix. A requested prompt
+    // applies to every input, as in sentence-transformers. The model card
+    // passes images and audio without a prefix, so the server default skips
+    // inputs without text.
+    for (EmbeddingInput& input : inputs) {
+      const bool has_text =
+          std::ranges::any_of(input.content, [](const EmbeddingPart& part) {
+            return part.type == EmbeddingPart::Type::kText &&
+                   !part.value.empty();
+          });
+      if (requested_prompt || has_text) {
+        input.content.insert(input.content.begin(),
+                             {EmbeddingPart::Type::kText, *prefix});
+      }
+    }
+  }
+
   EmbeddingRequestOptions options;
+  if (const auto* video = Optional(root, "video_options")) {
+    if (!video->is_object())
+      return BadRequest("video_options must be an object",
+                        "invalid_parameter_type");
+    for (const auto& [key, value] : video->members()) {
+      if (key == "fps") {
+        if (!value.is_number() || !std::isfinite(value.as_double()) ||
+            value.as_double() <= 0 || value.as_double() > 120)
+          return BadRequest("video fps must be in (0, 120]",
+                            "invalid_video_options");
+        options.video.fps = value.as_double();
+      } else if (key == "max_frames") {
+        const auto n = value.as_size(0);
+        if (!value.is_number() || n < 1 || n > 32 ||
+            value.as_double() != static_cast<double>(n))
+          return BadRequest("video max_frames must be an integer in [1, 32]",
+                            "invalid_video_options");
+        options.video.max_frames = n;
+      } else if (key == "add_timestamps") {
+        if (!value.is_bool())
+          return BadRequest("add_timestamps must be boolean",
+                            "invalid_video_options");
+        options.video.timestamps = value.as_bool();
+      } else if (key == "overflow_strategy") {
+        if (!value.is_string() ||
+            (value.str() != "uniform" && value.str() != "truncate"))
+          return BadRequest(
+              "video overflow_strategy must be uniform or truncate",
+              "invalid_video_options");
+        options.video.truncate_overflow = value.str() == "truncate";
+      } else if (key == "max_soft_tokens") {
+        const auto budget = value.as_size(0);
+        if (!value.is_number() ||
+            value.as_double() != static_cast<double>(budget) ||
+            !(budget == 70 || budget == 140 || budget == 280 || budget == 560 ||
+              budget == 1120))
+          return BadRequest(
+              "video max_soft_tokens must be one of 70, 140, 280, 560, or "
+              "1120",
+              "invalid_video_options");
+        options.video.max_soft_tokens = static_cast<std::uint32_t>(budget);
+      } else
+        return BadRequest("unsupported video option: " + key,
+                          "invalid_video_options");
+    }
+  }
+
   if (const json::Value* truncate = Optional(root, "truncate");
       truncate != nullptr) {
     if (!truncate->is_bool()) {
@@ -387,6 +521,31 @@ HttpResponse Embed(const HttpRequest& request, EmbeddingService& service,
                         "invalid_parameter_type");
     }
     options.truncate = truncate->as_bool();
+  }
+
+  // vLLM's per-request processor options. Only the image budget is supported.
+  if (const json::Value* kwargs = Optional(root, "mm_processor_kwargs");
+      kwargs != nullptr) {
+    if (!kwargs->is_object()) {
+      return BadRequest("'mm_processor_kwargs' must be an object",
+                        "invalid_parameter_type");
+    }
+    for (const auto& [key, value] : kwargs->members()) {
+      if (key != "max_soft_tokens") {
+        return BadRequest("unsupported mm_processor_kwargs key '" + key +
+                              "'; only 'max_soft_tokens' is supported",
+                          "invalid_mm_processor_kwargs");
+      }
+      const auto budget = value.as_size(0);
+      if (budget > kMaxImageSoftTokens ||
+          !(budget == 70 || budget == 140 || budget == 280 || budget == 560 ||
+            budget == 1120)) {
+        return BadRequest(
+            "'max_soft_tokens' must be one of 70, 140, 280, 560, or 1120",
+            "invalid_mm_processor_kwargs");
+      }
+      options.image_soft_tokens = static_cast<std::uint32_t>(budget);
+    }
   }
 
   EmbeddingBatch batch;
@@ -403,6 +562,8 @@ HttpResponse Embed(const HttpRequest& request, EmbeddingService& service,
                             std::to_string(EmbeddingService::kMaxInputTokens) +
                             "-token context window",
                         "context_length_exceeded");
+    case EmbeddingStatus::kInvalidVideoInput:
+      return BadRequest(error, "invalid_video_input");
     case EmbeddingStatus::kInvalidAudioInput:
       return BadRequest(error, "invalid_audio_input");
     case EmbeddingStatus::kInvalidInput:

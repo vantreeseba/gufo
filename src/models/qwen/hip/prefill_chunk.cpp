@@ -1,23 +1,26 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include <algorithm>
+#include <cstdlib>
+#include <gufo/ext/experimental/dispatch_telemetry.hpp>
+#include <gufo/ext/experimental/hip_utils.hpp>
 #include <optional>
 #include <stdexcept>
 
-#include "src/core/hip/detail/dispatch_telemetry.hpp"
-#include "src/core/hip/hip_utils.hpp"
-#include "src/models/qwen/gemm_route.hpp"
-#include "src/models/qwen/hip/detail/attention_policy.hpp"
+#include "src/families/qwen/hip_common/attention_policy.hpp"
+#include "src/families/qwen/hip_common/gemm_route.hpp"
+#include "src/families/qwen/kernels/ops.hpp"
+#include "src/families/qwen/kernels/ops/prefill_fp16.hpp"
 #include "src/models/qwen/hip/executor.hpp"
-#include "src/models/qwen/hip/ops.hpp"
 #include "src/models/qwen/hip/ops/moe.hpp"
-#include "src/models/qwen/hip/ops/prefill_fp16.hpp"
+#include "src/models/qwen/hip/ops/moe_routed.hpp"
 #include "src/models/qwen/modules/moe.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 
 namespace gufo::hip {
 namespace {
 
-namespace routed = models::qwen38_flash_next::rocm;
+namespace qfn = models::qwen38_flash_next::rocm;
+namespace routed = moe_routed;
 
 /// Host side of the routed F16 expert path: the per-expert counts come back
 /// once per layer to size the (expert, token tile) map, as in the Flash-Next
@@ -228,9 +231,9 @@ void ExecuteMoePrefillChunk(QwenGpuArena& arena, const QwenMoeScratch& moe,
   RoutedHostState& routed_host = GetRoutedHostState();
   if (routed_gate_up || routed_down) {
     routed_host.Reserve(n_experts, RoutedTiles(slots, n_experts));
-    routed::ExpertCounts(moe.ids.data(), routed_counts,
-                         static_cast<std::uint32_t>(batch_size), n_experts,
-                         n_used, stream);
+    qfn::ExpertCounts(moe.ids.data(), routed_counts,
+                      static_cast<std::uint32_t>(batch_size), n_experts, n_used,
+                      stream);
     HIP_CHECK(hipMemcpyAsync(routed_host.counts, routed_counts,
                              n_experts * sizeof(std::uint32_t),
                              hipMemcpyDeviceToHost, stream));
@@ -340,8 +343,8 @@ void ExecuteMoePrefillChunk(QwenGpuArena& arena, const QwenMoeScratch& moe,
   auto* act_half = reinterpret_cast<__half*>(moe.up_e.data());
   bool act_is_half = false;
   if (routed_gate_up) {
-    routed::NarrowActivations(arena.d_normed, moe.x_half.data(), false,
-                              batch_size * hidden, stream);
+    qfn::NarrowActivations(arena.d_normed, moe.x_half.data(), false,
+                           batch_size * hidden, stream);
     const auto* x_half = reinterpret_cast<const __half*>(moe.x_half.data());
     const auto paired_gate_up = [&](const std::int32_t* tiles,
                                     std::uint32_t count, std::uint32_t rows) {
@@ -411,8 +414,8 @@ void ExecuteMoePrefillChunk(QwenGpuArena& arena, const QwenMoeScratch& moe,
   // The down projection reads one activation row per (token, slot).
   if (routed_down) {
     if (!act_is_half) {
-      routed::NarrowActivations(moe.gate_e.data(), act_half, false,
-                                slots * expert_ff, stream);
+      qfn::NarrowActivations(moe.gate_e.data(), act_half, false,
+                             slots * expert_ff, stream);
     }
     auto* down_half = reinterpret_cast<__half*>(moe.down_e.data());
     // The kernel decodes an expert's weights once per tile, so a paired layer
@@ -439,10 +442,10 @@ void ExecuteMoePrefillChunk(QwenGpuArena& arena, const QwenMoeScratch& moe,
               : down(moe.routed_tiles.data(), n_tiles, tile_rows))) {
       throw std::runtime_error("routed F16 expert down GEMM failed");
     }
-    routed::MoeEpilogueVec4F16(
-        down_half, moe.weights.data(), moe.shexp_out.data(),
-        moe.shexp_gate.data(), 1, arena.d_ffn_out,
-        static_cast<std::uint32_t>(batch_size), n_used, hidden, stream);
+    qfn::MoeEpilogueVec4F16(down_half, moe.weights.data(), moe.shexp_out.data(),
+                            moe.shexp_gate.data(), 1, arena.d_ffn_out,
+                            static_cast<std::uint32_t>(batch_size), n_used,
+                            hidden, stream);
   } else {
     if (grouped_bf16(view.down_exps, hidden, expert_ff)) {
       LaunchMoeGroupedBf16Gemm(view.down_exps.data, moe.gate_e.data(),

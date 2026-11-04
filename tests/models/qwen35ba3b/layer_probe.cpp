@@ -17,13 +17,13 @@
 #include "qfn_mmq.h"
 #include "src/core/gguf_reader.hpp"
 #include "src/core/hip/hip_utils.hpp"
+#include "src/families/qwen/kernels/ops/gemm.hpp"
+#include "src/families/qwen/kernels/ops/swiglu.hpp"
+#include "src/families/qwen/text/tokenizer.hpp"
 #include "src/models/qwen/forward.hpp"
 #include "src/models/qwen/hip/executor.hpp"
-#include "src/models/qwen/hip/ops/gemm.hpp"
 #include "src/models/qwen/hip/ops/moe.hpp"
-#include "src/models/qwen/hip/ops/swiglu.hpp"
 #include "src/models/qwen/modules/moe.hpp"
-#include "src/models/qwen/tokenizer.hpp"
 
 namespace {
 using Token = gufo::tokenization::TokenId;

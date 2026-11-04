@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <gufo/ext/draft_backend.hpp>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -10,11 +11,10 @@
 #include <string>
 #include <vector>
 
-#include "src/core/speculative/draft_backend.hpp"
+#include "src/families/qwen/text/tokenizer.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/mtp_draft_vocab.hpp"
 #include "src/models/qwen/mtp_reference.hpp"
-#include "src/models/qwen/tokenizer.hpp"
 #include "src/models/qwen38_flash_next/mtp_sampling.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)

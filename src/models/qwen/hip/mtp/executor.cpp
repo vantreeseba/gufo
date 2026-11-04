@@ -14,10 +14,10 @@
 #include "qfn_mmq.h"
 #include "src/core/hip/hip_utils.hpp"
 #include "src/core/hip/snapshot_transfer.hpp"
-#include "src/models/qwen/hip/detail/attention_policy.hpp"
+#include "src/families/qwen/hip_common/attention_policy.hpp"
+#include "src/families/qwen/kernels/ops.hpp"
 #include "src/models/qwen/hip/mtp.hpp"
 #include "src/models/qwen/hip/mtp/detail/allocation.hpp"
-#include "src/models/qwen/hip/ops.hpp"
 #include "src/models/qwen/hip/ops/moe.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 

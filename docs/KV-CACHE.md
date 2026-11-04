@@ -27,8 +27,8 @@ that is correct for every model, including hybrid-recurrent ones. It costs the
 ability to trim a checkpoint: a saved snapshot can only be reused **whole**,
 and only when its tokens are an exact prefix of the new prompt.
 
-Qwen3.8-27B (AR and DFlash2) and Qwen3.8-Flash-Next serve through the
-component cache of the [cache redesign](cache-redesign/RFC.md). Its backing
+Qwen3.8-27B (AR and DFlash2), Qwen3.8-Flash-Next and DeepSeek V4 Flash (AR and
+DSpark) serve through the component cache of the [cache redesign](cache-redesign/RFC.md). Its backing
 and disk options are described under [component-cache budgets](#component-cache-budgets).
 Qwen27B retains target KV, convolution and recurrent state, image identity,
 sampled frontier and pending output tokens. DFlash2 adds private ring KV with
@@ -37,9 +37,16 @@ Borrowed target KV rows are preserved before mutation or rollback; private
 frontiers are captured into committed host backing. Disk transfers use fixed
 1 MiB staging regardless of checkpoint size.
 
-The snapshot-cache implementation below remains in use for DeepSeek. Earlier
-Qwen examples and measurements describe its former snapshot implementation;
-they are historical evidence, rather than qualification of the component path.
+DeepSeek shares its compressed attention and indexer rows, which are final once
+emitted, one row per `ratio` tokens. Each layer's sliding window and compressor
+frontiers are private, as are logits and the DSpark windows, so a checkpoint
+carries a fixed private cost whatever its depth. Rows are copied at capture
+rather than borrowed, because compressed caches grow by reallocation.
+
+The snapshot-cache implementation below remains for runners that do not provide
+a component adapter, such as extensions. Earlier examples and measurements
+describe that implementation; they are historical evidence, rather than
+qualification of the component path.
 
 ## Why it exists
 
@@ -303,7 +310,8 @@ history, and a one-row head computes the boundary logits. Attention queries
 on either side keep the grouping of separate passes. The final batch can
 include up to 128 tokens beyond the normal 2,048-token chunk, so a prompt that
 ends just past a chunk needs no separate tail pass; the stable boundary must be
-within eight tokens of that batch's end.
+within eleven tokens of that batch's end (an eight-token assistant suffix plus
+the up to three tokens a four-token-aligned boundary falls back).
 The cache reserves the full payload before enabling this capture. Disk,
 image, intermediate and learned-prefix checkpoints still stop prefill at
 their boundary.
@@ -358,6 +366,16 @@ captured; RAM-retained snapshots and their captures in progress share the RAM bu
 | RAM checkpoint records | 128, independent of `--sessions` | internal safety limit |
 | Disk bytes | 8 GiB | `--cache-disk-bytes` |
 | Disk staging bytes | smaller of `MemAvailable / 8` and the disk budget | `--cache-disk-staging-bytes` |
+
+`--cache-ram-bytes off` turns the RAM cache off. The server then keeps no
+checkpoint in RAM, commits no cache backing, and computes no budget. Without
+`--cache-disk` it also grows no backing before prefill. Each session still reuses its own live state, `--cache-disk`
+still works, and the per-response `gufo.component_cache` block stays present
+with zero captures. Off drops every RAM checkpoint, so there is no restore from
+RAM, no shared-prefix or branch checkpoint, and no retained history. With
+`--cache-disk`, Qwen and Flash-Next still copy each disk capture through a
+bounded 512 MiB backing, so `backing_prepared` appears in that case only. The
+startup line reports `ram_cache=off capacity_bytes=0`.
 
 `--cache-ram-bytes 0` selects automatic sizing. Zero does not disable reuse.
 A positive value replaces the automatic budget and may exceed it: it trades the
@@ -565,15 +583,22 @@ versus not, which reuse identically and interoperate within one conversation.
 `/v1/completions` or `/completion` bypasses lookup for a single request. The
 result can still populate the cache. `null` keeps the default, `true`.
 
+`cache_persist: false` on the same endpoints keeps one request's checkpoints
+in RAM only: nothing it captures is written or staged for the disk tier, so
+they are lost on eviction or restart. It still reads disk checkpoints, and it
+does not stop a later request without the flag from persisting the same
+prefix. `null` keeps the default, `true`. Responses echo the applied value as
+a top-level `cache_persist`; see [the server guide](SERVER.md).
+
 ## Observing it
 
 | Log line | Meaning |
 | --- | --- |
-| `event=snapshot_cache_configured` | retained capacity at startup, with the automatic budget and the most an explicit `--cache-ram-bytes` may claim |
-| `schema=component-cache-v1 event=configured` | Flash-Next: RAM, staging and disk budgets at startup, with the automatic budget and the most an explicit `--cache-ram-bytes` may claim |
+| `event=snapshot_cache_configured` | retained capacity at startup, with the automatic budget and the most an explicit `--cache-ram-bytes` may claim; `ram_cache=on` or `ram_cache=off` at the end of the line |
+| `schema=component-cache-v1 event=configured` | Flash-Next: RAM, staging and disk budgets at startup, with the automatic budget and the most an explicit `--cache-ram-bytes` may claim; `ram_cache=on` or `ram_cache=off` at the end of the line, and `disk_backing_bytes` for the backing an off cache keeps for disk captures |
 | `schema=component-cache-v1 event=backing_grown` | Flash-Next: a capture committed another segment of cache pages (about 1 GiB); reports `committed_bytes`, `segments` and the capture's `acquire_ms` |
 | `schema=component-cache-v1 event=backing_limited reason=host_reserve` | Flash-Next: the cache stopped growing below its budget because the host would keep less than 4 GiB available |
-| `schema=component-cache-v1 event=backing_limited reason=device_heap_reserve` | Flash-Next: the cache stopped growing because its pinned pages would leave the device heap less than its 4 GiB dispatch reserve, which would push session and scratch allocations onto managed memory (#460) |
+| `schema=component-cache-v1 event=backing_limited reason=device_heap_reserve` | Flash-Next: the cache stopped growing because registering a segment's pages took the device heap below its 4 GiB dispatch reserve, which would push session and scratch allocations onto managed memory (#460). Hosts that do not charge registered pages to the heap log it only when other allocations shrink the heap during the registration (#781) |
 | `schema=component-cache-v1 event=option_ignored option=--cache-disk-staging-bytes` | Flash-Next: the staging option is ignored; disk transfers use the internal buffer |
 | `schema=component-cache-v1 event=disk_evicted reason=budget` | Flash-Next: startup removed the oldest checkpoints (creation order) to fit a lowered `--cache-disk-bytes` |
 | `schema=component-cache-v1 event=disk_over_budget` | Flash-Next: the directory still exceeds `--cache-disk-bytes` after startup reclamation and eviction; publication is refused until it fits |
@@ -588,12 +613,21 @@ result can still populate the cache. `null` keeps the default, `true`.
 
 Per-request outcomes appear in the completion log and in `usage.gufo`:
 `cache_hit`, `cache_miss_reason`, `cache_common_prefix_tokens`,
-`cache_checkpoint_tokens`, `cache_restore_bytes`, `cache_restore_ms`,
+`cache_checkpoint_tokens`, `cache_restore_bytes`, `cache_restore_ms` (bytes and
+milliseconds restored on a hit), `cache_disk_hit` (the restored prefix came
+from disk), `cache_snapshot_bytes`, `cache_snapshot_ms` (the KV snapshot this
+request's retained prefix occupies and the time to snapshot it, also reported
+when a stop or cancel path retains the prefix), `cache_disk_queued_bytes`,
+`cache_disk_enqueue_ms` (snapshot bytes handed to disk publication and their
+enqueue time), `cache_shared_prefix_snapshots`, `cache_shared_prefix_bytes`,
+`cache_shared_prefix_ms` (shared-prefix snapshots and bytes queued for
+persistence during prefill and the time spent capturing them),
 `shared_prefix_wait_ms` (time spent waiting for a concurrent request, part of
 `queue_ms`), plus
 `prompt_n` (newly processed) and `cache_n` (reused) in the llama.cpp-compatible
 `timings` object. Miss reasons are `no_checkpoint`, `prefix_changed`,
-`input_changed` and `disabled`. Flash-Next reports `no_checkpoint` when no
+`input_changed`, `no_compatible_boundary` and `disabled`. Flash-Next reports
+`no_checkpoint` when no
 stored prompt shares a token with the request and `no_compatible_boundary`
 when one does but no restorable boundary covers it;
 `cache_common_prefix_tokens` is then the longest agreement and

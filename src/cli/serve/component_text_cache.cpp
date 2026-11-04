@@ -151,6 +151,7 @@ public:
               std::to_string(static_cast<unsigned>(e.action)) +
               " reason=" + std::to_string(static_cast<unsigned>(e.reason)) +
               " tokens=" + std::to_string(e.boundary) +
+              " purpose=" + std::to_string(static_cast<unsigned>(e.purpose)) +
               " rank=" + std::to_string(e.rank) +
               " unique_bytes_freed=" + std::to_string(e.unique_bytes_freed) +
               " ledger_bytes=" + std::to_string(e.ledger_bytes));
@@ -198,6 +199,13 @@ struct ComponentTextCache::Impl {
   std::unique_ptr<cache::StreamedStore> streaming;
   std::unique_ptr<cache::PersistenceQueue> queue;
   static constexpr std::size_t kPersistenceDepth = 8;
+  // Backing that disk captures copy through when the RAM cache is off. It
+  // equals the small explicit budget used before off existed, and it retains
+  // nothing.
+  static constexpr std::size_t kDiskOnlyBackingBytes = std::size_t{512} << 20;
+  // Ledger room for index and request metadata when the RAM cache is off. It
+  // caps accounting only; the memory is not reserved.
+  static constexpr std::size_t kOffMetadataBytes = std::size_t{64} << 20;
   // Queue ownership plus transient submissions before superseded callbacks
   // release their serving handles. No callback runs under the serving mutex.
   std::array<std::shared_ptr<const cache::Checkpoint>, 2 * kPersistenceDepth>
@@ -206,13 +214,17 @@ struct ComponentTextCache::Impl {
       pending_durable;
   std::size_t disk_capacity{}, disk_step{};
   // The cache's own RAM budget. The ledger limit adds what the slots pinned.
+  // Zero when the RAM cache is off.
   std::size_t budget{};
+  // RAM backing committed only to copy captures on their way to disk.
+  std::size_t disk_backing{};
+  bool ram_enabled{true};
   cache::ResourceCharge metadata;
 
   Impl(std::shared_ptr<TextModelRunner> runner, std::size_t count,
        std::size_t ram, std::size_t slot_ceiling,
        const std::optional<TextRunnerDiskCacheOptions>& options,
-       bool automatic_ram)
+       bool automatic_ram, bool ram_on)
       : runner(std::move(runner)),
         // Disk transfers lease one fixed pinned staging buffer. Its size does
         // not change restore or write speed (#562), and a larger one only
@@ -223,7 +235,8 @@ struct ComponentTextCache::Impl {
         resources(this->runner->CreateComponentCacheResources(ledger, ram)),
         identity(resources->adapter->CompatibilityIdentity()),
         index(ledger),
-        retention(ledger, index, &events) {
+        retention(ledger, index, &events),
+        ram_enabled(ram_on) {
     metadata = ledger.Reserve(cache::ResourceCategory::kMetadata, sizeof(Impl))
                    .Convert();
     crypto::Sha256Hasher hash;
@@ -268,7 +281,33 @@ struct ComponentTextCache::Impl {
       entries.push_back(std::move(entry));
     }
     std::size_t automatic_bytes{}, max_bytes{}, slot_pinned_bytes{};
-    if (resources->commit_backing) {
+    if (!ram_enabled) {
+      // Only disk captures copy through backing, so without a disk cache no
+      // pool exists. The ledger admits what the slots already charged, that
+      // backing, and request metadata.
+      ram = options ? kDiskOnlyBackingBytes : 0;
+      disk_backing = ram;
+      slot_pinned_bytes =
+          resources->pinned_bytes ? resources->pinned_bytes() : 0;
+      const auto staging = ledger.Limits().staging_bytes;
+      const auto limit =
+          std::min(ledger.Limits().ram_bytes,
+                   ledger.Snapshot().ram_bytes + ram + kOffMetadataBytes);
+      ledger.ConstrainLimits({limit + staging, limit, staging, limit});
+      if (resources->commit_backing) {
+        if (ram) {
+          resources->commit_backing(ram);
+        } else {
+          // No pool exists, so a payload allocation must fail, not crash.
+          resources->prepare_prefill = nullptr;
+          resources->can_capture = nullptr;
+          resources->allocate =
+              [](const cache::PayloadRequest&) -> ComponentCaptureBuffer {
+            throw cache::ResourceExhausted();
+          };
+        }
+      }
+    } else if (resources->commit_backing) {
       const auto claim = this->runner->ResourceClaim();
       // The claim measures the host after the slots allocated, so bytes they
       // pinned are missing from it. Add them back: in full to the ceiling,
@@ -303,7 +342,7 @@ struct ComponentTextCache::Impl {
       const auto staging = ledger.Limits().staging_bytes;
       ledger.ConstrainLimits({ram + staging, ram, staging, ram});
     }
-    budget = ram;
+    budget = ram_enabled ? ram : 0;
     if (options) {
       catalog = std::make_unique<cache::DiskCatalog>(ledger, *disk, index);
       for (const auto& durable : disk->Entries()) {
@@ -423,12 +462,14 @@ struct ComponentTextCache::Impl {
                  "schema=component-cache-v1 event=configured sessions=" +
                      std::to_string(count) +
                      " snapshot_entries=128 capacity_bytes=" +
-                     std::to_string(ram) + " staging_capacity_bytes=" +
+                     std::to_string(budget) + " staging_capacity_bytes=" +
                      std::to_string(ledger.Limits().staging_bytes) +
                      " automatic_bytes=" + std::to_string(automatic_bytes) +
                      " max_bytes=" + std::to_string(max_bytes) +
                      " disk_capacity_bytes=" + std::to_string(disk_capacity) +
-                     " slot_pinned_bytes=" + std::to_string(slot_pinned_bytes));
+                     " slot_pinned_bytes=" + std::to_string(slot_pinned_bytes) +
+                     " ram_cache=" + (ram_enabled ? "on" : "off") +
+                     " disk_backing_bytes=" + std::to_string(disk_backing));
   }
   ~Impl() {
     // Settle immutable-source readers before slots/resources/index unwind.
@@ -643,6 +684,8 @@ struct ComponentTextCache::Lease::Impl {
   std::size_t cached{}, restored{}, stable{}, capture_boundary{};
   double restore_time{};
   bool disk_hit{}, active{true}, preserve_source{};
+  // False keeps every checkpoint this lease captures in RAM only.
+  bool persist{true};
   cache::CheckpointId source{};
   std::array<cache::CheckpointId, cache::RetentionPolicy::kRecordLimit>
       edit_boundaries{};
@@ -699,7 +742,7 @@ struct ComponentTextCache::Lease::Impl {
 
 std::unique_ptr<TextRunnerSnapshot>
 ComponentTextCache::Lease::Impl::CaptureDurable() {
-  if (!cache->queue || !cache->resources->copy_observed_rows ||
+  if (!persist || !cache->queue || !cache->resources->copy_observed_rows ||
       purpose == SnapshotPurpose::kHistory)
     throw cache::ResourceExhausted();
   const auto capture_input = At(input, capture_tokens.size());
@@ -930,10 +973,10 @@ ComponentTextCache::Lease::Impl::CaptureDurable() {
 ComponentTextCache::ComponentTextCache(
     std::shared_ptr<TextModelRunner> runner, std::size_t count, std::size_t ram,
     const std::optional<TextRunnerDiskCacheOptions>& disk, bool automatic_ram,
-    std::size_t ceiling)
+    std::size_t ceiling, bool ram_enabled)
     : impl_(std::make_unique<Impl>(std::move(runner), count, ram,
-                                   std::max(ram, ceiling), disk,
-                                   automatic_ram)) {
+                                   std::max(ram, ceiling), disk, automatic_ram,
+                                   ram_enabled)) {
   // Fail at startup on an unknown value rather than on the first capture.
   const auto& modes = CacheCheckpointModesFromEnv();
   const auto name = [](CacheCheckpointMode mode) {
@@ -954,7 +997,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
     std::span<const ContinuationToken> prompt,
     const ContinuationCache::CancellationCheck& cancelled,
     std::shared_ptr<const TextPromptContext> context, bool reuse,
-    std::size_t stable, bool stop_at_eos) {
+    std::size_t stable, bool stop_at_eos, bool persist) {
   if (cancelled && cancelled())
     return {};
   auto input = Inputs(prompt.size(), context.get());
@@ -1090,6 +1133,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
     lease = std::make_unique<Lease>(std::make_unique<Lease::Impl>(
         impl_.get(), entry, std::move(slot), prompt, input, stable));
     auto& request = *lease->impl_;
+    request.persist = persist;
     request.state->SetCancellationCheck(cancelled);
     request.state->SetStopAtEos(stop_at_eos);
     impl_->runner->SetPromptContext(*request.state, context);
@@ -1112,10 +1156,17 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
     bool restored = bool(live);
     if (live)
       request.cached = found.selected->boundary;
+    // Prefill continues a checkpoint exactly only from an aligned position.
+    // The complete prompt stays off the alignment for an unchanged retry,
+    // which continues it without prefill; a longer prompt takes an aligned
+    // boundary instead (TextRunnerCapabilities::prefill_alignment).
+    const std::size_t alignment = std::max<std::size_t>(
+        1, impl_->runner->Descriptor().capabilities.prefill_alignment);
     for (const auto& candidate : found.candidates) {
       if (restored || (cancelled && cancelled()))
         break;
-      if (candidate.live)
+      if (candidate.live || (candidate.boundary % alignment != 0 &&
+                             candidate.boundary < prompt.size()))
         continue;
       try {
         if (candidate.checkpoint) {
@@ -1353,6 +1404,8 @@ std::optional<TextPendingPublication> ComponentTextCache::PendingPublication(
   if (!impl_->queue)
     return std::nullopt;
   const auto input = Inputs(prompt.size(), context);
+  const std::size_t alignment = std::max<std::size_t>(
+      1, impl_->runner->Descriptor().capabilities.prefill_alignment);
   const std::lock_guard lock(impl_->mutex);
   const auto found =
       impl_->index.Lookup({impl_->identity, prompt, input, 0, true});
@@ -1365,7 +1418,9 @@ std::optional<TextPendingPublication> ComponentTextCache::PendingPublication(
     if (checkpoint_id && id != checkpoint_id)
       continue;
     const auto& tokens = capture->manifest.tokens;
+    // Acquire skips an unaligned checkpoint below the prompt end.
     if (tokens.size() > prompt.size() ||
+        (tokens.size() % alignment != 0 && tokens.size() < prompt.size()) ||
         capture->manifest.input != At(input, tokens.size()) ||
         !std::equal(tokens.begin(), tokens.end(), prompt.begin()))
       continue;
@@ -1428,13 +1483,21 @@ bool ComponentTextCache::Lease::HasSnapshotFor(
 bool ComponentTextCache::Lease::TryReserveSnapshot(
     std::size_t bytes, std::size_t boundary, bool preserve,
     SnapshotPurpose purpose, std::span<const ContinuationToken> tokens) {
+  if (!impl_->cache->ram_enabled &&
+      (!impl_->cache->queue || purpose == SnapshotPurpose::kHistory))
+    return false;
   if (!boundary || boundary > impl_->prompt.size() ||
       (bytes > impl_->cache->budget &&
        (!impl_->cache->queue || purpose == SnapshotPurpose::kHistory)))
     return false;
-  impl_->capture_boundary = boundary;
   if (tokens.empty())
     tokens = std::span<const cache::Token>(impl_->prompt).first(boundary);
+  // A capture within the disk step has nowhere to go when the RAM cache is
+  // off. Refuse it here so callers do not log it as a failed capture.
+  if (!impl_->cache->ram_enabled && purpose != SnapshotPurpose::kBranchPoint &&
+      impl_->cache->WithinDiskStep(tokens, At(impl_->input, tokens.size())))
+    return false;
+  impl_->capture_boundary = boundary;
   impl_->capture_tokens.assign(tokens.begin(), tokens.end());
   impl_->preserve_source = preserve;
   impl_->purpose = purpose;
@@ -1486,7 +1549,7 @@ std::unique_ptr<TextRunnerSnapshot> ComponentTextCache::Lease::Capture() {
         std::string("schema=component-cache-v1 event=capture_failed reason=") +
             error.what());
   };
-  if (bytes > cache.budget) {
+  if (!cache.ram_enabled || bytes > cache.budget) {
     try {
       return request.CaptureDurable();
     } catch (const cache::ResourceExhausted&) {
@@ -1690,6 +1753,8 @@ std::size_t ComponentTextCache::Lease::PublishSnapshot(
     impl_->edit_boundaries[impl_->edit_boundary_count++] =
         component->checkpoint->Id();
   }
+  if (!impl_->persist)
+    return component->bytes;
   try {
     const auto started = Clock::now();
     impl_->metrics.disk_queued_bytes +=
@@ -1748,6 +1813,9 @@ void ComponentTextCache::Lease::Invalidate() noexcept {
 
 std::vector<std::size_t> ComponentTextCache::Lease::PlannedCaptures(
     std::size_t stable) const {
+  // Off with no disk cache keeps no checkpoint, so skip the planning.
+  if (!impl_->cache->ram_enabled && !impl_->cache->queue)
+    return {};
   const auto& adapter = *impl_->cache->resources->adapter;
   std::size_t private_bytes = 0;
   for (const auto& d : adapter.Components())

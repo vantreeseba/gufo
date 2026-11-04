@@ -2,10 +2,10 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <gufo/ext/experimental/hip_utils.hpp>
 #include <stdexcept>
 #include <thread>
 
-#include "src/core/hip/hip_utils.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 
 namespace gufo::hip {
