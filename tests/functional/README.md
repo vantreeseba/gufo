@@ -30,6 +30,15 @@ nix develop -c python3 tests/functional/model_services.py tts \
   --output artifacts/model-services/tts-base-1
 ```
 
+Embedding uses `--embedding-suite smoke` by default, including Devlab's PR tier.
+It retains independent reference-vector checks for all four modalities in one
+small batch, then checks an invalid clip and successful text recovery. This is
+a smoke check, not full model qualification. Select `--embedding-suite full`
+for the existing numerical/API suites plus video goldens, sampling/timestamps,
+dimensions, concurrent requests, context overflow, cancellation and recovery.
+Devlab's full tier selects that suite. Both retain individual request timings;
+manual invocations do not qualify performance against main.
+
 The default audio root is the packaged `fixtures/audio/` English WAV and reviewed
 transcript, authorized by the maintainer for publication. Override `--audio-root`
 only with a folder containing that English pair. ASR generates silence in memory
@@ -41,9 +50,9 @@ VoiceDesign model (fixed English voice instructions). Neither requires a clone.
 
 | Suite | Required checks |
 | --- | --- |
-| Embedding | Text, image and audio HTTP suites: independent reference vectors, dimensions, normalization, encodings, batch ordering, concurrent requests, image/audio formats, multiple clips, audio/text/image interleaving, invalid inputs, cancellation and recovery |
-| ASR | English transcript WER ≤ 0.15, exact greedy replay, JSON/text/verbose formats, complete SSE matching buffered output, concurrent speech/silence, rejected options, malformed WAV recovery, stream cancellation and subsequent valid inference |
-| TTS | Voice discovery, valid non-silent 24-kHz mono PCM16 audio, two fixed texts with ASR WER ≤ 0.25, exact same-seed warm replay, WAV/PCM/SSE equality, different concurrent texts/seeds, rejected inputs, stream cancellation and subsequent valid inference |
+| Embedding | The default three-request smoke check covers text, image, video, mixed video/audio/image input, malformed-video rejection and recovery. `--embedding-suite full` retains the text, image, audio and video HTTP suites: independent reference vectors, dimensions, normalization, encodings, batch ordering, concurrent requests, image/audio formats, multiple clips, audio/text/image interleaving, ignored unknown members, llama.cpp `content`/`embd_normalize`, invalid inputs, cancellation and recovery |
+| ASR | English transcript WER ≤ 0.15, exact greedy replay, JSON/text/verbose formats, complete SSE matching buffered output, concurrent speech/silence, ignored unknown fields, rejected options (including timestamps and logprobs), malformed WAV recovery, stream cancellation and subsequent valid inference |
+| TTS | Voice discovery, valid non-silent 24-kHz mono PCM16 audio, two fixed texts with ASR WER ≤ 0.25, exact same-seed warm replay, WAV/PCM/SSE equality, different concurrent texts/seeds, ignored unknown fields, rejected inputs, stream cancellation and subsequent valid inference |
 
 Audio cancellation must appear against the cancelled request's ID in the server
 log; a client closing a response alone does not satisfy the assertion. SSE must
@@ -130,6 +139,21 @@ slots with duplicate deep conversations. This checks that a short request
 after cancellation can reuse a redundant slot while another live copy retains
 the generated frontier. It also rejects the roughly 280 ms restore stall.
 
+Flash-Next prompt restores have a focused alignment check. Four conversations
+place the end of the final user turn on each residue modulo four past the
+sparse budget. Each continuation restores that boundary from RAM, and from
+`--cache-disk` after a restart, and must equal the same request on a fresh
+server byte for byte, with every restore on a multiple of four:
+
+```sh
+nix develop -c python3 tests/functional/cache_alignment_qwen38.py \
+  --output /tmp/cache-alignment -- \
+  /path/to/production/gufo serve llm --model /path/to/flash-next.gguf
+```
+
+Add `--mtp-model /path/to/mtp.gguf` before `--` for the MTP mode. The test owns
+its servers, cache directory and loopback listener.
+
 Flash-Next MTP and Qwen27B DFlash2 prompt lookup have a focused runner. It
 requires actual accepted copies, compares isolated and C2/C4/C6/C8 requests under greedy and the model's
 default sampling, mixes greedy copies with new text at C8, and checks stops
@@ -193,7 +217,7 @@ the same source input when comparing revisions. These are public substitutes
 for PR #613's private cases; they do not reproduce the author's exact prompts.
 Run the existing Pi `edit` and `creation` cases for real tool execution, too.
 
-`embeddings.py` checks EmbeddingGemma 2 through the OpenAI SDK against a running `gufo serve embedding`.  It covers the fixture probes against sentence-transformers float32 vectors, input order, base64 and float encodings, Matryoshka `dimensions`, concurrent identical requests, the error shapes, and `"truncate": true`, whose vector must equal that of the longest prefix that fits the token limit.  It is standalone and outside `--suite all`:
+`embeddings.py` checks EmbeddingGemma 2 through the OpenAI SDK against a running `gufo serve embedding`.  It covers the fixture probes against sentence-transformers float32 vectors, input order, base64 and float encodings, Matryoshka `dimensions`, concurrent identical requests, the error shapes, `"truncate": true`, whose vector must equal that of the longest prefix that fits the token limit, and `prompt_name`, whose vector must equal that of the same prompt written by the client.  It is standalone and outside `--suite all`:
 
 ```sh
 nix develop -c python3 tests/functional/embeddings.py \
@@ -253,7 +277,7 @@ between calls) use the deterministic HTTP fixtures in
 Qwen27 Q4/Q8 can omit the requested line or call a tool instead, so these parser
 checks must not depend on a model following a request to copy tool markup.
 
-`Devlab functional checks` runs on every push to a non-draft PR, like `CI`
+`Linux validation` runs on every push to a non-draft PR, like `Repository checks`
 (`pull_request`), with the repository's fork approval policy. A newer push cancels
 the PR's earlier run. PRs use the `pr` tier; release-please PRs and dispatches
 (unless they choose `tier: pr`) use `full`. Maintain/Admin users can dispatch a
@@ -346,9 +370,8 @@ layout for every selected model, selection reasons, known limitations and links
 to the run/artifacts. Missing selected groups, missing timing arms or mismatched
 revisions cannot pass. Correctness failures and consistently slower server phases
 set the advisory status to `failure`; incomplete, incomparable or unavailable evidence
-sets `error`. On ordinary PRs, complete but noisy timing comparisons keep a
-successful status with an explicit warning and retain every observation. The full
-release tier keeps `error` for inconclusive timing. HTTP-ready timing uses server
+sets `error`. On ordinary and release PRs, complete but noisy timing comparisons keep a
+successful status with an explicit warning and retain every observation. HTTP-ready timing uses server
 monotonic timestamps at load completion and listener readiness. Comparisons with
 older binaries that lack these timestamps retain poll-derived timings as advisory
 observations, excluded from the gate. The ordinary PR check remains advisory;
@@ -471,6 +494,8 @@ RAM, disk and restart settings once their contracts pass.
 | --- | --- |
 | `discovery` | Health, readiness, model ID/context and advertised text/image inputs; no generation |
 | `responses` | SDK buffered, streaming and async Responses |
+| `logprobs` | Generated-token probabilities on Chat and raw Completions, buffered/streamed, greedy/sampled; verifies unchanged output, usage, candidate limits, finite values and UTF-8 bytes |
+| `responses-logprobs` | Responses token probabilities with counts 0/3/20, greedy/sampled, buffered and streamed; unchanged output/usage, SDK accumulation, per-item deltas/done events, finite scores and UTF-8 bytes |
 | `stops` | Text, Unicode, reasoning and tool stops; peer isolation |
 | `conversation` | Thinking/efforts, images, cancellation and RAM reuse |
 | `image-inputs` | PNG, JPEG and WebP uploads in Chat and Responses; URL spellings, bad uploads and recovery; Messages image blocks in a user turn and a tool result |
@@ -488,6 +513,7 @@ RAM, disk and restart settings once their contracts pass.
 | `tool-agent-loop` | Bounded autonomous read/edit/verify loop; each turn checks cache reuse and detects repeated actions |
 | `tool-history` | Legacy names, result pairing, current-tool constraints, images, cached retry, stops/limits and sampled peers |
 | `messages-tools` | Messages `tool_use` call, `tool_result` replay with cache reuse, buffered and streamed events, and an uncached Chat control of the same prompt |
+| `openai-count-tokens` | Chat/Responses counts match complete generation prompt usage with system/history, Unicode, tools, reasoning, structured output and images; streaming request bodies, cold/warm caches, no inference side effects, over-context sizing and errors. Requires `--expected-input-modalities text,image` with a projector, or `text` for image rejection checks |
 | `messages-count-tokens` | Counts match complete Messages prompt usage with system/history, Unicode, all tool choices and thinking; cold/warm cache counts, no inference side effects, over-context sizing and request errors |
 | `messages-image-counts` | Image counts match buffered/streamed Messages usage, including tool results, warm caches, PNG/JPEG/WebP, multiple images, Unicode and over-context sizing; no inference side effects; text-only models reject image counts and generation. Requires `--expected-input-modalities text,image` with a projector, or `text` for capability rejection checks |
 | `tool-untyped` | Open/typed tools, refs and finite values: framing, arguments, streaming, turns, limits, stops/retry and sampled peers |
@@ -510,7 +536,7 @@ RAM, disk and restart settings once their contracts pass.
 | `cache-edits` | Reuse earlier work after editing the latest message, shortening an older tool result, or editing an earlier user message and dropping later turns; compare with uncached responses |
 | `cache-growth` | Keep cache reuse advancing over several turns when the client omits reasoning; check reasoning replay and thinking-off controls, including Messages thinking blocks, and compare with uncached responses |
 | `cache-depth` | Histories beyond 16K, concurrent branches from rewritten replies, a side conversation, resume, unchanged retries and exact uncached controls; use context 32768 and also check sessions 1 |
-| `cache-stalls` | Flash-Next AR/MTP: sequential coding/planning prompts with 6.4K/25.6K/55.6K/56K padding and three repeats each, thinking on and tg128. Checks prefix reuse and exact fully cached replay; retains each request's PP/TG and maximum-gap timing gate. Public equivalents of #632, whose prompts were not attached. Use sessions 2/context 262144 to match its capacity; minimum context 65536. Explicit selection only, outside `all` |
+| `cache-stalls` | Flash-Next AR/MTP: sequential coding/planning prompts with 6.4K/25.6K/55.6K/56K padding and three repeats each, thinking on and tg128. Checks prefix reuse and exact fully cached replay; retains each request's PP/TG and maximum-gap timing gate. Public equivalents of #632, whose prompts were not attached. Devlab runs sessions 2/context 131072: two 262144-token sessions exceed its 100 GiB device at load. Pass context 262144 locally to match #632's capacity; minimum context 65536. Explicit selection only, outside `all` |
 | `cache-rotation` | Check cache RAM limits and keep history across conversations and small side requests; compare answers with uncached controls |
 | `cache-shared-prefix` | New conversations under one system prompt, one after another, with long and short tasks: from the third on they restore the whole shared prefix; compare answers with uncached controls |
 | `cache-bridge` | A chat bridge sends each user message with metadata its history copy drops, under a full RAM budget with small unrelated requests between turns: from the third turn on, reuse reaches the user turn two back; compare answers with uncached controls. Not in `all` |
@@ -700,6 +726,9 @@ logged a capacity refusal during the continued request.
 Component disk-spacing checks correlate drained publication logs with the
 checkpoint IDs captured by their own requests, excluding delayed writes from
 earlier suites even when their token counts match.
+`cache` also checks `cache_persist: false` across the same restart: a flagged
+prompt still reuses RAM within the first server and finds nothing on disk after
+the restart, while an unflagged control prompt restores from disk.
 `cache-rotation` visits four conversations and eight small side requests; use
 `--sessions 1` to verify retention is independent of execution slots. It also
 checks the startup RAM cap; byte/record pressure is covered by CPU tests.

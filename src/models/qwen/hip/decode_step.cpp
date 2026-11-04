@@ -1,14 +1,14 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include "src/models/qwen/hip/detail/decode_step.hpp"
 
+#include <gufo/ext/experimental/dispatch_telemetry.hpp>
+#include <gufo/ext/experimental/hip_utils.hpp>
 #include <stdexcept>
 
 #include "qfn_mmq.h"
-#include "src/core/hip/detail/dispatch_telemetry.hpp"
-#include "src/core/hip/hip_utils.hpp"
-#include "src/models/qwen/hip/detail/attention_policy.hpp"
+#include "src/families/qwen/hip_common/attention_policy.hpp"
+#include "src/families/qwen/kernels/ops.hpp"
 #include "src/models/qwen/hip/executor.hpp"
-#include "src/models/qwen/hip/ops.hpp"
 #include "src/models/qwen/hip/ops/moe.hpp"
 #include "src/models/qwen/hip/ops/moe_wave64.hpp"
 #include "src/models/qwen/modules/modules.hpp"
@@ -56,9 +56,8 @@ void ExecuteMoeDecodeStep(hipStream_t stream, const QwenMoeScratch& moe,
                         view.shexp_up.data, view.shexp_up.type, x,
                         moe.shexp_act.data(), shared_ff, hidden, stream);
   if (!experiments.fuse_combine) {
-    LaunchGEMV(view.shexp_down.data, view.shexp_down.type,
-               moe.shexp_act.data(), moe.shexp_out.data(), hidden, shared_ff,
-               stream);
+    LaunchGEMV(view.shexp_down.data, view.shexp_down.type, moe.shexp_act.data(),
+               moe.shexp_out.data(), hidden, shared_ff, stream);
   }
 
   // Routed experts. The MMQ gated kernel fuses gate+up+SwiGLU for the formats
@@ -113,11 +112,11 @@ void ExecuteMoeDecodeStep(hipStream_t stream, const QwenMoeScratch& moe,
   }
   const bool fused_combine =
       experiments.fuse_combine &&
-      LaunchMoeSharedDownCombine(
-          view.shexp_down.data, view.shexp_down.type, moe.shexp_act.data(),
-          moe.down_e.data(), moe.weights.data(), moe.shexp_gate.data(), out, 1,
-          n_used, static_cast<std::uint32_t>(hidden),
-          static_cast<std::uint32_t>(shared_ff), stream);
+      LaunchMoeSharedDownCombine(view.shexp_down.data, view.shexp_down.type,
+                                 moe.shexp_act.data(), moe.down_e.data(),
+                                 moe.weights.data(), moe.shexp_gate.data(), out,
+                                 1, n_used, static_cast<std::uint32_t>(hidden),
+                                 static_cast<std::uint32_t>(shared_ff), stream);
   if (!fused_combine) {
     if (experiments.fuse_combine) {
       LaunchGEMV(view.shexp_down.data, view.shexp_down.type,

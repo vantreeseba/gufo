@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <gufo/ext/draft_backend.hpp>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -10,11 +11,10 @@
 #include <string>
 #include <vector>
 
-#include "src/core/speculative/draft_backend.hpp"
+#include "src/families/qwen/text/tokenizer.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/mtp_draft_vocab.hpp"
 #include "src/models/qwen/mtp_reference.hpp"
-#include "src/models/qwen/tokenizer.hpp"
 #include "src/models/qwen38_flash_next/mtp_sampling.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
@@ -337,7 +337,7 @@ private:
   std::uint32_t* d_chain_tokens_{nullptr};
   std::uint32_t chain_slots_{0};
   bool chain_active_{false};
-  // Draft table (mtp_draft_vocab.hpp): kMtpDraftExtraRows output-head rows
+  // Draft table (mtp_draft_vocab.hpp): kDraftVocabExtraRows output-head rows
   // and their token IDs; allocated only when the model HasDraftVocab().
   std::uint8_t* d_draft_rows_{nullptr};
   std::int32_t* d_draft_ids_{nullptr};

@@ -14,10 +14,10 @@
 #include "qfn_mmq.h"
 #include "src/core/hip/hip_utils.hpp"
 #include "src/core/hip/snapshot_transfer.hpp"
-#include "src/models/qwen/hip/detail/attention_policy.hpp"
+#include "src/families/qwen/hip_common/attention_policy.hpp"
+#include "src/families/qwen/kernels/ops.hpp"
 #include "src/models/qwen/hip/mtp.hpp"
 #include "src/models/qwen/hip/mtp/detail/allocation.hpp"
-#include "src/models/qwen/hip/ops.hpp"
 #include "src/models/qwen/hip/ops/moe.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 
@@ -106,7 +106,7 @@ template<typename T>
 /// Bytes of the draft table's rows, plus the 4 KiB of slack Flash-Next keeps
 /// past its table (#603).
 [[nodiscard]] std::size_t MtpDraftTableBytes(const QwenMtpGpuModel& model) {
-  return (std::size_t{speculative::kMtpDraftExtraRows} *
+  return (std::size_t{speculative::kDraftVocabExtraRows} *
           model.GetOutputRowBytes()) +
          4096;
 }
@@ -330,7 +330,7 @@ void QwenMtpGpuExecutor::Allocate() {
   AllocatePrimeScratch();
   if (model_->HasDraftVocab()) {
     allocate_scratch(d_draft_rows_, MtpDraftTableBytes(*model_));
-    allocate_scratch(d_draft_ids_, speculative::kMtpDraftExtraRows);
+    allocate_scratch(d_draft_ids_, speculative::kDraftVocabExtraRows);
     // The table opens with the special tokens; every request keeps them.
     AppendDraftRows(model_->GetDraftSpecials());
     HIP_CHECK(hipStreamSynchronize(stream_));
@@ -429,7 +429,7 @@ QwenGpuMemoryUsage QwenMtpGpuExecutor::EstimateMemoryUsage(
   scratch += MtpPrimeScratchBytes(config, std::min(prime_chunk, max_context));
   if (model.HasDraftVocab()) {
     add(MtpDraftTableBytes(model), 1);
-    add(speculative::kMtpDraftExtraRows, sizeof(std::int32_t));
+    add(speculative::kDraftVocabExtraRows, sizeof(std::int32_t));
   }
   return {
       .request_state_bytes = MtpStateBytes(config, max_context),
@@ -751,7 +751,7 @@ void QwenMtpGpuExecutor::RunDraftForward(const std::uint32_t* source_d_token,
   // leading rows, read in place, and the table rows follow it in the logits.
   // Only the candidate set changes; the remap turns a table index back into
   // its token ID, so chain steps embed the real token.
-  const std::uint32_t prefix = speculative::kMtpDraftVocab;
+  const std::uint32_t prefix = speculative::kDraftVocabPrefix;
   LaunchGEMV(weights.output.data, weights.output.type, d_feedback_hidden_,
              d_logits_, prefix, hidden, stream_,
              models::qwen::QwenGemmMode::kHipMtp);
@@ -775,7 +775,7 @@ void QwenMtpGpuExecutor::AppendDraftRows(std::span<const std::int32_t> ids) {
     return;
   }
   if (d_draft_rows_ == nullptr ||
-      ids.size() > speculative::kMtpDraftExtraRows - draft_rows_) {
+      ids.size() > speculative::kDraftVocabExtraRows - draft_rows_) {
     throw std::logic_error("MTP GPU draft table append is invalid");
   }
   const auto& output = model_->GetWeights().output;

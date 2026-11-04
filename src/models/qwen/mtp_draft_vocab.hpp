@@ -11,13 +11,10 @@
 #include <utility>
 #include <vector>
 
-#include "src/models/qwen/tokenizer.hpp"
-#include "src/models/qwen38_flash_next/draft_vocab.hpp"
+#include "src/families/qwen/draft_vocab/draft_vocab.hpp"
+#include "src/families/qwen/text/tokenizer.hpp"
 
 namespace gufo::speculative {
-
-using models::qwen38_flash_next::kMtpDraftExtraRows;
-using models::qwen38_flash_next::kMtpDraftVocab;
 
 /// Rows of the Qwen3.5/3.6/3.8 vocabulary. Flash-Next's small draft head
 /// (draft_vocab.hpp) assumes this byte-level BPE vocabulary, whose early
@@ -43,17 +40,17 @@ QwenMtpDraftSpecials(
   for (const auto& [name, id] : specials) {
     if (id >= vocab_size)
       return std::nullopt;
-    if (id >= kMtpDraftVocab)
+    if (id >= kDraftVocabPrefix)
       ids.push_back(static_cast<std::int32_t>(id));
   }
   std::ranges::sort(ids);
   ids.erase(std::ranges::unique(ids).begin(), ids.end());
-  if (ids.size() >= kMtpDraftExtraRows)
+  if (ids.size() >= kDraftVocabExtraRows)
     return std::nullopt;
   return ids;
 }
 
-/// One session's draft table and head choice (MtpDraftVocab), kept in step
+/// One session's draft table and head choice (DraftVocab), kept in step
 /// with the token sequence each proposal receives: committed history, then
 /// the anchor. As in Flash-Next, the anchor is decided against the history
 /// before it and enters the table with the next proposal. The table is a
@@ -63,7 +60,7 @@ class QwenMtpDraftTable {
 public:
   explicit QwenMtpDraftTable(std::vector<std::int32_t> specials)
       : specials_(std::move(specials)),
-        vocab_(kMtpDraftExtraRows -
+        vocab_(kDraftVocabExtraRows -
                static_cast<std::uint32_t>(specials_.size())) {}
 
   /// What Sync changed: when `restart` is set, the rows above the special
@@ -119,12 +116,12 @@ private:
                                           : -1;
   }
   [[nodiscard]] bool Common(std::int32_t id) const {
-    return id >= 0 && (static_cast<std::uint32_t>(id) < kMtpDraftVocab ||
+    return id >= 0 && (static_cast<std::uint32_t>(id) < kDraftVocabPrefix ||
                        std::ranges::binary_search(specials_, id));
   }
 
   std::vector<std::int32_t> specials_;
-  models::qwen38_flash_next::MtpDraftVocab vocab_;
+  DraftVocab vocab_;
   std::vector<std::int32_t> history_;  ///< scanned tokens, as table IDs
   std::vector<std::int32_t> added_;
   bool stale_{true};

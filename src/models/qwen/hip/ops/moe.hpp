@@ -35,10 +35,10 @@ void LaunchMoeEpilogue(const float* expert_out, const float* weights,
 /// unsupported formats or shapes, or more tokens than counters.
 [[nodiscard]] bool LaunchMoeFusedRouter(
     const void* router_w, core::GgmlType router_type, const void* gate_w,
-    core::GgmlType gate_type, const float* x, float* logits,
-    float* shared_gate, std::int32_t* ids, float* weights, std::uint32_t* done,
-    std::size_t done_slots, std::uint32_t n_tokens, std::uint32_t n_experts, std::uint32_t hidden,
-    std::uint32_t n_used, hipStream_t stream = nullptr);
+    core::GgmlType gate_type, const float* x, float* logits, float* shared_gate,
+    std::int32_t* ids, float* weights, std::uint32_t* done,
+    std::size_t done_slots, std::uint32_t n_tokens, std::uint32_t n_experts,
+    std::uint32_t hidden, std::uint32_t n_used, hipStream_t stream = nullptr);
 
 /// Experimental (GUFO_EXP_MOE_FUSE=combine): the shared expert's down
 /// projection fused with LaunchMoeEpilogue. Returns false, launching nothing,

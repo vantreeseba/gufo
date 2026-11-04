@@ -617,7 +617,7 @@ int main(int argc, const char* const* argv) {
            "MTP draft vocabulary gate");
     if (mtp_model->HasDraftVocab()) {
       const auto specials = mtp_model->GetDraftSpecials();
-      const std::uint32_t prefix = gufo::speculative::kMtpDraftVocab;
+      const std::uint32_t prefix = gufo::speculative::kDraftVocabPrefix;
       Expect(executor->GetDraftRows() == specials.size(),
              "MTP draft table opens with the special tokens");
       executor->Reset();

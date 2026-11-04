@@ -25,16 +25,15 @@ namespace gufo::hip {
 /// s / x_token_divisor. gate and up must share a format.
 [[nodiscard]] bool LaunchMoeWave64SwigluGemv(
     const void* gate_w, core::GgmlType gate_type, const void* up_w,
-    core::GgmlType up_type, const float* x, const std::int32_t* ids,
-    float* act, std::size_t expert_ff, std::size_t hidden, std::uint32_t slots,
+    core::GgmlType up_type, const float* x, const std::int32_t* ids, float* act,
+    std::size_t expert_ff, std::size_t hidden, std::uint32_t slots,
     std::uint32_t x_token_divisor, hipStream_t stream);
 
 /// out[s, :] = W_e * x[s, :] for e = ids[s] (per-slot input rows).
 [[nodiscard]] bool LaunchMoeWave64Gemv(const void* w, core::GgmlType type,
                                        const float* x, const std::int32_t* ids,
-                                       float* out, std::size_t m,
-                                       std::size_t k, std::uint32_t slots,
-                                       hipStream_t stream);
+                                       float* out, std::size_t m, std::size_t k,
+                                       std::uint32_t slots, hipStream_t stream);
 
 }  // namespace gufo::hip
 #endif  // defined(ENGINE_ENABLE_HIP)

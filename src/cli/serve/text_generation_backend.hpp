@@ -15,12 +15,14 @@
 #include <utility>
 #include <vector>
 
+#include "gufo/ext/text.hpp"
 #include "src/cli/serve/component_cache_metrics.hpp"
+#include "src/cli/serve/logprobs.hpp"
 #include "src/core/reasoning.hpp"
 #include "src/core/sampling.hpp"
 #include "src/core/text_sampling_defaults.hpp"
-#include "src/models/qwen/chat_template.hpp"
-#include "src/models/qwen/tokenizer.hpp"
+#include "src/families/qwen/text/chat_template.hpp"
+#include "src/families/qwen/text/tokenizer.hpp"
 
 namespace gufo::server {
 
@@ -93,47 +95,17 @@ private:
   TextGenerationErrorCode code_;
 };
 
-struct ChatRequest {
-  enum class ToolChoice : std::uint8_t {
-    kAuto,
-    kNone,
-    kRequired,
-  };
-
-  ChatRequest() = default;
-  explicit ChatRequest(std::vector<tokenization::ChatMessage> chat_messages)
-      : messages(std::move(chat_messages)) {}
-
-  std::vector<tokenization::ChatMessage> messages;
-  std::vector<tokenization::ChatTool> tools;
-  std::string client_id{"anonymous"};
-  ToolChoice tool_choice{ToolChoice::kAuto};
-  std::string forced_tool_name;
-  /// Responses namespace of each flattened function, echoed on its calls.
-  std::map<std::string, std::string> tool_namespaces;
-  bool constrained_tools{false};
-  bool parallel_tool_calls{true};
-  ReasoningOptions reasoning;
-  bool add_vision_id{false};
-  /// Bypass prompt reuse for this request; its completed state may be retained.
-  bool cache_prompt{true};
-  /// Optional streaming prompt progress; never changes prompt or cache
-  /// identity.
-  bool return_progress{false};
-  std::vector<std::string> stop_sequences;
-  std::shared_ptr<const sampling::JsonConstraint> response_format;
-  std::string response_format_description;
-};
+using ChatRequest = ext::ChatRequest;
 
 /// Model-agnostic text generation boundary used by the HTTP transport.
 ///
 /// Implementations retain ownership of tokenization, templates, complete
 /// continuation state, and execution resources. The transport observes only
-/// generated text pieces and aggregate request metrics.
+/// generated text pieces, optional token probabilities and aggregate metrics.
 class TextGenerationBackend {
 public:
   using CancellationCheck = std::function<bool()>;
-  using TokenCallback = std::function<bool(std::string_view)>;
+  using TokenCallback = std::function<bool(const TokenPiece&)>;
 
   /// llama-server `prompt_progress`; `processed` includes cached tokens.
   struct PromptProgress {
@@ -168,11 +140,7 @@ public:
     kCancelled,
   };
 
-  enum class InitialOutputState : std::uint8_t {
-    kAuto,
-    kReasoning,
-    kContent,
-  };
+  using InitialOutputState = gufo::ext::InitialOutputState;
 
   struct SamplingDefaults {
     /// Zero means generate until EOS or the remaining context is exhausted.
@@ -190,6 +158,7 @@ public:
   struct Result {
     std::optional<ComponentCacheMetrics> component_cache;
     std::string text;
+    std::vector<DecodedLogprobs> logprobs;
     std::vector<tokenization::TokenId> tokens;
     std::size_t prompt_tokens{0};
     std::size_t cached_prompt_tokens{0};
@@ -336,7 +305,8 @@ public:
                           const TokenCallback& on_token = {},
                           std::string_view client_id = "anonymous",
                           const std::vector<std::string>& stop_sequences = {},
-                          bool cache_prompt = true) = 0;
+                          bool cache_prompt = true,
+                          bool cache_persist = true) = 0;
 
   virtual Result chat(const ChatRequest& request, std::size_t max_tokens,
                       const sampling::SamplingConfig& sampling,
@@ -377,7 +347,8 @@ public:
       const CancellationCheck& is_cancelled = {}, bool stream_output = false,
       bool ignore_eos = false, std::string_view client_id = "anonymous",
       const std::vector<std::string>& stop_sequences = {},
-      bool return_progress = false, bool cache_prompt = true);
+      bool return_progress = false, bool cache_prompt = true,
+      bool cache_persist = true);
 
   std::shared_ptr<GenerationRequest> start_chat(
       const ChatRequest& request, std::size_t max_tokens, float temperature,
@@ -396,6 +367,13 @@ public:
       const ChatRequest&) const {
     return std::nullopt;
   }
+
+  /// The prompt text a chat request renders to through the model's chat
+  /// template, before tokenization. Empty when the backend cannot tell.
+  [[nodiscard]] virtual std::optional<std::string> render_chat_prompt(
+      const ChatRequest&) const {
+    return std::nullopt;
+  }
 };
 
 inline std::shared_ptr<TextGenerationBackend::GenerationRequest>
@@ -404,7 +382,7 @@ TextGenerationBackend::start_complete(
     const sampling::SamplingConfig& sampling,
     const CancellationCheck& is_cancelled, bool stream_output, bool ignore_eos,
     std::string_view client_id, const std::vector<std::string>& stop_sequences,
-    bool return_progress, bool cache_prompt) {
+    bool return_progress, bool cache_prompt, bool cache_persist) {
   (void)stream_output;
   (void)return_progress;
   if (ignore_eos)
@@ -417,7 +395,7 @@ TextGenerationBackend::start_complete(
                               CancellationCheck cancellation,
                               std::string client_id,
                               std::vector<std::string> stop_sequences,
-                              bool cache_prompt)
+                              bool cache_prompt, bool cache_persist)
         : backend_(backend),
           prompt_(std::move(prompt)),
           max_tokens_(max_tokens),
@@ -425,7 +403,8 @@ TextGenerationBackend::start_complete(
           cancellation_(std::move(cancellation)),
           client_id_(std::move(client_id)),
           stop_sequences_(std::move(stop_sequences)),
-          cache_prompt_(cache_prompt) {}
+          cache_prompt_(cache_prompt),
+          cache_persist_(cache_persist) {}
 
     Result Wait(const TokenCallback& on_token, const ProgressCallback&,
                 const StartCallback&) override {
@@ -437,7 +416,7 @@ TextGenerationBackend::start_complete(
             return cancelled_.load(std::memory_order_acquire) ||
                    (cancellation_ && cancellation_());
           },
-          on_token, client_id_, stop_sequences_, cache_prompt_);
+          on_token, client_id_, stop_sequences_, cache_prompt_, cache_persist_);
     }
     void Cancel() noexcept override {
       cancelled_.store(true, std::memory_order_release);
@@ -452,12 +431,13 @@ TextGenerationBackend::start_complete(
     std::string client_id_;
     std::vector<std::string> stop_sequences_;
     bool cache_prompt_;
+    bool cache_persist_;
     std::atomic<bool> waited_{false};
     std::atomic<bool> cancelled_{false};
   };
   return std::make_shared<DeferredGenerationRequest>(
       *this, std::string(prompt), max_tokens, sampling, is_cancelled,
-      std::string(client_id), stop_sequences, cache_prompt);
+      std::string(client_id), stop_sequences, cache_prompt, cache_persist);
 }
 
 inline std::shared_ptr<TextGenerationBackend::GenerationRequest>

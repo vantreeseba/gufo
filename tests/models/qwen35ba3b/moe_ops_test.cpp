@@ -19,11 +19,12 @@
 #include "src/core/hip/hip_utils.hpp"
 #include "src/core/model_config.hpp"
 #include "src/core/quant/ggml_dequant.hpp"
+#include "src/families/qwen/kernels/ops/gemm.hpp"
+#include "src/families/qwen/kernels/ops/swiglu.hpp"
 #include "src/models/qwen/hip/executor.hpp"
-#include "src/models/qwen/hip/ops/gemm.hpp"
 #include "src/models/qwen/hip/ops/moe.hpp"
+#include "src/models/qwen/hip/ops/moe_routed.hpp"
 #include "src/models/qwen/hip/ops/moe_wave64.hpp"
-#include "src/models/qwen/hip/ops/swiglu.hpp"
 #include "src/models/qwen/modules/moe.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "tests/models/qwen/hip/support/device.hpp"
@@ -648,19 +649,15 @@ std::vector<std::uint8_t> RandomQ45K(GgmlType type, std::size_t rows,
 /// The quantized expert formats the routed kernels cover for this model.
 struct RoutedFormat {
   GgmlType type;
-  gufo::models::qwen38_flash_next::rocm::WeightType weight_type;
+  gufo::hip::moe_routed::WeightType weight_type;
   const char* name;
 };
 
 constexpr RoutedFormat kRoutedFormats[] = {
-    {GgmlType::kQ8_0, gufo::models::qwen38_flash_next::rocm::WeightType::kQ8_0,
-     "Q8_0"},
-    {GgmlType::kQ6_K, gufo::models::qwen38_flash_next::rocm::WeightType::kQ6_K,
-     "Q6_K"},
-    {GgmlType::kQ5_K, gufo::models::qwen38_flash_next::rocm::WeightType::kQ5_K,
-     "Q5_K"},
-    {GgmlType::kQ4_K, gufo::models::qwen38_flash_next::rocm::WeightType::kQ4_K,
-     "Q4_K"},
+    {GgmlType::kQ8_0, gufo::hip::moe_routed::WeightType::kQ8_0, "Q8_0"},
+    {GgmlType::kQ6_K, gufo::hip::moe_routed::WeightType::kQ6_K, "Q6_K"},
+    {GgmlType::kQ5_K, gufo::hip::moe_routed::WeightType::kQ5_K, "Q5_K"},
+    {GgmlType::kQ4_K, gufo::hip::moe_routed::WeightType::kQ4_K, "Q4_K"},
 };
 
 /// Random expert weights `rows` x `cols` in `type`.
@@ -687,7 +684,8 @@ std::vector<std::uint8_t> RandomExpertWeights(GgmlType type, std::size_t rows,
 /// difference is the F16 rounding of the activation rows (and, for the K
 /// quants, of the sub-block scale).
 void CheckRoutedF16(hipStream_t stream) {
-  namespace routed = gufo::models::qwen38_flash_next::rocm;
+  namespace qfn = gufo::models::qwen38_flash_next::rocm;
+  namespace routed = gufo::hip::moe_routed;
   for (const RoutedFormat& format : kRoutedFormats) {
     const GgmlType type = format.type;
     const auto weight_type = format.weight_type;
@@ -738,8 +736,8 @@ void CheckRoutedF16(hipStream_t stream) {
         gufo::test::DeviceBuffer<std::int32_t> d_rows_token(rows);
         gufo::test::DeviceBuffer<std::int32_t> d_rows_slot(rows);
         gufo::test::DeviceBuffer<std::uint16_t> d_x_half(x_rows * shape.k);
-        routed::ExpertCounts(d_ids.data(), d_counts.data(), tokens, kExperts,
-                             kUsed, stream);
+        qfn::ExpertCounts(d_ids.data(), d_counts.data(), tokens, kExperts,
+                          kUsed, stream);
         const auto counts = d_counts.CopyToHost();
         for (const std::uint32_t tile_rows : {16U, 48U}) {
           std::vector<std::int32_t> tiles;
@@ -755,8 +753,8 @@ void CheckRoutedF16(hipStream_t stream) {
                                 d_cursors.data(), d_rows_token.data(),
                                 d_rows_slot.data(), tokens, kUsed, kExperts,
                                 stream);
-          routed::NarrowActivations(d_x.data(), d_x_half.data(), false,
-                                    x_rows * shape.k, stream);
+          qfn::NarrowActivations(d_x.data(), d_x_half.data(), false,
+                                 x_rows * shape.k, stream);
           const auto* rows_in =
               shape.per_slot_input ? d_rows_slot.data() : d_rows_token.data();
           Expect(routed::RoutedF16Gemm(
@@ -824,7 +822,8 @@ float Fp16BitsToFloat(std::uint16_t h) {
 /// Paired routed gate/up (SwiGLU in the epilogue, F16 out) against
 /// silu(gate) * up from two per-slot GEMVs on the same weights.
 void CheckRoutedPair(hipStream_t stream) {
-  namespace routed = gufo::models::qwen38_flash_next::rocm;
+  namespace qfn = gufo::models::qwen38_flash_next::rocm;
+  namespace routed = gufo::hip::moe_routed;
   constexpr std::uint32_t kExperts = 64;
   constexpr std::uint32_t kUsed = 8;
   constexpr std::size_t kM = 512;
@@ -868,14 +867,14 @@ void CheckRoutedPair(hipStream_t stream) {
       gufo::test::DeviceBuffer<std::int32_t> d_rows_token(rows);
       gufo::test::DeviceBuffer<std::int32_t> d_rows_slot(rows);
       gufo::test::DeviceBuffer<std::uint16_t> d_x_half(tokens * kK);
-      routed::ExpertCounts(d_ids.data(), d_counts.data(), tokens, kExperts,
-                           kUsed, stream);
+      qfn::ExpertCounts(d_ids.data(), d_counts.data(), tokens, kExperts, kUsed,
+                        stream);
       routed::RoutedCompact(d_ids.data(), d_counts.data(), d_bounds.data(),
                             d_cursors.data(), d_rows_token.data(),
                             d_rows_slot.data(), tokens, kUsed, kExperts,
                             stream);
-      routed::NarrowActivations(d_x.data(), d_x_half.data(), false, tokens * kK,
-                                stream);
+      qfn::NarrowActivations(d_x.data(), d_x_half.data(), false, tokens * kK,
+                             stream);
       const auto counts = d_counts.CopyToHost();
       const auto gate_ref = d_gate_ref.CopyToHost();
       const auto up_ref = d_up_ref.CopyToHost();
@@ -1031,7 +1030,8 @@ struct Agreement {
   std::size_t non_finite;
 };
 
-Agreement Compare(const std::vector<float>& ref, const std::vector<float>& got) {
+Agreement Compare(const std::vector<float>& ref,
+                  const std::vector<float>& got) {
   double max_abs = 0.0;
   double magnitude = 0.0;
   std::size_t non_finite = 0;
@@ -1076,8 +1076,8 @@ void CheckExperimentalDecode(hipStream_t stream) {
   };
 
   // Wave64 expert GEMVs (FP32 activations, same decode as the slot GEMV).
-  for (const GgmlType type : {GgmlType::kQ8_0, GgmlType::kQ4_K,
-                              GgmlType::kQ5_K, GgmlType::kQ6_K}) {
+  for (const GgmlType type :
+       {GgmlType::kQ8_0, GgmlType::kQ4_K, GgmlType::kQ5_K, GgmlType::kQ6_K}) {
     gufo::test::DeviceBuffer<std::uint8_t> d_gate(
         RandomExpertWeights(type, kExperts * kFf, kHidden));
     gufo::test::DeviceBuffer<std::uint8_t> d_up(
@@ -1093,25 +1093,23 @@ void CheckExperimentalDecode(hipStream_t stream) {
       gufo::hip::LaunchMoeSlotSwigluGemv(
           d_gate.data(), type, d_up.data(), type, d_x.data(), d_ids.data(),
           d_act_ref.data(), kFf, kHidden, slots, kUsed, stream);
-      Expect(gufo::hip::LaunchMoeWave64SwigluGemv(
-                 d_gate.data(), type, d_up.data(), type, d_x.data(),
-                 d_ids.data(), d_act_got.data(), kFf, kHidden, slots, kUsed,
-                 stream),
-             "wave64 SwiGLU GEMV rejected the format");
+      Expect(
+          gufo::hip::LaunchMoeWave64SwigluGemv(
+              d_gate.data(), type, d_up.data(), type, d_x.data(), d_ids.data(),
+              d_act_got.data(), kFf, kHidden, slots, kUsed, stream),
+          "wave64 SwiGLU GEMV rejected the format");
       gufo::test::DeviceBuffer<float> d_out_ref(slots * kHidden);
       gufo::test::DeviceBuffer<float> d_out_got(slots * kHidden);
       gufo::hip::LaunchMoeSlotGemv(d_down.data(), type, d_act_ref.data(),
-                                   d_ids.data(), d_out_ref.data(), kHidden,
-                                   kFf, slots, 1, stream);
-      Expect(gufo::hip::LaunchMoeWave64Gemv(d_down.data(), type,
-                                            d_act_ref.data(), d_ids.data(),
-                                            d_out_got.data(), kHidden, kFf,
-                                            slots, stream),
+                                   d_ids.data(), d_out_ref.data(), kHidden, kFf,
+                                   slots, 1, stream);
+      Expect(gufo::hip::LaunchMoeWave64Gemv(
+                 d_down.data(), type, d_act_ref.data(), d_ids.data(),
+                 d_out_got.data(), kHidden, kFf, slots, stream),
              "wave64 GEMV rejected the format");
       HIP_CHECK(hipStreamSynchronize(stream));
       const auto act = Compare(d_act_ref.CopyToHost(), d_act_got.CopyToHost());
-      const auto down =
-          Compare(d_out_ref.CopyToHost(), d_out_got.CopyToHost());
+      const auto down = Compare(d_out_ref.CopyToHost(), d_out_got.CopyToHost());
       std::cout << "wave64 type=" << static_cast<int>(type)
                 << " tokens=" << tokens << ": swiglu rel=" << act.rel
                 << " down rel=" << down.rel << "\n";
@@ -1135,10 +1133,9 @@ void CheckExperimentalDecode(hipStream_t stream) {
     gufo::test::DeviceBuffer<float> d_x(random_rows(kHidden));
     gufo::test::DeviceBuffer<float> d_act_ref(kUsed * kFf);
     gufo::test::DeviceBuffer<float> d_act_got(kUsed * kFf);
-    gufo::hip::LaunchMoeSlotSwigluGemv(d_gate.data(), kType, d_up.data(),
-                                       kType, d_x.data(), d_ids.data(),
-                                       d_act_ref.data(), kFf, kHidden, kUsed,
-                                       kUsed, stream);
+    gufo::hip::LaunchMoeSlotSwigluGemv(
+        d_gate.data(), kType, d_up.data(), kType, d_x.data(), d_ids.data(),
+        d_act_ref.data(), kFf, kHidden, kUsed, kUsed, stream);
     Expect(qfn_mmq_moe_gated_vec(static_cast<int>(kType), d_gate.data(),
                                  d_up.data(), d_x.data(), d_ids.data(),
                                  d_act_got.data(), kFf, kHidden, 1, kExperts,
@@ -1177,10 +1174,9 @@ void CheckExperimentalDecode(hipStream_t stream) {
     gufo::test::DeviceBuffer<std::int32_t> d_ids_ref(tokens * kUsed);
     gufo::test::DeviceBuffer<float> d_w_ref(tokens * kUsed);
     for (std::uint32_t t = 0; t < tokens; ++t) {
-      gufo::hip::LaunchGEMV(d_router.data(), GgmlType::kF32,
-                            d_x.data() + t * kHidden,
-                            d_logits_ref.data() + t * kExperts, kExperts,
-                            kHidden, stream);
+      gufo::hip::LaunchGEMV(
+          d_router.data(), GgmlType::kF32, d_x.data() + t * kHidden,
+          d_logits_ref.data() + t * kExperts, kExperts, kHidden, stream);
       gufo::hip::LaunchGEMV(d_gate_inp.data(), GgmlType::kF32,
                             d_x.data() + t * kHidden, d_gate_ref.data() + t, 1,
                             kHidden, stream);
@@ -1199,8 +1195,7 @@ void CheckExperimentalDecode(hipStream_t stream) {
                  d_router.data(), GgmlType::kF32, d_gate_inp.data(),
                  GgmlType::kF32, d_x.data(), d_logits.data(), d_gate.data(),
                  d_ids.data(), d_w.data(), d_done.data(), tokens, tokens,
-                 kExperts,
-                 static_cast<std::uint32_t>(kHidden), kUsed, stream),
+                 kExperts, static_cast<std::uint32_t>(kHidden), kUsed, stream),
              "fused router rejected the shape");
     }
     HIP_CHECK(hipStreamSynchronize(stream));
@@ -1223,7 +1218,8 @@ void CheckExperimentalDecode(hipStream_t stream) {
 
   // Shared-expert down projection fused with the combine epilogue.
   for (const std::uint32_t tokens : {1U, 4U}) {
-    const auto down_q = RandomExpertWeights(GgmlType::kQ8_0, kHidden, kSharedFf);
+    const auto down_q =
+        RandomExpertWeights(GgmlType::kQ8_0, kHidden, kSharedFf);
     gufo::test::DeviceBuffer<std::uint8_t> d_down(down_q);
     gufo::test::DeviceBuffer<float> d_act(random_rows(tokens * kSharedFf));
     gufo::test::DeviceBuffer<float> d_experts(
@@ -1238,10 +1234,9 @@ void CheckExperimentalDecode(hipStream_t stream) {
     gufo::test::DeviceBuffer<float> d_ref(tokens * kHidden);
     gufo::test::DeviceBuffer<float> d_got(tokens * kHidden);
     for (std::uint32_t t = 0; t < tokens; ++t) {
-      gufo::hip::LaunchGEMV(d_down.data(), GgmlType::kQ8_0,
-                            d_act.data() + t * kSharedFf,
-                            d_shared.data() + t * kHidden, kHidden, kSharedFf,
-                            stream);
+      gufo::hip::LaunchGEMV(
+          d_down.data(), GgmlType::kQ8_0, d_act.data() + t * kSharedFf,
+          d_shared.data() + t * kHidden, kHidden, kSharedFf, stream);
     }
     gufo::hip::LaunchMoeEpilogue(d_experts.data(), d_weights.data(),
                                  d_shared.data(), d_gate.data(), d_ref.data(),

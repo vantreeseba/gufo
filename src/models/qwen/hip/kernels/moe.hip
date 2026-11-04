@@ -8,7 +8,7 @@
 
 #include "src/core/gguf_reader.hpp"
 #include "src/models/qwen/hip/ops/moe.hpp"
-#include "src/models/qwen/hip/quant_ops.hpp"
+#include "src/families/qwen/hip_common/quant_ops.hpp"
 
 namespace gufo::hip {
 namespace {

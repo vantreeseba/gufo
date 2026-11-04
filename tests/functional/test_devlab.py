@@ -47,7 +47,7 @@ class PlanTest(unittest.TestCase):
 
     def test_shared_llm_uses_only_flash_next(self):
         for path in ('src/core/sampling.cpp', 'src/cache/cache.cpp',
-                     'src/models/qwen/tokenizer.cpp', 'src/models/qwen/vision/encoder.hip',
+                     'src/families/qwen/text/tokenizer.cpp', 'src/families/qwen/vision/encoder.hip',
                      'src/cli/serve/text_model_runner.cpp'):
             with self.subTest(path=path):
                 self.assertEqual(self.models(path), {'flash-next-q4'})
@@ -87,6 +87,13 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(self.models('docs/SERVER.md'), set())
         self.assertEqual(self.models('src/models/qwen_image_21/model.cpp'), set())
         self.assertEqual(self.models('src/models/minimax_h3/runtime.cpp'), set())
+
+    def test_embedding_smoke_and_full_coverage(self):
+        pr = self.plan('src/models/embedding_gemma2/video_processor.cpp')
+        self.assertEqual(pr['groups'][0]['suites'], ['embedding-smoke'])
+        full = self.plan('src/models/embedding_gemma2/video_processor.cpp', tier='full')
+        self.assertEqual(full['groups'][0]['suites'],
+                         ['embedding-text', 'embedding-images', 'embedding-audio', 'embedding-video'])
 
     def test_full_tts_and_optional_ar(self):
         self.assertEqual(self.models('src/models/qwen3_tts/config.cpp', tier='full'),
@@ -282,7 +289,10 @@ class TimingTest(unittest.TestCase):
             self.assertEqual(state, 'success')
             self.assertIn('timing warning', description)
             self.assertIn('⚠️', comment)
-            self.assertEqual(report.render_models(args, {**plan, 'tier': 'full'}, summary)[0], 'error')
+            state, description, comment = report.render_models(args, {**plan, 'tier': 'full'}, summary)
+            self.assertEqual(state, 'success')
+            self.assertIn('timing warning', description)
+            self.assertIn('⚠️', comment)
             checked['comparable_work'] = False
             (root/'qwen3-asr.phases.json').write_text(json.dumps(data))
             self.assertEqual(report.render_models(args, plan, summary)[0], 'error')

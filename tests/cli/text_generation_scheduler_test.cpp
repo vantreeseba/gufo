@@ -21,17 +21,21 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "src/cli/serve/generation_metrics.hpp"
 #include "src/cli/serve/http_server.hpp"
+#include "src/cli/serve/inference_backend.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/stop_sequences.hpp"
 #include "src/cli/serve/trace.hpp"
 #include "src/core/json.hpp"
 #include "src/core/platform/env.hpp"
 #include "src/core/platform/os_info.hpp"
+#include "tests/cache/fake_adapter.hpp"
+#include "tests/cli/fake_cache_resources.hpp"
 
 namespace {
 
@@ -112,6 +116,8 @@ struct Event {
 };
 
 struct FakeControl {
+  gufo::sampling::TextModelPreset sampling_preset{
+      gufo::sampling::TextModelPreset::kUnspecified};
   void Log(Event event) {
     const std::lock_guard<std::mutex> lock(mutex);
     events.push_back(event);
@@ -214,27 +220,67 @@ struct FakeControl {
   std::uint32_t max_context{128};
   std::optional<std::size_t> stop_after;
   std::optional<std::size_t> eos_after;
+  // Retained state needs snapshot capabilities; a capture observer implies it.
+  bool snapshots{false};
   std::function<void()> snapshot_callback;
+  [[nodiscard]] bool Retains() const {
+    return snapshots || bool(snapshot_callback);
+  }
 };
 
-class FakeState final : public TextRunnerState {
-public:
-  explicit FakeState(std::shared_ptr<FakeControl> control)
-      : control_(std::move(control)) {}
-
-  void Invalidate() noexcept override {
-    control_->RecordInvalidation();
-    label = 0;
-    position = 0;
-    decode_count = 0;
-    frontier.reset();
-  }
-
-  std::shared_ptr<FakeControl> control_;
+// What a checkpoint restores besides the adapter's rows.
+struct FakeFrontier {
   TextRunnerToken label{0};
   std::size_t position{0};
   std::size_t decode_count{0};
   std::optional<TextRunnerToken> frontier;
+};
+
+class ObservedAdapter final : public gufo::cache::testing::FakeAdapter {
+public:
+  explicit ObservedAdapter(std::shared_ptr<FakeControl> control)
+      : FakeAdapter(64), control_(std::move(control)) {}
+  std::unique_ptr<gufo::cache::Slot> CreateSlot(
+      gufo::cache::MutationGuard& guard) override {
+    control_->states_created.fetch_add(1, std::memory_order_relaxed);
+    return FakeAdapter::CreateSlot(guard);
+  }
+  bool Invalidate(gufo::cache::Slot& slot) noexcept override {
+    // Assigning a cold slot also resets it; only discarded work counts.
+    bool executed = true;
+    try {
+      executed = Positions(slot).front().valid_rows != 0;
+    } catch (...) {
+    }
+    if (executed)
+      control_->RecordInvalidation();
+    return FakeAdapter::Invalidate(slot);
+  }
+  gufo::cache::Completion CapturePrivatePiece(
+      const gufo::cache::Slot& slot, gufo::cache::ComponentId id,
+      std::size_t offset, std::span<std::byte> bytes,
+      gufo::cache::Stream& stream) override {
+    if (offset == 0 && control_->snapshot_callback)
+      control_->snapshot_callback();
+    return FakeAdapter::CapturePrivatePiece(slot, id, offset, bytes, stream);
+  }
+
+private:
+  std::shared_ptr<FakeControl> control_;
+};
+
+class FakeState final : public TextRunnerState, public FakeFrontier {
+public:
+  FakeState(gufo::cache::testing::FakeAdapter& adapter, gufo::cache::Slot& slot)
+      : adapter(adapter), slot(slot) {}
+
+  void Invalidate() noexcept override {
+    (void)adapter.Invalidate(slot);
+    static_cast<FakeFrontier&>(*this) = {};
+  }
+
+  gufo::cache::testing::FakeAdapter& adapter;
+  gufo::cache::Slot& slot;
 };
 
 FakeState& RequireFakeState(TextRunnerState& state) {
@@ -266,8 +312,8 @@ public:
         .capabilities =
             TextRunnerCapabilities{
                 .incremental_prefill = control_->incremental_prefill,
-                .snapshot = bool(control_->snapshot_callback),
-                .fork = bool(control_->snapshot_callback),
+                .snapshot = control_->Retains(),
+                .fork = control_->Retains(),
                 .final_token_advance_required =
                     control_->final_token_advance_required,
                 .incremental_text_is_exact =
@@ -279,6 +325,7 @@ public:
                 .prefix_reuse = control_->prefix_reuse,
             },
         .persistence = std::nullopt,
+        .sampling_preset = control_->sampling_preset,
     };
   }
 
@@ -288,8 +335,7 @@ public:
         .state_capacity_bytes = 8 * 64,
         .per_request_state_bytes = 64,
         .temporary_scratch_bytes = 0,
-        .retained_snapshot_capacity_bytes =
-            control_->snapshot_callback ? 4096U : 0U,
+        .retained_snapshot_capacity_bytes = 1U << 25,
         .requires_device_runtime_lock = true,
     };
   }
@@ -350,8 +396,29 @@ public:
   }
 
   [[nodiscard]] std::unique_ptr<TextRunnerState> CreateState() const override {
-    control_->states_created.fetch_add(1, std::memory_order_relaxed);
-    return std::make_unique<FakeState>(control_);
+    throw std::logic_error("slots are owned by the component cache");
+  }
+
+  [[nodiscard]] bool UsesComponentCache() const override { return true; }
+  [[nodiscard]] std::unique_ptr<gufo::server::ComponentCacheResources>
+  CreateComponentCacheResources(gufo::cache::ResourceLedger& ledger,
+                                std::size_t) const override {
+    return gufo::server::testing::MakeFakeCacheResources(
+        ledger, std::make_unique<ObservedAdapter>(control_),
+        {.private_blocks = 512,
+         .row_backing_bytes = 1024,
+         .total_row_bytes = 1U << 24});
+  }
+  [[nodiscard]] std::unique_ptr<TextRunnerState> BindComponentState(
+      gufo::cache::Adapter& adapter, gufo::cache::Slot& slot) const override {
+    auto state = std::make_unique<FakeState>(
+        dynamic_cast<gufo::cache::testing::FakeAdapter&>(adapter), slot);
+    Recall(*state);
+    return state;
+  }
+  void ReconcileComponentState(TextRunnerState& state,
+                               std::size_t) const override {
+    Recall(RequireFakeState(state));
   }
 
   void PrepareBatchExecution(TextRunnerState& state) const override {
@@ -391,11 +458,14 @@ public:
       }
     }
 
+    const auto rows = prompt.subspan(offset, consumed);
+    fake.adapter.Append(fake.slot, rows, rows);
     fake.position += consumed;
     const bool ready = fake.position == prompt.size();
     if (ready) {
       fake.frontier = fake.label * 100;
     }
+    Remember(fake);
     return {
         .consumed_tokens = consumed,
         .decode_ready = ready,
@@ -403,13 +473,18 @@ public:
   }
 
   [[nodiscard]] TextDecodeSelection SelectNext(
-      TextRunnerState& state, gufo::sampling::SamplerState&) const override {
+      TextRunnerState& state,
+      gufo::sampling::SamplerState& sampler) const override {
     const auto& fake = RequireFakeState(state);
     if (!fake.frontier.has_value()) {
       throw std::logic_error("scheduler fake has no frontier");
     }
+    auto probabilities = sampler.config().logprobs
+                             ? std::optional(gufo::sampling::TokenLogprobs{
+                                   {*fake.frontier, -0.25}, {}})
+                             : std::nullopt;
     if (control_->stop_after && fake.decode_count >= *control_->stop_after)
-      return {.stop = true};
+      return {.stop = true, .logprobs = probabilities};
     if (control_->eos_after && fake.decode_count >= *control_->eos_after &&
         fake.stop_at_eos())
       return {.stop = true};
@@ -418,12 +493,15 @@ public:
           static_cast<std::size_t>(*fake.frontier - fake.label * 100);
       if (index >= control_->output_pieces.size())
         return {.stop = true};
-      return {.token = *fake.frontier, .piece = control_->output_pieces[index]};
+      return {.token = *fake.frontier,
+              .piece = control_->output_pieces[index],
+              .logprobs = probabilities};
     }
     return {
         .stop = false,
         .token = *fake.frontier,
         .piece = std::to_string(*fake.frontier),
+        .logprobs = probabilities,
     };
   }
 
@@ -433,39 +511,6 @@ public:
     if (!control_->preview_first_token)
       return std::nullopt;
     return SelectNext(state, sampler);
-  }
-
-  struct SnapshotState final : gufo::server::TextRunnerSnapshot {
-    explicit SnapshotState(const FakeState& state)
-        : label(state.label),
-          position(state.position),
-          decode_count(state.decode_count),
-          frontier(state.frontier) {}
-    TextRunnerToken label;
-    std::size_t position, decode_count;
-    std::optional<TextRunnerToken> frontier;
-    std::size_t PayloadBytes() const noexcept override {
-      return sizeof(SnapshotState);
-    }
-  };
-  std::size_t SnapshotPayloadBytes(const TextRunnerState&) const override {
-    return sizeof(SnapshotState);
-  }
-  std::unique_ptr<gufo::server::TextRunnerSnapshot> Snapshot(
-      const TextRunnerState& state) const override {
-    if (control_->snapshot_callback)
-      control_->snapshot_callback();
-    return std::make_unique<SnapshotState>(RequireFakeState(state));
-  }
-  void RestoreOrFork(
-      TextRunnerState& state,
-      const gufo::server::TextRunnerSnapshot& snapshot) const override {
-    auto& restored = RequireFakeState(state);
-    const auto& saved = dynamic_cast<const SnapshotState&>(snapshot);
-    restored.label = saved.label;
-    restored.position = saved.position;
-    restored.decode_count = saved.decode_count;
-    restored.frontier = saved.frontier;
   }
 
   void Advance(TextRunnerState& state, TextRunnerToken token) const override {
@@ -499,9 +544,11 @@ public:
       });
     }
 
+    fake.adapter.Append(fake.slot, {&token, 1}, {&token, 1});
     ++fake.position;
     ++fake.decode_count;
     fake.frontier = token + 1;
+    Remember(fake);
     if (fake.label == 1)
       control_->first_request_advance_ns.fetch_add(
           std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -527,6 +574,7 @@ public:
       auto selection = SelectNext(state, sampler);
       if (selection.stop) {
         step.stop = true;
+        step.terminal_logprobs = selection.logprobs;
         break;
       }
       Advance(state, selection.token);
@@ -581,7 +629,19 @@ public:
   }
 
 private:
+  void Remember(const FakeState& state) const {
+    const std::lock_guard lock(frontier_mutex_);
+    frontiers_[state.adapter.RecurrentHash(state.slot)] = state;
+  }
+  void Recall(FakeState& state) const {
+    const std::lock_guard lock(frontier_mutex_);
+    const auto found = frontiers_.find(state.adapter.RecurrentHash(state.slot));
+    static_cast<FakeFrontier&>(state) =
+        found == frontiers_.end() ? FakeFrontier{} : found->second;
+  }
   std::shared_ptr<FakeControl> control_;
+  mutable std::mutex frontier_mutex_;
+  mutable std::unordered_map<std::uint64_t, FakeFrontier> frontiers_;
 };
 
 std::unique_ptr<TextGenerationScheduler> MakeScheduler(
@@ -1039,6 +1099,7 @@ void TestRequestTotalsDoNotNeedAConsumer() {
       };
   {
     auto control = std::make_shared<FakeControl>();
+    control->snapshots = true;
     auto scheduler = MakeScheduler(control, 1);
     gufo::server::RecordServerMetrics(
         scheduler->Submit({1, 10}, 1, 0.0F).Wait());
@@ -1354,13 +1415,16 @@ void TestPrefillYieldsToEveryDueDecoder(bool multi_token, bool batched) {
   control->multi_token_decode = multi_token;
   control->batched_multi_token_decode = batched;
   control->supports_batched_advance = multi_token;
-  control->block_advance_label = 2;
+  control->block_advance_label = 1;
   auto scheduler = MakeScheduler(control, 3, {.decode_active_tokens = 2});
 
   const std::size_t output_tokens = multi_token ? 30 : 10;
   auto request_a = scheduler->Submit({1}, output_tokens, 0.0F);
+  // Hold A before it can finish while the submitting thread is descheduled.
+  // Queue both peers before releasing it, so both decoders are still due
+  // between C's prefill chunks, regardless of host scheduling.
+  control->WaitForAdvance(1);
   auto request_b = scheduler->Submit({2}, output_tokens, 0.0F);
-  control->WaitForAdvance(2);
   auto request_c = scheduler->Submit({3, 30, 31, 32, 33, 34, 35}, 2, 0.0F);
   control->ReleaseAdvance();
 
@@ -1831,7 +1895,9 @@ void TestMetricsDuringCacheAdmission() {
         release.acquire();
       }
     };
-    auto scheduler = MakeScheduler(control, 2);
+    // Capture does not hold admission: only the full slot keeps the peer
+    // queued.
+    auto scheduler = MakeScheduler(control, 1);
     const auto first = scheduler->Submit({1, 10}, 1, 0.0F).Wait();
     Expect(first.tokens == ExpectedTokens(1, 1), "first request completes");
     Expect(metrics::RequestsProcessing().load() == processing_before,
@@ -2307,11 +2373,17 @@ void TestStopSequencesPreserveExecutedState() {
         TextGenerationScheduler::RequestMetadata metadata;
         metadata.stop_sequences = {"<STOP>"};
         std::string streamed;
-        auto request = scheduler->Submit({1, 10}, 8, 0.0F, {}, true, metadata);
-        const auto result = request.Wait([&](std::string_view piece) {
-          streamed += piece;
-          return true;
-        });
+        gufo::sampling::SamplingConfig config;
+        config.logprobs = 2;
+        std::size_t logprob_tokens = 0;
+        auto request =
+            scheduler->Submit({1, 10}, 8, config, {}, true, metadata);
+        const auto result =
+            request.Wait([&](const gufo::server::TokenPiece& piece) {
+              streamed += piece.text;
+              logprob_tokens += piece.logprobs != nullptr;
+              return true;
+            });
         Expect(
             result.finish_reason == Finish::kStopSequence && !result.cancelled,
             "stop sequence is a successful completion");
@@ -2322,10 +2394,14 @@ void TestStopSequencesPreserveExecutedState() {
         Expect(result.tokens.size() == (first ? 1U : 2U) &&
                    result.completion_tokens == result.tokens.size(),
                "usage includes the token that completed the stop");
+        Expect(logprob_tokens == result.tokens.size() &&
+                   result.logprobs.size() == result.tokens.size(),
+               "stop filtering retains selected metadata and discards the "
+               "speculative tail");
         // Repeating the prompt must not resume from an incorrectly labelled
         // generated frontier, including when preview or a speculative tail ran.
         const auto replay =
-            scheduler->Submit({1, 10}, 8, 0.0F, {}, true, metadata).Wait();
+            scheduler->Submit({1, 10}, 8, config, {}, true, metadata).Wait();
         Expect(replay.tokens == result.tokens && replay.text == result.text,
                "a stopped request leaves a safe reusable prompt cache");
       }
@@ -2773,6 +2849,7 @@ void TestPromptProgressPrecedesStreamedTokens() {
   using gufo::server::TextGenerationBackend;
   auto control = std::make_shared<FakeControl>();
   control->prefill_capacity = 2;
+  control->snapshots = true;
   auto scheduler = MakeScheduler(control, 1);
   auto run = [&](std::vector<TextRunnerToken> prompt, bool stream,
                  bool report_progress = true) {
@@ -2979,7 +3056,123 @@ void TestEmptyTokenIsPublished() {
          "an empty streamed piece still charges the output budget");
 }
 
+void TestTokenLogprobs() {
+  for (const bool multi : {false, true}) {
+    for (const bool preview : {false, true}) {
+      auto control = std::make_shared<FakeControl>();
+      control->multi_token_decode = multi;
+      control->preview_first_token = preview;
+      control->stop_after = 3;
+      auto scheduler = MakeScheduler(control, 2);
+      gufo::sampling::SamplingConfig config;
+      config.logprobs = 2;
+      auto request = scheduler->Submit({1, 10, 11}, 8, config, {}, true);
+      auto peer =
+          scheduler->Submit({2, 20, 21}, 2, gufo::sampling::SamplingConfig{});
+      std::vector<gufo::sampling::TokenId> observed;
+      const auto result =
+          request.Wait([&](const gufo::server::TokenPiece& piece) {
+            Expect(piece.logprobs != nullptr,
+                   "every selected token carries metadata");
+            observed.push_back(piece.logprobs->entries.front().id);
+            return true;
+          });
+      Expect(result.tokens == ExpectedTokens(1, 3) &&
+                 observed == ExpectedTokens(1, 4),
+             "preview and speculative blocks publish each token and EOS "
+             "exactly once");
+      Expect(result.logprobs.size() == observed.size(),
+             "stream and buffered records agree");
+      Expect(peer.Wait().logprobs.empty(),
+             "concurrent disabled requests retain no metadata");
+      const auto resumed = scheduler->Submit({1, 10, 11}, 2, config).Wait();
+      Expect(resumed.logprobs.size() == 2,
+             "a reused session owns fresh logprob state");
+      auto cancelled = scheduler->Submit({3, 30, 31}, 8, config, {}, true);
+      std::size_t delivered = 0;
+      const auto cancelled_result =
+          cancelled.Wait([&](const gufo::server::TokenPiece& piece) {
+            Expect(piece.logprobs != nullptr,
+                   "cancelled stream retains delivered metadata");
+            ++delivered;
+            return false;
+          });
+      Expect(cancelled_result.cancelled && delivered == 1,
+             "cancellation stops metadata delivery with text");
+      const auto after_cancel =
+          scheduler->Submit({4, 40, 41}, 2, config).Wait();
+      Expect(after_cancel.logprobs.size() == 2 &&
+                 after_cancel.logprobs.front().entries.front().id ==
+                     ExpectedTokens(4, 1).front(),
+             "reclaimed sessions do not leak cancelled metadata");
+    }
+  }
+  for (const bool stream : {false, true}) {
+    auto control = std::make_shared<FakeControl>();
+    TextSchedulerPolicy policy;
+    if (stream) {
+      policy.max_buffered_output_bytes_per_request = 32;
+      policy.max_buffered_output_bytes_total = 32;
+    } else {
+      policy.max_output_bytes_per_request = 32;
+    }
+    auto scheduler = MakeScheduler(control, 1, {}, policy);
+    gufo::sampling::SamplingConfig config;
+    config.logprobs = 0;
+    bool failed = false;
+    std::size_t scored = 0;
+    try {
+      scored = scheduler->Submit({1, 10}, 2, config, {}, stream)
+                   .Wait()
+                   .logprobs.size();
+    } catch (const TextGenerationError& error) {
+      failed = error.code() == TextGenerationErrorCode::kOutputBackpressure;
+    }
+    Expect(stream ? failed : scored == 2,
+           stream ? "metadata counts toward backpressure limits"
+                  : "metadata does not count toward the text byte limit");
+  }
+}
+
+#if defined(ENGINE_ENABLE_HIP)
+void TestBackendPreservesModelSamplingPreset() {
+  using gufo::sampling::TextModelPreset;
+  for (const auto preset :
+       {TextModelPreset::kQwen38, TextModelPreset::kDeepSeekV4Flash}) {
+    auto control = std::make_shared<FakeControl>();
+    control->sampling_preset = preset;
+    gufo::server::InferenceBackend backend;
+    std::string error;
+    Expect(backend.load(std::make_shared<FakeRunner>(control), &error), error);
+    Expect(backend.sampling_defaults().model == preset,
+           "loading an extension preserves its sampling preset");
+    for (const bool thinking : {false, true}) {
+      const auto defaults = backend.sampling_defaults().Resolve(thinking);
+      const bool qwen_off = preset == TextModelPreset::kQwen38 && !thinking;
+      Expect(
+          defaults.temperature == (qwen_off ? 0.7F : 1.0F) &&
+              defaults.top_p == (qwen_off ? 0.8F : 0.95F) &&
+              defaults.top_k == (preset == TextModelPreset::kQwen38 ? 20 : 0) &&
+              defaults.presence_penalty == (qwen_off ? 1.5F : 0.0F),
+          "omitted sampling settings use the model's thinking preset");
+    }
+    gufo::sampling::SamplingConfig configured;
+    configured.temperature = 0.25F;
+    backend.set_sampling_defaults(32, configured, {.temperature = true});
+    const auto defaults = backend.sampling_defaults();
+    Expect(defaults.model == preset && defaults.max_tokens == 32 &&
+               defaults.Resolve(true).temperature == 0.25F &&
+               defaults.Resolve(true).top_p == 0.95F,
+           "server overrides retain the model preset for omitted fields");
+  }
+}
+#endif
+
 int main() {
+#if defined(ENGINE_ENABLE_HIP)
+  TestBackendPreservesModelSamplingPreset();
+#endif
+  TestTokenLogprobs();
   TestPublicationWaitUsesRecentSubstantialPrefill();
   // Log assertions in this binary match the plain "[LEVEL] [component]" text
   // captured from a redirected sink; a TTY stderr would tint the level tag.

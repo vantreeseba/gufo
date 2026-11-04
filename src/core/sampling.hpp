@@ -35,6 +35,8 @@ struct ReasoningBudget {
 /// Filters run in this order: penalties, temperature, top-k, top-p, min-p.
 /// The defaults preserve Gufo's existing greedy decoding behavior.
 struct SamplingConfig {
+  /// Observational raw target log probabilities; null disables collection.
+  std::optional<std::uint32_t> logprobs;
   float temperature{0.0F};
   std::int32_t top_k{0};
   float top_p{1.0F};
@@ -73,6 +75,21 @@ struct LogitCandidate {
   float value;
 };
 
+struct TokenLogprob {
+  TokenId token{0};
+  double logprob{0};
+};
+
+struct TokenLogprobs {
+  TokenLogprob selected;
+  std::vector<TokenLogprob> top;
+};
+
+/// Full-vocabulary log-softmax before any sampling transformations.
+[[nodiscard]] std::optional<TokenLogprobs> CollectLogprobs(
+    std::span<const float> logits, TokenId selected,
+    std::optional<std::uint32_t> count);
+
 /// A normalized, post-filter sampling distribution.
 class SamplingDistribution {
 public:
@@ -100,6 +117,12 @@ private:
     std::span<const float> logits, const SamplingConfig& config,
     std::span<const TokenId> prompt_tokens = {},
     std::span<const TokenId> generated_tokens = {});
+
+/// Buffers the full-row sampler reuses across tokens; not part of the API.
+struct LogitRowScratch {
+  std::vector<std::uint32_t> histogram;
+  std::vector<double> block_maxima;
+};
 
 /// Request-owned controls, repetition window, full generated counts and RNG.
 ///
@@ -192,8 +215,7 @@ private:
   [[nodiscard]] SamplingDistribution LinearDistribution(
       std::span<const float> logits) const;
   void PrepareSelected(std::span<const float> logits);
-  void FilterSelected(double full_softmax_sum = 0,
-                      bool has_full_softmax_sum = false);
+  void FilterSelected(std::optional<std::size_t> top_p_keep = std::nullopt);
   [[nodiscard]] SamplingDistribution SelectedDistribution();
   void StartReasoning();
   void AdvanceReasoning(TokenId token);
@@ -205,6 +227,7 @@ private:
   std::vector<TokenId> history_;
   std::vector<TokenPenalty> penalty_counts_;
   std::vector<Probability> candidate_scratch_;
+  LogitRowScratch row_scratch_;
   std::uint64_t rng_state_{0};
   std::optional<TokenId> pending_sample_;
   enum class ReasoningPhase : std::uint8_t {

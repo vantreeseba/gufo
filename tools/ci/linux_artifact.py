@@ -43,6 +43,15 @@ def copy_runtime(source, root):
         destination.chmod(source.stat().st_mode & 0o777)
 
 
+def copy_share(source, destination):
+    shutil.copytree(source, destination, symlinks=False)
+    # Nix store directories are read-only. Persistent self-hosted workspaces
+    # must be able to delete the unpacked copy before the next run.
+    for directory in [destination, *destination.rglob('*')]:
+        if directory.is_dir():
+            directory.chmod(directory.stat().st_mode | 0o700)
+
+
 def launcher(directory, name, loader, libraries, environment):
     script = directory / name
     # Use shell builtins only before invoking the bundled ELF loader. The
@@ -63,7 +72,7 @@ def launcher(directory, name, loader, libraries, environment):
 def pack(package, revision, destination):
     package = package.resolve(strict=True)
     version = output(str(package / 'bin/gufo'), '--version')
-    if not version.endswith(f'({revision[:7]})'):
+    if not version.splitlines()[0].endswith(f'({revision[:7]})'):
         raise ValueError(f'Package revision mismatch: {version}; expected {revision}')
     root = destination.parent
     closure = [Path(path) for path in output('nix-store', '--query', '--requisites', str(package)).splitlines()]
@@ -75,7 +84,7 @@ def pack(package, revision, destination):
     if executable.read_bytes()[:4] != b'\x7fELF':
         raise ValueError('Production package does not contain an ELF executable')
     shutil.copy2(executable, destination / 'libexec/gufo')
-    shutil.copytree(package / 'share', destination / 'share', symlinks=False)
+    copy_share(package / 'share', destination / 'share')
     for dependency in closure:
         if dependency == package:
             continue
@@ -139,7 +148,7 @@ def verify(source, revision):
         if hashlib.file_digest(file, 'sha256').hexdigest() != manifest['sha256']:
             raise ValueError('Linux binary checksum mismatch')
     version = output(str(source / 'gufo'), '--version')
-    if version != manifest['version'] or not version.endswith(f'({revision[:7]})'):
+    if version != manifest['version'] or not version.splitlines()[0].endswith(f'({revision[:7]})'):
         raise ValueError('Linux binary has the wrong revision')
     root = source.parent
     linked = output(str(root / manifest['loader']), '--library-path',

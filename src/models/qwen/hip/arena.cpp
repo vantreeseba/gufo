@@ -3,6 +3,8 @@
 #include <array>
 #include <cassert>
 #include <cstring>
+#include <gufo/ext/experimental/hip_utils.hpp>
+#include <gufo/ext/experimental/snapshot_transfer.hpp>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -10,11 +12,9 @@
 #include <utility>
 
 #include "qfn_mmq.h"
-#include "src/core/hip/hip_utils.hpp"
-#include "src/core/hip/snapshot_transfer.hpp"
-#include "src/models/qwen/hip/detail/attention_policy.hpp"
+#include "src/families/qwen/hip_common/attention_policy.hpp"
+#include "src/families/qwen/kernels/ops/gemm.hpp"
 #include "src/models/qwen/hip/executor.hpp"
-#include "src/models/qwen/hip/ops/gemm.hpp"
 
 namespace gufo::hip {
 namespace {
@@ -115,8 +115,8 @@ QwenMoeScratch CarveMoeScratch(std::uint8_t* block,
   };
   scratch.router_done = std::span<std::uint32_t>(
       reinterpret_cast<std::uint32_t*>(block), kMoeRouterCounterSlots);
-  offset += ((kMoeRouterCounterSlots * sizeof(std::uint32_t) + 255) / 256) *
-            256;
+  offset +=
+      ((kMoeRouterCounterSlots * sizeof(std::uint32_t) + 255) / 256) * 256;
   scratch.router_logits = take_floats(batch * config.expert_count);
   scratch.shexp_gate = take_floats(batch);
   scratch.ids = take_ints(slots);
@@ -556,6 +556,12 @@ QwenGpuMemoryUsage QwenGpuArena::GetMemoryUsage() const {
   if (d_ssm_conv_buffers_[1] && d_ssm_deltanet_buffers_[1])
     CheckedAdd(RecurrentStateBytes(config_, policy_),
                &usage.request_state_bytes);
+  // Rollback scratch, not snapshot state: only the slots a wide verification
+  // added to the ring (the runner claims them).
+  if (d_ssm_replay_qkv_ != nullptr && replay_capacity_ > kSsmReplayCapacity)
+    CheckedAdd(SsmReplayLogBytes(config_, replay_capacity_) -
+                   SsmReplayLogBytes(config_, kSsmReplayCapacity),
+               &usage.temporary_scratch_bytes);
   return usage;
 }
 
@@ -1077,6 +1083,7 @@ QwenGpuArena::QwenGpuArena(QwenGpuArena&& other) noexcept
   d_ssm_replay_alpha_ = other.d_ssm_replay_alpha_;
   d_ssm_replay_beta_ = other.d_ssm_replay_beta_;
   d_ssm_replay_enabled_ = other.d_ssm_replay_enabled_;
+  replay_capacity_ = other.replay_capacity_;
   saved_context_ = other.saved_context_;
   replay_last_position_ = other.replay_last_position_;
   replay_captured_positions_ = other.replay_captured_positions_;
@@ -1124,6 +1131,7 @@ QwenGpuArena::QwenGpuArena(QwenGpuArena&& other) noexcept
   other.d_ssm_replay_alpha_ = nullptr;
   other.d_ssm_replay_beta_ = nullptr;
   other.d_ssm_replay_enabled_ = nullptr;
+  other.replay_capacity_ = kSsmReplayCapacity;
   other.saved_context_ = 0;
   other.replay_last_position_ = 0;
   other.replay_captured_positions_ = 0;
@@ -1181,6 +1189,7 @@ QwenGpuArena& QwenGpuArena::operator=(QwenGpuArena&& other) noexcept {
     d_ssm_replay_alpha_ = other.d_ssm_replay_alpha_;
     d_ssm_replay_beta_ = other.d_ssm_replay_beta_;
     d_ssm_replay_enabled_ = other.d_ssm_replay_enabled_;
+    replay_capacity_ = other.replay_capacity_;
     saved_context_ = other.saved_context_;
     replay_last_position_ = other.replay_last_position_;
     replay_captured_positions_ = other.replay_captured_positions_;
@@ -1228,6 +1237,7 @@ QwenGpuArena& QwenGpuArena::operator=(QwenGpuArena&& other) noexcept {
     other.d_ssm_replay_alpha_ = nullptr;
     other.d_ssm_replay_beta_ = nullptr;
     other.d_ssm_replay_enabled_ = nullptr;
+    other.replay_capacity_ = kSsmReplayCapacity;
     other.saved_context_ = 0;
     other.replay_last_position_ = 0;
     other.replay_captured_positions_ = 0;

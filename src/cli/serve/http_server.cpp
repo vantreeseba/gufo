@@ -29,11 +29,13 @@
 #include "src/cli/serve/audio_asr_api.hpp"
 #include "src/cli/serve/audio_tts_api.hpp"
 #include "src/cli/serve/audio_websocket.hpp"
+#include "src/cli/serve/decision_service.hpp"
 #include "src/cli/serve/embedding_service.hpp"
 #include "src/cli/serve/embeddings_api.hpp"
 #include "src/cli/serve/image_api.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/openai_chat.hpp"
+#include "src/cli/serve/responses_logprobs.hpp"
 #include "src/cli/serve/sampling_request.hpp"
 #include "src/cli/serve/stop_sequences.hpp"
 #include "src/cli/serve/trace.hpp"
@@ -41,12 +43,11 @@
 #include "src/cli/serve/video_api.hpp"
 #include "src/cli/serve/video_jobs.hpp"
 #include "src/cli/serve/websocket.hpp"
-#include "src/core/crypto/sha256.hpp"
 #include "src/core/json.hpp"
 #include "src/core/platform/net.hpp"
 #include "src/core/platform/shutdown_signal.hpp"
 #include "src/core/utf8.hpp"
-#include "src/models/qwen/chat_template.hpp"
+#include "src/families/qwen/text/chat_template.hpp"
 
 namespace gufo::server {
 namespace {
@@ -227,39 +228,6 @@ bool ExpectsContinue(const HttpRequest& request) {
   });
 }
 
-std::string CredentialHash(std::string_view value) {
-  return crypto::Sha256Hex(std::span(
-      reinterpret_cast<const std::uint8_t*>(value.data()), value.size()));
-}
-
-bool IsAuthorized(const HttpRequest& request, const std::string& key_hash) {
-  if (key_hash.empty()) {
-    return true;
-  }
-  std::string_view credential;
-  bool found = false;
-  for (const auto& [name, value] : request.headers) {
-    if (ToLower(name) == "authorization") {
-      if (found) {
-        return false;
-      }
-      found = true;
-      credential = value;
-    }
-  }
-  const auto space = credential.find(' ');
-  if (space == std::string_view::npos ||
-      ToLower(credential.substr(0, space)) != "bearer") {
-    return false;
-  }
-  credential.remove_prefix(space + 1);
-  while (credential.starts_with(' ')) {
-    credential.remove_prefix(1);
-  }
-  // Comparing digests does not disclose matching prefixes of the API key.
-  return CredentialHash(credential) == key_hash;
-}
-
 bool HasHeader(const HttpResponse& response, std::string_view name) {
   const std::string lowered = ToLower(name);
   return std::ranges::any_of(response.headers, [&](const auto& header) {
@@ -319,6 +287,8 @@ std::string BuildResponseHead(const HttpResponse& resp,
   }
   out += "Access-Control-Allow-Origin: *\r\n";
   out += "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n";
+  // Authorization is accepted (and ignored) so browser SDKs that always send
+  // it still pass their CORS preflight.
   out += "Access-Control-Allow-Headers: Content-Type, Authorization, Range\r\n";
   for (const auto& [name, value] : resp.headers) {
     out += name;
@@ -635,6 +605,7 @@ struct CompatibilityAllowances {
   bool stream{false};
   bool stream_options{false};
   bool ignore_eos{false};
+  bool logprobs{false};
   bool response_controls{false};
   bool thinking{false};
   bool output_config{false};
@@ -713,6 +684,7 @@ std::optional<HttpResponse> ReadCompatibilityOptions(
     if (field != allowances.stop_field &&
         !(field == "stream_options" && allowances.stream_options) &&
         !(field == "ignore_eos" && allowances.ignore_eos) &&
+        !(field == "logprobs" && allowances.logprobs) &&
         !(field == "thinking" && allowances.thinking) &&
         !(field == "output_config" && allowances.output_config) &&
         !((field == "tools" || field == "tool_choice") && allowances.tools) &&
@@ -720,10 +692,7 @@ std::optional<HttpResponse> ReadCompatibilityOptions(
         !(allowances.response_controls &&
           (field == "text" || field == "reasoning" || field == "tools" ||
            field == "tool_choice" || field == "parallel_tool_calls" ||
-           // include is a standard Responses field (for example encrypted
-           // reasoning); gufo keeps no server-side conversation, so its value
-           // is accepted and ignored.
-           field == "include"))) {
+           field == "include" || field == "top_logprobs"))) {
       return InvalidCompatibilityRequest("request field '" + field +
                                          "' is not supported on this endpoint");
     }
@@ -754,11 +723,20 @@ std::optional<HttpResponse> ReadCompatibilityOptions(
 // Endpoint handlers
 // ---------------------------------------------------------------------------
 
+// The primary ID followed by its accepted aliases, in listing order.
+std::vector<std::string> ServedIds(const std::string& primary,
+                                   const std::vector<std::string>& aliases) {
+  std::vector<std::string> ids{primary};
+  ids.insert(ids.end(), aliases.begin(), aliases.end());
+  return ids;
+}
+
 HttpResponse ListModels(TextGenerationBackend* backend,
                         const VideoJobService* video_jobs,
                         const TtsService* tts, const AsrService* asr,
                         const ImageService* images,
-                        const EmbeddingService* embeddings) {
+                        const EmbeddingService* embeddings,
+                        const DecisionService* decisions) {
   json::Value resp = json::Value::object();
   resp["object"] = "list";
   json::Value data = json::Value::array();
@@ -801,41 +779,83 @@ HttpResponse ListModels(TextGenerationBackend* backend,
       model["capability"] = "video";
       data.push_back(std::move(model));
     }
+    // Configured `--served-model-name` aliases of the root model (#957).
+    for (const auto& alias : video_jobs->model_aliases()) {
+      json::Value model = json::Value::object();
+      model["id"] = alias;
+      model["object"] = "model";
+      model["created"] = Now();
+      model["owned_by"] = "operator-supplied-minimax";
+      model["root"] = "minimax-h3";
+      model["capability"] = "video";
+      data.push_back(std::move(model));
+    }
   }
   if (tts != nullptr && tts->ready()) {
-    json::Value model = json::Value::object();
-    model["id"] = tts->model_id();
-    model["object"] = "model";
-    model["created"] = Now();
-    model["owned_by"] = "operator-supplied-qwen";
-    model["capability"] = "audio_tts";
-    data.push_back(std::move(model));
+    for (const auto& id : ServedIds(tts->model_id(), tts->model_aliases())) {
+      json::Value model = json::Value::object();
+      model["id"] = id;
+      model["object"] = "model";
+      model["created"] = Now();
+      model["owned_by"] = "operator-supplied-qwen";
+      model["capability"] = "audio_tts";
+      data.push_back(std::move(model));
+    }
   }
   if (asr != nullptr && asr->ready()) {
-    json::Value model = json::Value::object();
-    model["id"] = asr->model_id();
-    model["object"] = "model";
-    model["created"] = Now();
-    model["owned_by"] = "operator-supplied-qwen";
-    model["capability"] = "audio_asr";
-    data.push_back(std::move(model));
+    for (const auto& id : ServedIds(asr->model_id(), asr->model_aliases())) {
+      json::Value model = json::Value::object();
+      model["id"] = id;
+      model["object"] = "model";
+      model["created"] = Now();
+      model["owned_by"] = "operator-supplied-qwen";
+      model["capability"] = "audio_asr";
+      data.push_back(std::move(model));
+    }
   }
   if (images != nullptr) {
-    auto model = json::Value::object();
-    model["id"] = images->model_id();
-    model["object"] = "model";
-    model["created"] = Now();
-    model["owned_by"] = "operator-supplied-qwen";
-    model["capability"] = "image";
-    data.push_back(std::move(model));
+    for (const auto& id :
+         ServedIds(images->model_id(), images->model_aliases())) {
+      auto model = json::Value::object();
+      model["id"] = id;
+      model["object"] = "model";
+      model["created"] = Now();
+      model["owned_by"] = "operator-supplied-qwen";
+      model["capability"] = "image";
+      data.push_back(std::move(model));
+    }
   }
   if (embeddings != nullptr && embeddings->ready()) {
-    json::Value model = json::Value::object();
-    model["id"] = embeddings->model_id();
+    for (const auto& id :
+         ServedIds(embeddings->model_id(), embeddings->model_aliases())) {
+      json::Value model = json::Value::object();
+      model["id"] = id;
+      model["object"] = "model";
+      model["created"] = Now();
+      model["owned_by"] = "operator-supplied-gemma";
+      model["capability"] = "embedding";
+      data.push_back(std::move(model));
+    }
+  }
+  for (const auto& decision_id :
+       decisions != nullptr
+           ? ServedIds(decisions->model_id, decisions->model_aliases)
+           : std::vector<std::string>{}) {
+    auto model = json::Value::object();
+    model["id"] = decision_id;
     model["object"] = "model";
     model["created"] = Now();
-    model["owned_by"] = "operator-supplied-gemma";
-    model["capability"] = "embedding";
+    model["owned_by"] = "gufo";
+    model["capability"] = "decision";
+    auto modalities = json::Value::array();
+    modalities.push_back("text");
+    if (decisions->multimodal) {
+      modalities.push_back("image");
+      modalities.push_back("audio");
+    }
+    auto architecture = json::Value::object();
+    architecture["input_modalities"] = modalities;
+    model["architecture"] = architecture;
     data.push_back(std::move(model));
   }
   resp["data"] = std::move(data);
@@ -862,9 +882,12 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
                                                 .stream = true,
                                                 .stream_options = true,
                                                 .ignore_eos = true,
+                                                .logprobs = true,
                                             })) {
     return std::move(*error);
   }
+  if (const auto error = ParseLogprobs(body, false, &sampling_config))
+    return InvalidCompatibilityRequest(error->message);
   const auto* stream_field = body.find("stream");
   const bool stream = stream_field != nullptr && stream_field->as_bool();
   bool include_usage = false;
@@ -899,6 +922,13 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
       return InvalidCompatibilityRequest("'cache_prompt' must be a boolean");
     cache_prompt = value->as_bool();
   }
+  bool cache_persist = true;
+  if (const auto* value = body.find("cache_persist");
+      value != nullptr && !value->is_null()) {
+    if (!value->is_bool())
+      return InvalidCompatibilityRequest("'cache_persist' must be a boolean");
+    cache_persist = value->as_bool();
+  }
   std::vector<std::string> stop_sequences;
   if (const auto error = ParseStopSequences(
           body.find("stop"), StopSequenceFormat::kOpenAi, &stop_sequences))
@@ -914,9 +944,10 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
                "invalid_request_error", "missing_prompt");
   }
 
-  auto generation = b.start_complete(
-      prompt, max_tokens, sampling_config, req.is_cancelled, stream, ignore_eos,
-      req.client_id, stop_sequences, return_progress, cache_prompt);
+  auto generation =
+      b.start_complete(prompt, max_tokens, sampling_config, req.is_cancelled,
+                       stream, ignore_eos, req.client_id, stop_sequences,
+                       return_progress, cache_prompt, cache_persist);
   const std::string id = "cmpl-" + RandomId();
   const long long created = Now();
   const std::string model = RequestedModel(body, b);
@@ -931,9 +962,12 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
                     {"X-Accel-Buffering", "no"}},
         .streaming_body =
             [generation = std::move(generation), id, created, model,
-             include_usage, return_progress,
+             include_usage, return_progress, cache_persist,
+             logprobs = sampling_config.logprobs,
              stream_log](const HttpResponse::BodyWriter& writer) {
               bool started = return_progress;
+              std::optional<json::Value> pending_logprobs;
+              std::size_t text_offset = 0;
               const auto write_chunk =
                   [&](std::string_view piece, std::string_view finish_reason,
                       const json::Value* usage = nullptr,
@@ -949,7 +983,10 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
                       json::Value choice = json::Value::object();
                       choice["text"] = std::string(piece);
                       choice["index"] = 0;
-                      choice["logprobs"] = json::Value();
+                      choice["logprobs"] = pending_logprobs
+                                               ? std::move(*pending_logprobs)
+                                               : json::Value();
+                      pending_logprobs.reset();
                       choice["finish_reason"] =
                           finish_reason.empty()
                               ? json::Value()
@@ -961,6 +998,9 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
                       chunk["usage"] = *usage;
                     if (timings != nullptr)
                       chunk["timings"] = *timings;
+                    // The finishing and usage chunks echo the applied value.
+                    if (usage != nullptr || timings != nullptr)
+                      chunk["cache_persist"] = cache_persist;
                     if (progress != nullptr)
                       chunk["prompt_progress"] = *progress;
                     started = true;
@@ -980,8 +1020,12 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
               }
               try {
                 const auto result = generation->Wait(
-                    [&](std::string_view piece) {
-                      const auto text = decoder.Push(piece, false);
+                    [&](const TokenPiece& piece) {
+                      if (logprobs && piece.logprobs)
+                        pending_logprobs = CompletionLogprobs(
+                            std::span(piece.logprobs, 1), text_offset);
+                      const auto text = decoder.Push(piece.text, false);
+                      text_offset += UnicodeLength(text);
                       connected = write_chunk(text, {});
                       return connected;
                     },
@@ -1060,7 +1104,8 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
   json::Value c = json::Value::object();
   c["text"] = core::Utf8Decoder{}.Push(res.text, true);
   c["index"] = 0;
-  c["logprobs"] = json::Value();
+  c["logprobs"] = sampling_config.logprobs ? CompletionLogprobs(res.logprobs)
+                                           : json::Value();
   c["finish_reason"] =
       res.finish_reason == TextGenerationBackend::FinishReason::kLength
           ? "length"
@@ -1069,6 +1114,7 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
   resp["choices"] = std::move(choices);
   resp["usage"] = UsageJson(res);
   resp["timings"] = GenerationTimings(res);
+  resp["cache_persist"] = cache_persist;
   return WithTiming(Ok(resp), res);
 } catch (const std::length_error& error) {
   return Err(400, "Bad Request", error.what(), "invalid_request_error",
@@ -1078,28 +1124,21 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
              "invalid_prompt");
 }
 
-HttpResponse OpenAiResponses(const HttpRequest& req,
-                             TextGenerationBackend& b) try {
-  json::Value body;
-  try {
-    body = json::parse(req.body);
-  } catch (const std::exception& e) {
-    return Err(400, "Bad Request", e.what(), "invalid_request_error",
-               "parse_error");
-  }
-
-  ChatRequest chat;
-  chat.reasoning = b.reasoning_defaults();
-  if (auto error = ParseOpenAiResponseControls(body, &chat))
-    return std::move(*error);
-  std::size_t max_tokens = 0;
-  sampling::SamplingConfig sampling_config;
+std::optional<HttpResponse> ReadOpenAiResponseChat(
+    const json::Value& body, TextGenerationBackend& b, ChatRequest* chat,
+    std::size_t* max_tokens, sampling::SamplingConfig* sampling_config) {
+  chat->reasoning = b.reasoning_defaults();
+  if (auto error = ParseOpenAiResponseControls(body, chat))
+    return error;
   if (auto error = ReadCompatibilityOptions(
-          body, b, "max_output_tokens", &max_tokens, &sampling_config,
-          chat.reasoning.enabled,
+          body, b, "max_output_tokens", max_tokens, sampling_config,
+          chat->reasoning.enabled,
           {.stream = true, .response_controls = true})) {
-    return std::move(*error);
+    return error;
   }
+  if (const auto error = ParseResponsesLogprobs(body, sampling_config))
+    return Err(400, "Bad Request", error->message.c_str(),
+               "invalid_request_error", error->code.c_str());
 
   std::vector<tokenization::ChatMessage> messages;
   if (const auto* instructions = body.find("instructions")) {
@@ -1120,12 +1159,57 @@ HttpResponse OpenAiResponses(const HttpRequest& req,
     return InvalidCompatibilityRequest(input_error);
   }
 
-  chat.messages = std::move(messages);
+  chat->messages = std::move(messages);
+  return std::nullopt;
+}
+
+HttpResponse OpenAiResponses(const HttpRequest& req,
+                             TextGenerationBackend& b) try {
+  json::Value body;
+  try {
+    body = json::parse(req.body);
+  } catch (const std::exception& e) {
+    return Err(400, "Bad Request", e.what(), "invalid_request_error",
+               "parse_error");
+  }
+
+  ChatRequest chat;
+  std::size_t max_tokens = 0;
+  sampling::SamplingConfig sampling_config;
+  if (auto error =
+          ReadOpenAiResponseChat(body, b, &chat, &max_tokens, &sampling_config))
+    return std::move(*error);
   chat.client_id = req.client_id;
   return CreateOpenAiResponse(
       req, b, chat, max_tokens, sampling_config,
       body.find("stream") != nullptr && body.find("stream")->as_bool(),
       RequestedModel(body, b));
+} catch (const std::length_error& error) {
+  return Err(400, "Bad Request", error.what(), "invalid_request_error",
+             "context_length_exceeded");
+} catch (const std::invalid_argument& error) {
+  return Err(400, "Bad Request", error.what(), "invalid_request_error",
+             "invalid_prompt");
+}
+
+HttpResponse OpenAiResponsesInputTokens(const HttpRequest& req,
+                                        TextGenerationBackend& b) try {
+  json::Value body;
+  try {
+    body = json::parse(req.body);
+  } catch (const std::exception& e) {
+    return Err(400, "Bad Request", e.what(), "invalid_request_error",
+               "parse_error");
+  }
+
+  ChatRequest chat;
+  std::size_t max_tokens = 0;
+  sampling::SamplingConfig sampling_config;
+  if (auto error =
+          ReadOpenAiResponseChat(body, b, &chat, &max_tokens, &sampling_config))
+    return std::move(*error);
+  chat.client_id = req.client_id;
+  return CountOpenAiInputTokens(chat, b);
 } catch (const std::length_error& error) {
   return Err(400, "Bad Request", error.what(), "invalid_request_error",
              "context_length_exceeded");
@@ -1347,10 +1431,17 @@ HttpResponse LlamaCompletion(const HttpRequest& req,
       return InvalidCompatibilityRequest("'cache_prompt' must be a boolean");
     cache_prompt = value->as_bool();
   }
+  bool cache_persist = true;
+  if (const auto* value = body.find("cache_persist");
+      value != nullptr && !value->is_null()) {
+    if (!value->is_bool())
+      return InvalidCompatibilityRequest("'cache_persist' must be a boolean");
+    cache_persist = value->as_bool();
+  }
 
   const auto res =
       b.complete(prompt, max_tokens, sampling_config, req.is_cancelled, {},
-                 req.client_id, stop_sequences, cache_prompt);
+                 req.client_id, stop_sequences, cache_prompt, cache_persist);
 
   json::Value resp = json::Value::object();
   resp["content"] = core::Utf8Decoder{}.Push(res.text, true);
@@ -1369,6 +1460,7 @@ HttpResponse LlamaCompletion(const HttpRequest& req,
   resp["tokens_cached"] = res.cached_prompt_tokens;
   resp["timings"] = GenerationTimings(res);
   resp["usage"] = UsageJson(res);
+  resp["cache_persist"] = cache_persist;
   return WithTiming(Ok(resp), res);
 } catch (const std::length_error& error) {
   return Err(400, "Bad Request", error.what(), "invalid_request_error",
@@ -1722,8 +1814,10 @@ void LoadingResponder::serve() {
   loading.headers.emplace_back("Retry-After", "1");
   const std::string reply = BuildResponse(loading);
   // One connection at a time is enough for probes. Read the request head
-  // before replying so closing does not reset an unread request, but bound
-  // the wait: a client that connects and sends nothing must not delay stop().
+  // before replying, and after replying read what the client still sends (a
+  // request body) until it closes: closing with unread data resets the
+  // connection, and the client can lose the reply. Bound both waits: a client
+  // that connects and sends nothing must not delay stop().
   constexpr auto kRequestWait = std::chrono::milliseconds(500);
   while (!stopped_.load(std::memory_order_acquire)) {
     if (net::PollReadable(listen_fd_, 100) <= 0)
@@ -1731,26 +1825,36 @@ void LoadingResponder::serve() {
     const int client_fd = static_cast<int>(net::AcceptClientSocket(listen_fd_));
     if (client_fd < 0)
       continue;
-    std::string head;
-    const auto deadline = std::chrono::steady_clock::now() + kRequestWait;
-    while (head.find("\r\n\r\n") == std::string::npos && head.size() < 8192 &&
-           !stopped_.load(std::memory_order_acquire)) {
+    // Appends one read to `into` (when set); false once the deadline passes,
+    // the client closes or stop() runs.
+    const auto receive = [&](std::chrono::steady_clock::time_point deadline,
+                             std::string* into) {
       const auto remaining =
           std::chrono::duration_cast<std::chrono::milliseconds>(
               deadline - std::chrono::steady_clock::now())
               .count();
-      if (remaining <= 0 ||
+      if (stopped_.load(std::memory_order_acquire) || remaining <= 0 ||
           net::PollReadable(client_fd, static_cast<int>(remaining)) <= 0)
-        break;
-      char buffer[2048];
+        return false;
+      char buffer[4096];
       const std::intptr_t received =
           net::Receive(client_fd, buffer, sizeof(buffer), 0);
       if (received <= 0)
-        break;
-      head.append(buffer, static_cast<std::size_t>(received));
+        return false;
+      if (into != nullptr)
+        into->append(buffer, static_cast<std::size_t>(received));
+      return true;
+    };
+    std::string head;
+    const auto head_deadline = std::chrono::steady_clock::now() + kRequestWait;
+    while (head.find("\r\n\r\n") == std::string::npos && head.size() < 8192 &&
+           receive(head_deadline, &head)) {
     }
     (void)SendAll(client_fd, reply);
     (void)net::ShutdownSocket(client_fd, net::ShutdownHow::kWrite);
+    const auto drain_deadline = std::chrono::steady_clock::now() + kRequestWait;
+    while (receive(drain_deadline, nullptr)) {
+    }
     net::CloseSocket(client_fd);
   }
 }
@@ -1806,7 +1910,8 @@ HttpServer::HttpServer(std::string host, int port,
                        std::shared_ptr<AsrService> asr,
                        HttpServerOptions options,
                        std::shared_ptr<ImageService> images,
-                       std::shared_ptr<EmbeddingService> embeddings)
+                       std::shared_ptr<EmbeddingService> embeddings,
+                       std::shared_ptr<DecisionService> decisions)
     : host_(std::move(host)),
       port_(port),
       backend_(std::move(backend)),
@@ -1815,12 +1920,10 @@ HttpServer::HttpServer(std::string host, int port,
       asr_(std::move(asr)),
       images_(std::move(images)),
       embeddings_(std::move(embeddings)),
+      decisions_(std::move(decisions)),
       options_(std::move(options)) {
   if (options_.max_request_body_bytes == 0 || options_.max_connections == 0) {
     throw std::invalid_argument("HTTP server limits must be positive");
-  }
-  if (!options_.api_key.empty()) {
-    api_key_hash_ = CredentialHash(options_.api_key);
   }
   register_routes();
 }
@@ -1844,7 +1947,9 @@ void HttpServer::register_routes() {
   // ---- OpenAI ----
   add("POST", "/v1/completions", OpenAiCompletions);
   add("POST", "/v1/chat/completions", HandleOpenAiChat);
+  add("POST", "/v1/chat/completions/input_tokens", HandleOpenAiChatInputTokens);
   add("POST", "/v1/responses", OpenAiResponses);
+  add("POST", "/v1/responses/input_tokens", OpenAiResponsesInputTokens);
   add("POST", "/v1/embeddings", NotImplemented);
 
   // ---- Anthropic ----
@@ -1857,6 +1962,7 @@ void HttpServer::register_routes() {
   add("POST", "/rerank", NotImplemented);
   add("POST", "/infill", NotImplemented);
   add("POST", "/completion", LlamaCompletion);
+  add("POST", "/apply-template", HandleApplyTemplate);
   add("GET", "/props", LlamaProps);
   add("GET", "/slots", LlamaSlots);
   add("GET", "/v1/slots", LlamaSlots);
@@ -1961,7 +2067,6 @@ void HttpServer::run(bool handle_signals) {
           " address=http://" +
           (host_.find(':') == std::string::npos ? host_ : "[" + host_ + "]") +
           ":" + std::to_string(port_) +
-          " auth=" + (options_.api_key.empty() ? "off" : "bearer") +
           " max_connections=" + std::to_string(options_.max_connections) +
           " max_body_bytes=" + std::to_string(options_.max_request_body_bytes));
   while (!stopped_.load(std::memory_order_acquire)) {
@@ -2069,17 +2174,23 @@ void HttpServer::reap_workers() {
 }
 
 HttpResponse HttpServer::handle_request(const HttpRequest& req) {
-  if (!IsAuthorized(req, api_key_hash_)) {
-    auto response = Err(401, "Unauthorized", "missing or invalid API key",
-                        "authentication_error", "invalid_api_key");
-    response.headers.emplace_back("WWW-Authenticate", "Bearer");
-    return response;
+  // The voice page holds no data; it opens its WebSocket when the user
+  // connects.
+  if (req.method == "GET" && req.path == "/voice" && asr_ &&
+      asr_->supports_voice()) {
+    HttpResponse page{
+        .status = 200, .reason = "OK", .body = std::string(VoicePage())};
+    page.headers.emplace_back("Content-Type", "text/html; charset=utf-8");
+    page.headers.emplace_back("Cache-Control", "no-store");
+    return page;
   }
   // `/health` and `/ready` are the native spelling and match llama-server's
   // `/health`. `/healthz` and `/readyz` are aliases so Kubernetes-style probe
-  // configuration works unmodified.
+  // configuration works unmodified. `GET /` answers like `/health` so
+  // llama-swap's Load button and startup preload, which request the upstream
+  // root, report success once the loading gate has released (#957).
   if (req.method == "GET" &&
-      (req.path == "/health" || req.path == "/v1/health" ||
+      (req.path == "/" || req.path == "/health" || req.path == "/v1/health" ||
        req.path == "/healthz")) {
     if (device_lost())
       return DeviceLost();
@@ -2096,7 +2207,7 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
                        (tts_ != nullptr && tts_->ready()) ||
                        (asr_ != nullptr && asr_->ready()) ||
                        (embeddings_ != nullptr && embeddings_->ready()) ||
-                       images_ != nullptr;
+                       images_ != nullptr || decisions_ != nullptr;
     if (!ready) {
       return Err(503, "Service Unavailable", "model service is not ready",
                  "server_error", "not_ready");
@@ -2111,6 +2222,8 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
       body["model"] = tts_->model_id();
     } else if (embeddings_ != nullptr && embeddings_->ready()) {
       body["model"] = embeddings_->model_id();
+    } else if (decisions_ != nullptr) {
+      body["model"] = decisions_->model_id;
     } else if (images_ != nullptr) {
       body["model"] = images_->model_id();
     } else {
@@ -2121,7 +2234,39 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
   if (req.method == "GET" &&
       (req.path == "/v1/models" || req.path == "/models")) {
     return ListModels(backend_.get(), video_jobs_.get(), tts_.get(), asr_.get(),
-                      images_.get(), embeddings_.get());
+                      images_.get(), embeddings_.get(), decisions_.get());
+  }
+  if (req.path == "/v1/systemone") {
+    if (req.method != "POST")
+      return Err(405, "Method Not Allowed", "use POST", "invalid_request_error",
+                 "method_not_allowed");
+    if (!decisions_ || !decisions_->decide)
+      return Err(503, "Service Unavailable",
+                 "decision service is not configured", "server_error",
+                 "decision_service_unavailable");
+    json::Value payload;
+    try {
+      payload = json::parse(req.body);
+    } catch (const std::exception& e) {
+      return Err(400, "Bad Request", e.what(), "invalid_request_error",
+                 "invalid_json");
+    }
+    try {
+      if (const auto* model = payload.find("model");
+          model &&
+          (!model->is_string() || !ServesModel(*decisions_, model->str())))
+        return Err(404, "Not Found", "unknown decision model",
+                   "invalid_request_error", "model_not_found");
+      auto result = decisions_->decide(payload);
+      result["model"] = decisions_->model_id;
+      return Ok(result);
+    } catch (const std::invalid_argument& e) {
+      return Err(400, "Bad Request", e.what(), "invalid_request_error",
+                 "invalid_request");
+    } catch (const std::exception& e) {
+      return Err(500, "Internal Server Error", e.what(), "server_error",
+                 "decision_failed");
+    }
   }
   if (req.path == "/v1/images/generations" || req.path == "/v1/images/edits") {
     if (!images_)
@@ -2381,9 +2526,7 @@ void HttpServer::handle_connection(int client_fd,
     } else if (req.method == "OPTIONS") {
       resp = {.status = 204, .reason = "No Content"};
     } else {
-      // A client without the API key cannot write into the trace.
-      traced = Trace::Enabled() && IsTracedRoute(req) &&
-               IsAuthorized(req, api_key_hash_);
+      traced = Trace::Enabled() && IsTracedRoute(req);
       if (traced) {
         TraceRequest(req);
       }
