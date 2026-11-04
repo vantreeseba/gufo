@@ -337,7 +337,7 @@ private:
   std::uint32_t* d_chain_tokens_{nullptr};
   std::uint32_t chain_slots_{0};
   bool chain_active_{false};
-  // Draft table (mtp_draft_vocab.hpp): kMtpDraftExtraRows output-head rows
+  // Draft table (mtp_draft_vocab.hpp): kDraftVocabExtraRows output-head rows
   // and their token IDs; allocated only when the model HasDraftVocab().
   std::uint8_t* d_draft_rows_{nullptr};
   std::int32_t* d_draft_ids_{nullptr};

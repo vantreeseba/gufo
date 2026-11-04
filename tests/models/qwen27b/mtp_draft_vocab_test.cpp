@@ -20,12 +20,11 @@ void Require(bool condition, const char* message) {
     throw std::runtime_error(message);
 }
 
-constexpr TokenId kPrefix = sp::kMtpDraftVocab;
+constexpr TokenId kPrefix = sp::kDraftVocabPrefix;
 // Two special tokens above the prefix, as in the Qwen vocabulary.
 constexpr TokenId kImStart = 248045;
 constexpr TokenId kImEnd = 248046;
-constexpr std::size_t kWindow =
-    gufo::models::qwen38_flash_next::kMtpDraftVocabWindow;
+constexpr std::size_t kWindow = gufo::speculative::kDraftVocabWindow;
 // Ordinary tokens above the prefix.
 constexpr TokenId kRareA = kPrefix + 10;
 constexpr TokenId kRareB = kPrefix + 20;
@@ -61,13 +60,13 @@ void CheckSpecials() {
   Require(!sp::QwenMtpDraftSpecials(kArch, sp::kQwenMtpDraftVocabRows, outside),
           "a special token outside the vocabulary");
   Specials crowded;
-  for (TokenId id = 0; id < sp::kMtpDraftExtraRows; ++id)
+  for (TokenId id = 0; id < sp::kDraftVocabExtraRows; ++id)
     crowded.emplace_back("<|s" + std::to_string(id) + "|>", kPrefix + id);
   Require(!sp::QwenMtpDraftSpecials(kArch, sp::kQwenMtpDraftVocabRows, crowded),
           "special tokens filled the table");
   crowded.pop_back();
   Require(sp::QwenMtpDraftSpecials(kArch, sp::kQwenMtpDraftVocabRows, crowded)
-                  ->size() == sp::kMtpDraftExtraRows - 1,
+                  ->size() == sp::kDraftVocabExtraRows - 1,
           "one row left for the request's own tokens");
 }
 
@@ -146,11 +145,11 @@ void CheckLimits() {
           "an out-of-vocabulary anchor drafted small");
 
   sp::QwenMtpDraftTable full(std::vector<std::int32_t>(
-      sp::kMtpDraftExtraRows - 1, static_cast<std::int32_t>(kImEnd)));
+      sp::kDraftVocabExtraRows - 1, static_cast<std::int32_t>(kImEnd)));
   tokens = {kRareA, kRareB};
   tokens.resize(tokens.size() + kWindow + 2, 1);
   update = full.Sync(tokens);
-  Require(update.added.size() == 1 && full.rows() == sp::kMtpDraftExtraRows,
+  Require(update.added.size() == 1 && full.rows() == sp::kDraftVocabExtraRows,
           "the table overfilled");
   Require(full.Fits(kRareA) && !full.Fits(kRareB), "an untabled token fits");
 }

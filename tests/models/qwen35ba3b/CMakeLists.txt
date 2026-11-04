@@ -4,8 +4,9 @@
 if (ENGINE_ENABLE_HIP)
   add_executable(qwen35ba3b_moe_ops_test
     ${CMAKE_CURRENT_SOURCE_DIR}/moe_ops_test.cpp)
+  # The MMQ decode checks call Flash-Next's qfn_mmq kernels directly.
   target_link_libraries(qwen35ba3b_moe_ops_test
-    PRIVATE gufo_core ${GUFO_QWEN_LIBRARIES})
+    PRIVATE gufo_core ${GUFO_QWEN_LIBRARIES} gufo_qwen38_flash_next_mmq)
   add_test(NAME qwen35ba3b_moe_ops_test COMMAND qwen35ba3b_moe_ops_test)
   set_tests_properties(qwen35ba3b_moe_ops_test PROPERTIES
     LABELS "qwen35ba3b;gpu;hip;moe;kernels;correctness")

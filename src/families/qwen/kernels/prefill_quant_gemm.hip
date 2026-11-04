@@ -525,8 +525,8 @@ __device__ __forceinline__ void BlockedSwiGluQuantEpilogue(
       }
       const float d = max_abs / 127.0F;
       const float id = (d != 0.0F) ? (1.0F / d) : 0.0F;
-      const auto q_lo = static_cast<std::int8_t>(roundf(v_lo * id));
-      const auto q_hi = static_cast<std::int8_t>(roundf(v_hi * id));
+      const auto q_lo = static_cast<std::int8_t>(__float2int_rn(v_lo * id));
+      const auto q_hi = static_cast<std::int8_t>(__float2int_rn(v_hi * id));
       if (live) {
         tile[(tl * 16) + row] = q_lo;
         tile[256 + (tl * 16) + row] = q_hi;
