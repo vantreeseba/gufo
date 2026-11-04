@@ -51,7 +51,6 @@ gufo_extension_target(
     hip/decode.cpp
     hip/decode_step.cpp
     hip/executor.cpp
-    hip/moe_experiments.cpp
     hip/model_loader.cpp
     hip/prefill.cpp
     hip/prefill_chunk.cpp
@@ -88,13 +87,6 @@ if(TARGET gufo_qwen_hip)
       hip/attention.hip
       hip/batched_ssm.hip
       hip/kernels/moe.hip
-  )
-  # Routed-expert MoE helpers that must share the kernel's wave size.
-  gufo_extension_hip_sources(gufo_qwen_hip
-    SOURCES
-      hip/kernels/moe_decode_wave64.hip
-    OPTIONS
-      -mwavefrontsize64
   )
   # The 35B's routed-expert F16 GEMMs keep the flags they were validated with
   # in Flash-Next, so their F16 rounding does not move.
