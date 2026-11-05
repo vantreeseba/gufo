@@ -3,7 +3,8 @@ name: Publish runtime image
 # Builds the upstream gufo-runtime OCI image (gufo-org/toolboxes) with this
 # repository's engine in place of the pinned one, and publishes it to this
 # repository's GitHub Container Registry package. Pull requests into the
-# branch run the same build as a HIP compile check and publish nothing.
+# branch only build the engine package the image would contain, as a HIP
+# compile check, and publish nothing.
 
 on:
   push:
@@ -41,13 +42,29 @@ jobs:
         uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
         with:
           determinate: false
+          # Upstream's cache holds the gfx1151 ROCm closure. Without it the
+          # runner compiles LLVM and the ROCm libraries for over an hour.
+          extra-conf: |
+            extra-substituters = https://gufo.cachix.org
+            extra-trusted-public-keys = gufo.cachix.org-1:rfZe3n4lHINgyoACKzs5EthIZmBNvEyCCtufUpth0PE=
+
+      # gufo-org/toolboxes builds the image from the engine's default package.
+      - name: Build engine
+        if: github.event_name == 'pull_request'
+        env:
+          # A pull request's GITHUB_SHA is a merge commit the flake reference
+          # cannot fetch; build the head commit instead.
+          ENGINE_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          nix build "github:${GITHUB_REPOSITORY}/${ENGINE_SHA}#default" \
+            --no-link --print-build-logs
+          df -h /
 
       - name: Build image
+        if: github.event_name != 'pull_request'
         env:
           TOOLBOXES_REF: ${{ inputs.toolboxes-ref || 'main' }}
-          # A pull request's GITHUB_SHA is a merge commit the flake input
-          # cannot fetch; build the head commit instead.
-          ENGINE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          ENGINE_SHA: ${{ github.sha }}
         run: |
           nix run "github:gufo-org/toolboxes/${TOOLBOXES_REF}#stream-gufo-runtime" \
             --override-input gufo-engine "github:${GITHUB_REPOSITORY}/${ENGINE_SHA}" \
