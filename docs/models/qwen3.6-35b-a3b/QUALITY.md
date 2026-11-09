@@ -15,7 +15,13 @@ requires the loaded config to report an MoE architecture, then runs:
 | Prefill/decode self-consistency | Same full prompt: one `ForwardPromptBatch` prefill versus a one-token-at-a-time `ForwardToken` decode loop. | The two next-token IDs must be **exactly equal**. |
 | Concurrent verification | Three sessions verify 8, 8 and 7 rows together through `ForwardVerificationBatch` (23 stacked rows, more than the 8-row Q8_0 gated vector kernel takes per launch); each session's own `ForwardVerificationChunk` is the reference. | Logits **finite** and the greedy token of **every row equal** to the per-session reference (`CompareLogits`, `atol = rtol = 5e-2`). |
 
-Executor context is capped at 4096 tokens for both checks. The parity fixtures
+Executor context is capped at 4096 tokens for both checks.
+
+On the non-UD `Qwen_Qwen3.6-35B-A3B-Q4_K_M.gguf` the GPU/CPU parity check
+fails at position 10 of the first fixture (greedy tokens differ at a near-tie;
+logit 22 is 0.0921 from the reference against a 0.0915 tolerance), identically
+on `8c985f93` and with the November 2026 routed kernels, which those 10-12-row
+prefills do not reach. UD-Q4_K_XL passes. The parity fixtures
 must tokenize to at least 12 / 16 tokens respectively, or the test fails rather
 than skips.
 
@@ -29,10 +35,13 @@ for 1, 7, 100 and 512 tokens on both projection shapes, requiring every
 slot written, relative error < 1e-2, and byte-identical output across two
 runs. The op test also checks the dense mode of the BF16 WMMA GEMM against
 the FP32-activation GEMV for 1, 100 and 512 rows (relative error < 1e-2,
-every row written). It also checks the routed F16 expert GEMM (Q8_0 and
-Q6_K, 16- and 48-row tiles) and the paired gate/up GEMM (Q8_0 and Q6_K, 64-
-and 128-row tiles) against per-slot GEMV references, requiring every output
-written and relative error below 1e-2 (routed) and 5e-3 (paired).
+every row written). It also checks the routed F16 expert GEMM (Q8_0, Q6_K,
+Q5_K and Q4_K; F32 rows over 16- and 48-row tiles, F16 rows over 48-, 64- and
+128-row tiles) and the paired gate/up GEMM (the same formats, 64- and 128-row
+tiles) against per-slot GEMV references, requiring every output written and
+relative error below 1e-2 (routed) and 5e-3 (paired). The F16 rows of the 64-
+and 128-row tiles, which take the register-resident kernels, must be
+byte-identical to the 48-row tiles.
 
 ## MTP head
 

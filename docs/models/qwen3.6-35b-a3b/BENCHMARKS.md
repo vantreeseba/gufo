@@ -130,6 +130,26 @@ real text. MTP on this file has not been measured: its head failed to load
 (Q5_K `blk.40.ffn_down_exps`) until `657e451`, which has not been run on
 hardware.
 
+### Prefill on the Q4 GGUFs, November 2026
+
+The register-resident routed K-quant kernels (see [Experiments](EXPERIMENTS.md)),
+measured November 9, 2026 as an interleaved A/B against the source they were
+developed on (`8c985f93`), both `gpu-test` builds of the same toolchain (ROCm
+10.1 runtime), in the dev container with the inference services stopped:
+`gufo bench --n-prompt 1024,2048,4096,8192,16384 --n-gen 0 --repetitions 3`,
+two rounds per artifact, mean of the rounds. Greedy output is byte-identical.
+
+| Prompt (tokens) | Q4_K_M before (t/s) | after (t/s) | gain | UD-Q4_K_XL before (t/s) | after (t/s) | gain |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1024 | 3147.2 | 3229.5 | +2.6% | 3355.6 | 3460.4 | +3.1% |
+| 2048 | 3463.7 | 3540.7 | +2.2% | 3703.6 | 3838.2 | +3.6% |
+| 4096 | 3560.5 | 3633.9 | +2.1% | 3904.7 | 4052.0 | +3.8% |
+| 8192 | 3423.7 | 3489.2 | +1.9% | 3713.6 | 3856.5 | +3.8% |
+| 16384 | 3184.8 | 3244.5 | +1.9% | 3431.8 | 3550.8 | +3.5% |
+
+`Qwen_Qwen3.6-35B-A3B-Q4_K_M.gguf` is the non-UD quant: Q4_K experts with
+Q4_K / Q6_K down projections and K-quant dense layers. Decode is unchanged.
+
 ## MTP decode
 
 | Quant, draft tokens | tg128-mtp (t/s) | tg128 without MTP (t/s) | gain |
