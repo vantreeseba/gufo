@@ -233,16 +233,17 @@ std::shared_ptr<const models::qwen::vision::Prompt> PrepareVision(
     const ext::TextPromptOptions& opt,
     const tokenization::QwenTokenizer& tokenizer,
     std::span<const tokenization::ChatMessage> messages,
-    const std::shared_ptr<models::qwen::vision::Encoder>& encoder) {
+    const std::shared_ptr<models::qwen::vision::Encoder>& encoder,
+    tokenization::QwenTemplateDialect dialect) {
   if (!encoder)
     throw std::invalid_argument(
         "image input requires a matching --mmproj sidecar");
   const auto reasoning = PromptReasoningOptions(opt);
   return std::make_shared<models::qwen::vision::Prompt>(
-      models::qwen::vision::Prepare(
-          tokenizer, messages, {},
-          tokenization::ResolveQwenChatOptions(reasoning, opt.add_vision_id),
-          encoder->identity(), kDefaultContext));
+      models::qwen::vision::Prepare(tokenizer, messages, {},
+                                    tokenization::ResolveQwenChatOptions(
+                                        reasoning, opt.add_vision_id, dialect),
+                                    encoder->identity(), kDefaultContext));
 }
 
 std::unique_ptr<speculative::SpeculativeVerifier> CreateQwenVerifier(
@@ -782,6 +783,7 @@ int RunQwenPromptImpl(const ext::TextPromptOptions& opt,
   const std::shared_ptr<const core::GgufReader> reader =
       std::shared_ptr<const core::GgufReader>(
           std::shared_ptr<const core::GgufReader>{}, &reader_ref);
+  const auto dialect = tokenization::DetectQwenTemplateDialect(reader_ref);
   std::string err;
   std::string rendered_prompt = opt.prompt_text;
   std::vector<tokenization::ContentSpan> content_spans;
@@ -796,7 +798,8 @@ int RunQwenPromptImpl(const ext::TextPromptOptions& opt,
     const auto reasoning = PromptReasoningOptions(opt);
     const auto rendered = tokenization::QwenChatTemplate::Render(
         messages, {},
-        tokenization::ResolveQwenChatOptions(reasoning, opt.add_vision_id),
+        tokenization::ResolveQwenChatOptions(reasoning, opt.add_vision_id,
+                                             dialect),
         nullptr, nullptr, nullptr, &content_spans);
     if (rendered.has_value()) {
       rendered_prompt = *rendered;
@@ -824,8 +827,8 @@ int RunQwenPromptImpl(const ext::TextPromptOptions& opt,
         auto encoder = LoadQwenVision(opt, *reader);
         if (!opt.image_paths.empty()) {
           AttachImages(opt, messages.back());
-          auto vision =
-              PrepareVision(opt, gpu_exec->GetTokenizer(), messages, encoder);
+          auto vision = PrepareVision(opt, gpu_exec->GetTokenizer(), messages,
+                                      encoder, dialect);
           prompt_tokens = vision->tokens;
           gpu_exec->ConfigureVision(std::move(vision), std::move(encoder));
         }
@@ -931,6 +934,7 @@ int RunQwenPromptImpl(const ext::TextPromptOptions& opt,
 int RunQwenChatImpl(const ext::TextPromptOptions& opt,
                     const core::GgufReader& reader,
                     std::chrono::steady_clock::time_point model_load_start) {
+  const auto dialect = tokenization::DetectQwenTemplateDialect(reader);
   const tokenization::QwenTokenizer* tokenizer = nullptr;
   std::string architecture;
   std::unique_ptr<models::QwenGenerator> generator;
@@ -1017,7 +1021,8 @@ int RunQwenChatImpl(const ext::TextPromptOptions& opt,
     std::vector<tokenization::ContentSpan> content_spans;
     const auto rendered_prompt = tokenization::QwenChatTemplate::Render(
         history, {},
-        tokenization::ResolveQwenChatOptions(reasoning, opt.add_vision_id),
+        tokenization::ResolveQwenChatOptions(reasoning, opt.add_vision_id,
+                                             dialect),
         nullptr, nullptr, nullptr, &content_spans);
     if (!rendered_prompt.has_value()) {
       std::cerr << "Error formatting chat template.\n";
@@ -1037,7 +1042,8 @@ int RunQwenChatImpl(const ext::TextPromptOptions& opt,
         AttachImages(opt, history.back());
       first_turn = false;
       if (!opt.image_paths.empty()) {
-        auto vision = PrepareVision(opt, *tokenizer, history, vision_encoder);
+        auto vision =
+            PrepareVision(opt, *tokenizer, history, vision_encoder, dialect);
         prompt_tokens = vision->tokens;
         if (gpu_executor)
           gpu_executor->ConfigureVision(vision, vision_encoder);

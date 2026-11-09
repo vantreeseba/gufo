@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "src/families/qwen/hip_common/continuation_hooks.hpp"
+#include "src/families/qwen/text/chat_template.hpp"
 #include "src/families/qwen/text/tokenizer.hpp"
 #include "src/models/qwen/forward.hpp"
 #include "src/models/qwen/generator.hpp"
@@ -122,6 +123,10 @@ public:
   [[nodiscard]] const core::ModelConfig& GetConfig() const noexcept {
     return weights_.config;
   }
+  [[nodiscard]] tokenization::QwenTemplateDialect GetChatDialect()
+      const noexcept {
+    return chat_dialect_;
+  }
   [[nodiscard]] std::size_t GetWeightRegionCount() const noexcept {
     return weight_regions_.size();
   }
@@ -135,6 +140,8 @@ private:
   std::shared_ptr<const tokenization::QwenTokenizer> tokenizer_;
   std::vector<QwenGpuWeightRegion> weight_regions_;
   std::shared_ptr<models::qwen::vision::Encoder> vision_;
+  tokenization::QwenTemplateDialect chat_dialect_{
+      tokenization::QwenTemplateDialect::kQwen38};
 };
 
 class QwenGpuSnapshot final {

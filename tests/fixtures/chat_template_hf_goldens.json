@@ -131,6 +131,40 @@
       }
     ]
   },
+  "qwen36": {
+    "repo": "Qwen/Qwen3.6-35B-A3B",
+    "revision": "345d467b117d1fd5eda9b879a5988de9ae5f47a7",
+    "template_sha256": "1b8361565cc35d47551d342214cff341c0f1a9685ce529c7ce31de0ed3616248",
+    "cases": {
+      "thinking": {
+        "rendered_sha256": "c2ba928ee33190de9d2bbb82fb68dfaed38a4ee345dcf675a3bc27f112f45b05"
+      },
+      "chat": {
+        "rendered_sha256": "323dbd5987839260d0dd3350d815ab3b5cdffe3c0a33b467c3579fe202e990f7"
+      },
+      "history_drop": {
+        "rendered_sha256": "ea0dc42bc76d66bb38fab09250bcf72f63c3bb1ec7098403a77a8c6452add6a5"
+      },
+      "history_preserve": {
+        "rendered_sha256": "4d07a9c7b9533039ba9e58596e8f388b98dec8591d2113edac3a7733b7b7b10f"
+      },
+      "history_preserve_chat": {
+        "rendered_sha256": "6fc054000bc6bedd03a3521bd92c59af85247ad7d3bb2013d97c1a25eea6bdee"
+      },
+      "inline_drop": {
+        "rendered_sha256": "ea0dc42bc76d66bb38fab09250bcf72f63c3bb1ec7098403a77a8c6452add6a5"
+      },
+      "inline_preserve": {
+        "rendered_sha256": "4d07a9c7b9533039ba9e58596e8f388b98dec8591d2113edac3a7733b7b7b10f"
+      },
+      "system_tools": {
+        "rendered_sha256": "8a349915a19b289bf855a35301c139bc89a92bd47a8e5eb39f2d3d988ea9f9e5"
+      },
+      "tool_loop_drop": {
+        "rendered_sha256": "6376ef1f57fd6b13f2f5aa6fb6485d8ec3120d240895a698c6f2ca154e2588c9"
+      }
+    }
+  },
   "deepseek": {
     "repo": "deepseek-ai/DeepSeek-V4-Flash-0731",
     "revision": "7872f01b1d1fe23eabc4c98b48bffcef5a386062",

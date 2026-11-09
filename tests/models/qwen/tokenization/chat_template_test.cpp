@@ -296,6 +296,131 @@ void TestGgufTemplateExtraction() {
          "Qwen3.8 look-alike template is rejected by hash");
 }
 
+void TestTemplateDialectDetection() {
+  using gufo::tokenization::DetectQwenTemplateDialect;
+  using gufo::tokenization::QwenTemplateDialect;
+  const auto dialect = [](std::string_view name, std::string_view tpl) {
+    GgufTemplateBuilder builder;
+    if (!name.empty())
+      builder.AddMetadataString("general.name", name);
+    if (!tpl.empty())
+      builder.AddMetadataString("tokenizer.chat_template", tpl);
+    const auto binary = builder.Build();
+    std::string err;
+    auto reader =
+        gufo::core::GgufReader::OpenMemory(binary.data(), binary.size(), &err);
+    Expect(reader != nullptr, "Dialect GGUF opens");
+    return DetectQwenTemplateDialect(*reader);
+  };
+  std::string qwen38 = ReadText(GUFO_QWEN38_CHAT_TEMPLATE_REFERENCE);
+  std::string qwen36 = ReadText(GUFO_QWEN36_CHAT_TEMPLATE_REFERENCE);
+  Expect(qwen38.ends_with('\n') && qwen36.ends_with('\n'),
+         "Reference templates are readable");
+  qwen38.pop_back();
+  qwen36.pop_back();
+  Expect(Sha256(qwen36) ==
+             "1b8361565cc35d47551d342214cff341c0f1a9685ce529c7ce31de0ed3616248",
+         "Qwen3.6 reference matches the pinned official template");
+
+  Expect(dialect("Qwen3.8-27B", qwen38) == QwenTemplateDialect::kQwen38,
+         "A Qwen3.8 artifact renders the Qwen3.8 dialect");
+  Expect(dialect("", qwen38) == QwenTemplateDialect::kQwen38,
+         "A pinned Qwen3.8 template renders the Qwen3.8 dialect");
+  Expect(dialect("Qwen3.6-35B-A3B", qwen36) == QwenTemplateDialect::kQwen36,
+         "The 35B renders the Qwen3.6 dialect");
+  Expect(dialect("Qwen3.6-35B-A3B", "") == QwenTemplateDialect::kQwen36,
+         "A non-Qwen3.8 artifact without a template renders Qwen3.6");
+}
+
+// Hashes are the official Qwen/Qwen3.6-35B-A3B template rendered as
+// transformers' apply_chat_template does; Unsloth's 35B template renders the
+// same bytes for every case.
+void TestQwen36RenderedGoldens() {
+  using gufo::tokenization::ChatMessage;
+  using gufo::tokenization::ChatRole;
+  using gufo::tokenization::ChatTemplateOptions;
+  using gufo::tokenization::QwenChatTemplate;
+  using gufo::tokenization::QwenTemplateDialect;
+  using gufo::tokenization::ResolveQwenChatOptions;
+
+  std::ifstream input(GUFO_CHAT_TEMPLATE_HF_GOLDENS);
+  Expect(input.good(), "Template fixture opens");
+  const auto fixture = gufo::json::parse(std::string{
+      std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()});
+  const auto check =
+      [&](const std::vector<ChatMessage>& messages,
+          const ChatTemplateOptions& options, std::string_view name,
+          std::span<const gufo::tokenization::ChatTool> tools = {}) {
+        const auto rendered =
+            QwenChatTemplate::Render(messages, tools, options);
+        Expect(rendered.has_value(), "Qwen3.6 golden renders");
+        const auto expected =
+            gufo::testing::chat_goldens::GoldenCase(fixture, "qwen36", name)
+                .member_str("rendered_sha256");
+        Expect(Sha256(*rendered) == expected,
+               "Qwen3.6 rendered bytes match the pinned Hugging Face golden");
+      };
+  const auto resolve = [](gufo::ReasoningOptions reasoning) {
+    return ResolveQwenChatOptions(reasoning, false,
+                                  QwenTemplateDialect::kQwen36);
+  };
+
+  const std::vector<ChatMessage> base = {
+      {ChatRole::kUser, "Name one color.", "", ""},
+  };
+  const std::vector<ChatMessage> history = {
+      base[0],
+      {ChatRole::kAssistant, "Red", "", "I should answer with one color."},
+      {ChatRole::kUser, "Name another.", "", ""},
+  };
+  // A client that returns the raw reply, thinking included, as content.
+  auto inline_history = history;
+  inline_history[1] = {ChatRole::kAssistant,
+                       "<think>\nI should answer with one color.\n</think>\n\n"
+                       "Red"};
+
+  // No effort instruction at any effort: Qwen3.6 has none.
+  check(base, resolve({}), "thinking");
+  for (const auto effort :
+       {gufo::ReasoningEffort::kLow, gufo::ReasoningEffort::kMedium,
+        gufo::ReasoningEffort::kMax})
+    check(base, resolve({.effort = effort}), "thinking");
+  check(base, resolve({.enabled = false}), "chat");
+
+  Expect(resolve({}).preserve_thinking,
+         "Qwen3.6 keeps earlier thinking by default");
+  check(history, resolve({}), "history_preserve");
+  check(history, resolve({.preserve_thinking = false}), "history_drop");
+  check(history, resolve({.enabled = false, .preserve_thinking = true}),
+        "history_preserve_chat");
+  check(inline_history, resolve({}), "inline_preserve");
+  check(inline_history, resolve({.preserve_thinking = false}), "inline_drop");
+
+  auto qwen38 = resolve({});
+  qwen38.dialect = QwenTemplateDialect::kQwen38;
+  qwen38.reasoning_effort = gufo::tokenization::QwenReasoningEffort::kMedium;
+  const auto qwen38_inline = QwenChatTemplate::Render(inline_history, qwen38);
+  Expect(
+      qwen38_inline && qwen38_inline->find("<think>\n\n</think>\n\n<think>") !=
+                           std::string::npos,
+      "Qwen3.8 keeps inline thinking as content, like its template");
+
+  const std::vector<gufo::tokenization::ChatTool> tools = {
+      {.name = "get_weather",
+       .description = "Get weather",
+       .parameters_json =
+           R"({"type":"object","properties":{"city":{"type":"string"}},"required":["city"]})"}};
+  check({{ChatRole::kSystem, "Be concise."}, base[0]}, resolve({}),
+        "system_tools", tools);
+
+  ChatMessage call{ChatRole::kAssistant, "", "", "Use the tool."};
+  call.tool_calls.push_back({.name = "get_weather",
+                             .arguments = {{.name = "city", .value = "Rome"}}});
+  check(
+      {base[0], call, {ChatRole::kUser, "<tool_response>21 C</tool_response>"}},
+      resolve({.preserve_thinking = false}), "tool_loop_drop");
+}
+
 void TestHuggingFaceRenderedGoldens() {
   using gufo::tokenization::ChatMessage;
   using gufo::tokenization::ChatRole;
@@ -1204,7 +1329,9 @@ int main() {
   TestBoundedOutputLimit();
   TestRenderedPromptBoundFollowsContext();
   TestGgufTemplateExtraction();
+  TestTemplateDialectDetection();
   TestHuggingFaceRenderedGoldens();
+  TestQwen36RenderedGoldens();
   TestRenderAndTokenize();
   TestContentSpellingATokenIsNotParsedAsOne();
   TestToolReplayArgumentsAreContent();

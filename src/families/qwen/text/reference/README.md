@@ -34,3 +34,22 @@ including Unicode case-insensitive contractions, letter/mark runs and
 trailing-whitespace backtracking. Ten raw-text
 goldens check exact token IDs for spacing, code, accents, scripts with combining
 marks, Unicode number categories and special-token boundaries on both models.
+
+## Qwen3.6 dialect
+
+`qwen36_chat_template.jinja` is the official `Qwen/Qwen3.6-35B-A3B` template
+at revision `345d467b117d1fd5eda9b879a5988de9ae5f47a7` (SHA-256
+`1b8361565cc35d47551d342214cff341c0f1a9685ce529c7ce31de0ed3616248`; the
+repository copy adds a terminating LF). Unsloth's 35B template renders the same
+bytes for every golden. Artifacts that are neither Qwen3.8 nor carry a pinned
+Qwen3.8 template render this dialect, which differs from Qwen3.8 in two places:
+
+- It has no reasoning-effort instruction, so no effort adds a system turn.
+- An assistant message without `reasoning_content` may carry its thinking
+  inline: the text before the first `</think>` (after any `<think>`) is the
+  thought and the text after the last `</think>` is the answer.
+
+Its template makes `preserve_thinking` opt-in. Gufo keeps earlier thinking by
+default for both dialects: the model is trained to use it, and it keeps earlier
+turns byte-stable for the continuation cache. `--preserve-thinking off` or
+`chat_template_kwargs.preserve_thinking=false` restores the template default.

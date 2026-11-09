@@ -86,10 +86,11 @@ struct QwenImageContext final : TextPromptContext {
   std::shared_ptr<const models::qwen::vision::Prompt> prompt;
 };
 
-tokenization::ChatTemplateOptions QwenChatOptions(const ChatRequest& request,
-                                                  std::uint32_t max_context) {
-  auto options = tokenization::ResolveQwenChatOptions(request.reasoning,
-                                                      request.add_vision_id);
+tokenization::ChatTemplateOptions QwenChatOptions(
+    const ChatRequest& request, std::uint32_t max_context,
+    tokenization::QwenTemplateDialect dialect) {
+  auto options = tokenization::ResolveQwenChatOptions(
+      request.reasoning, request.add_vision_id, dialect);
   // gufo #285: the rendered prompt may be as long as the context can hold.
   options.max_output_bytes =
       tokenization::RenderedPromptBoundBytes(max_context);
@@ -99,15 +100,16 @@ tokenization::ChatTemplateOptions QwenChatOptions(const ChatRequest& request,
 // The text before tokenization. An image renders as its one placeholder, not
 // the visual tokens Prepare expands it into. Template errors are request
 // errors, as in Prepare.
-std::optional<std::string> RenderQwenPrompt(const ChatRequest& request,
-                                            std::uint32_t max_context) {
+std::optional<std::string> RenderQwenPrompt(
+    const ChatRequest& request, std::uint32_t max_context,
+    tokenization::QwenTemplateDialect dialect) {
   std::string error;
   auto rendered = tokenization::QwenChatTemplate::Render(
       request.messages,
       request.tool_choice == ChatRequest::ToolChoice::kNone
           ? std::span<const tokenization::ChatTool>{}
           : std::span<const tokenization::ChatTool>{request.tools},
-      QwenChatOptions(request, max_context), &error);
+      QwenChatOptions(request, max_context, dialect), &error);
   if (!rendered)
     throw std::invalid_argument(error);
   return rendered;
@@ -116,8 +118,9 @@ std::optional<std::string> RenderQwenPrompt(const ChatRequest& request,
 std::optional<std::size_t> CountQwenPromptTokens(
     const ChatRequest& request, const tokenization::QwenTokenizer& tokenizer,
     const std::shared_ptr<models::qwen::vision::Encoder>& encoder,
-    std::uint32_t max_context, models::qwen::vision::ImageCache& image_cache) {
-  const auto options = QwenChatOptions(request, max_context);
+    std::uint32_t max_context, tokenization::QwenTemplateDialect dialect,
+    models::qwen::vision::ImageCache& image_cache) {
+  const auto options = QwenChatOptions(request, max_context, dialect);
   const auto tools =
       request.tool_choice == ChatRequest::ToolChoice::kNone
           ? std::span<const tokenization::ChatTool>{}
@@ -141,10 +144,11 @@ std::optional<std::size_t> CountQwenPromptTokens(
 TextPreparedPrompt PrepareQwenPrompt(
     const ChatRequest& request, const tokenization::QwenTokenizer& tokenizer,
     const std::shared_ptr<models::qwen::vision::Encoder>& encoder,
-    std::uint32_t max_context, models::qwen::vision::ImageCache& image_cache) {
+    std::uint32_t max_context, tokenization::QwenTemplateDialect dialect,
+    models::qwen::vision::ImageCache& image_cache) {
   const bool has_images = std::ranges::any_of(
       request.messages, [](const auto& m) { return !m.images.empty(); });
-  const auto options = QwenChatOptions(request, max_context);
+  const auto options = QwenChatOptions(request, max_context, dialect);
   auto prompt = std::make_shared<models::qwen::vision::Prompt>(
       models::qwen::vision::Prepare(
           tokenizer, request.messages,
@@ -884,26 +888,26 @@ public:
         request.tool_choice == ChatRequest::ToolChoice::kNone
             ? std::span<const tokenization::ChatTool>{}
             : std::span<const tokenization::ChatTool>{request.tools},
-        QwenChatOptions(request, max_context_));
+        QwenChatOptions(request, max_context_, model_->GetChatDialect()));
   }
 
   [[nodiscard]] std::optional<TextPreparedPrompt> PreparePrompt(
       const ChatRequest& request) const override {
     return PrepareQwenPrompt(request, model_->GetTokenizer(),
                              model_->VisionEncoder(), max_context_,
-                             image_cache_);
+                             model_->GetChatDialect(), image_cache_);
   }
 
   [[nodiscard]] std::optional<std::size_t> CountPromptTokens(
       const ChatRequest& request) const override {
     return CountQwenPromptTokens(request, model_->GetTokenizer(),
                                  model_->VisionEncoder(), max_context_,
-                                 image_cache_);
+                                 model_->GetChatDialect(), image_cache_);
   }
 
   [[nodiscard]] std::optional<std::string> RenderPrompt(
       const ChatRequest& request) const override {
-    return RenderQwenPrompt(request, max_context_);
+    return RenderQwenPrompt(request, max_context_, model_->GetChatDialect());
   }
 
   void SetPromptContext(
@@ -915,7 +919,8 @@ public:
 
   [[nodiscard]] ext::InitialOutputState InitialOutputState(
       const ChatRequest& request) const override {
-    return QwenChatOptions(request, max_context_).enable_thinking
+    return QwenChatOptions(request, max_context_, model_->GetChatDialect())
+                   .enable_thinking
                ? ext::InitialOutputState::kReasoning
                : ext::InitialOutputState::kContent;
   }

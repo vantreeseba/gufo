@@ -30,9 +30,11 @@ std::size_t RenderedPromptBoundBytes(std::uint32_t context_tokens) noexcept {
 }
 
 ChatTemplateOptions ResolveQwenChatOptions(const ReasoningOptions& reasoning,
-                                           bool add_vision_id) {
+                                           bool add_vision_id,
+                                           QwenTemplateDialect dialect) {
   ChatTemplateOptions options;
   options.add_vision_id = add_vision_id;
+  options.dialect = dialect;
   options.enable_thinking = reasoning.enabled.value_or(options.enable_thinking);
   options.preserve_thinking =
       reasoning.preserve_thinking.value_or(options.preserve_thinking);
@@ -116,6 +118,34 @@ std::string_view Trim(std::string_view value) {
   return value.substr(first, last - first);
 }
 
+struct InlineThinking {
+  std::string_view thought;
+  std::string_view content;
+};
+
+// Qwen3.6 reads thinking a client left in an assistant's content. On the
+// trimmed content: the thought is the text before the first </think>, after
+// the last <think> within it; the answer is the text after the last </think>.
+std::optional<InlineThinking> SplitInlineThinking(std::string_view content) {
+  constexpr std::string_view kOpen = "<think>";
+  constexpr std::string_view kClose = "</think>";
+  const auto first_close = content.find(kClose);
+  if (first_close == std::string_view::npos)
+    return std::nullopt;
+  std::string_view thought = content.substr(0, first_close);
+  while (thought.ends_with('\n'))
+    thought.remove_suffix(1);
+  if (const auto open = thought.rfind(kOpen); open != std::string_view::npos)
+    thought.remove_prefix(open + kOpen.size());
+  while (thought.starts_with('\n'))
+    thought.remove_prefix(1);
+  std::string_view answer =
+      content.substr(content.rfind(kClose) + kClose.size());
+  while (answer.starts_with('\n'))
+    answer.remove_prefix(1);
+  return InlineThinking{Trim(thought), answer};
+}
+
 std::string PythonJsonSpacing(std::string_view value) {
   std::string output;
   output.reserve(value.size() + value.size() / 8);
@@ -144,7 +174,8 @@ std::string PythonJsonSpacing(std::string_view value) {
 
 void AppendReasoningInstruction(std::string& output,
                                 const ChatTemplateOptions& options) {
-  if (!options.enable_thinking) {
+  if (!options.enable_thinking ||
+      options.dialect != QwenTemplateDialect::kQwen38) {
     return;
   }
   switch (options.reasoning_effort) {
@@ -530,6 +561,15 @@ QwenToolCallScan ScanQwenToolCall(std::string_view text) {
   return result;
 }
 
+QwenTemplateDialect DetectQwenTemplateDialect(const core::GgufReader& reader) {
+  if (IsQwen38Artifact(reader))
+    return QwenTemplateDialect::kQwen38;
+  const auto template_str = reader.GetMetadataString("tokenizer.chat_template");
+  return template_str.has_value() && IsQwen38ReasoningTemplate(*template_str)
+             ? QwenTemplateDialect::kQwen38
+             : QwenTemplateDialect::kQwen36;
+}
+
 std::unique_ptr<QwenChatTemplate> QwenChatTemplate::CreateFromGguf(
     const core::GgufReader& reader, std::string* error_msg) {
   auto template_str = reader.GetMetadataString("tokenizer.chat_template");
@@ -796,7 +836,16 @@ std::optional<std::string> QwenChatTemplate::Render(
     output.append(role_name);
     output.push_back('\n');
 
-    const std::string_view thought = Trim(msg.thought);
+    std::string_view thought = Trim(msg.thought);
+    // Requests carry no "absent" state for reasoning_content, so an empty one
+    // also lets inline thinking through. Assistant messages carry no images.
+    std::optional<InlineThinking> inline_thinking;
+    if (options.dialect == QwenTemplateDialect::kQwen36 &&
+        msg.role == ChatRole::kAssistant && thought.empty() &&
+        msg.images.empty())
+      inline_thinking = SplitInlineThinking(Trim(msg.content));
+    if (inline_thinking)
+      thought = inline_thinking->thought;
     if (msg.role == ChatRole::kAssistant &&
         (options.preserve_thinking || message_index > last_user_index)) {
       output.append("<think>\n");
@@ -804,8 +853,14 @@ std::optional<std::string> QwenChatTemplate::Render(
       output.append("\n</think>\n\n");
     }
 
-    const bool has_content = AppendMessageContent(
-        output, msg, options, image_count, image_offsets, content_spans);
+    bool has_content = false;
+    if (inline_thinking) {
+      AppendContent(output, content_spans, inline_thinking->content);
+      has_content = !inline_thinking->content.empty();
+    } else {
+      has_content = AppendMessageContent(output, msg, options, image_count,
+                                         image_offsets, content_spans);
+    }
     if (msg.role == ChatRole::kAssistant && !msg.tool_calls.empty()) {
       if (has_content) {
         output.append("\n\n");

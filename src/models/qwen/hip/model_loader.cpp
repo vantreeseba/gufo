@@ -344,7 +344,10 @@ QwenGpuModel::QwenGpuModel(
       weights_(std::move(weights)),
       tokenizer_(std::move(tokenizer)),
       weight_regions_(std::move(weight_regions)),
-      vision_(std::move(vision)) {}
+      vision_(std::move(vision)) {
+  if (reader_)
+    chat_dialect_ = tokenization::DetectQwenTemplateDialect(*reader_);
+}
 
 QwenGpuModel::~QwenGpuModel() {
   ReleaseWeightRegions(weight_regions_);

@@ -104,12 +104,30 @@ enum class QwenReasoningEffort : std::uint8_t {
   kXHigh,
 };
 
+/// The official template family an artifact was trained with. Rendering
+/// follows Qwen3.8; Qwen3.6 (35B-A3B) differs in two places.
+enum class QwenTemplateDialect : std::uint8_t {
+  /// Reasoning-effort instructions open the system turn.
+  kQwen38,
+  /// No effort instructions. An assistant message without reasoning_content
+  /// may carry its thinking inline as `<think>...</think>` in its content.
+  kQwen36,
+};
+
+/// Qwen3.8 for Qwen3.8 artifacts or pinned Qwen3.8 templates, else Qwen3.6.
+[[nodiscard]] QwenTemplateDialect DetectQwenTemplateDialect(
+    const core::GgufReader& reader);
+
 /// Formatting options for rendering a conversation into a text prompt.
 struct ChatTemplateOptions {
   bool add_generation_prompt{true};
   bool enable_thinking{true};
   QwenReasoningEffort reasoning_effort{QwenReasoningEffort::kXHigh};
+  /// Both dialects keep earlier thinking by default. Qwen3.6's own template
+  /// makes it opt-in, but the model is trained to use it, and it keeps earlier
+  /// turns byte-stable for the continuation cache.
   bool preserve_thinking{true};
+  QwenTemplateDialect dialect{QwenTemplateDialect::kQwen38};
   bool add_vision_id{false};
   std::size_t max_output_bytes{1024ULL * 1024ULL};  ///< 1 MiB upper bound
 };
@@ -137,7 +155,8 @@ inline constexpr std::size_t kMaxRenderedBytesPerToken = 128;
 /// Resolve CLI/API controls against the official Qwen3.8 template defaults.
 /// Provider-neutral minimal/high/max map to native low/xhigh/xhigh.
 [[nodiscard]] ChatTemplateOptions ResolveQwenChatOptions(
-    const ReasoningOptions& reasoning, bool add_vision_id = false);
+    const ReasoningOptions& reasoning, bool add_vision_id = false,
+    QwenTemplateDialect dialect = QwenTemplateDialect::kQwen38);
 
 /// Deterministic, bounded Qwen ChatML formatter.
 class QwenChatTemplate {

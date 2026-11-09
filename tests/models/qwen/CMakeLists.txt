@@ -22,6 +22,7 @@ add_qwen_cpu_test(qwen_chat_template_test
   "cpu;tokenization;chat_template")
 target_compile_definitions(qwen_chat_template_test PRIVATE
   GUFO_QWEN38_CHAT_TEMPLATE_REFERENCE="${PROJECT_SOURCE_DIR}/src/families/qwen/text/reference/chat_template.jinja"
+  GUFO_QWEN36_CHAT_TEMPLATE_REFERENCE="${PROJECT_SOURCE_DIR}/src/families/qwen/text/reference/qwen36_chat_template.jinja"
   GUFO_CHAT_TEMPLATE_HF_GOLDENS="${PROJECT_SOURCE_DIR}/tests/fixtures/chat_template_hf_goldens.json")
 
 add_qwen_cpu_test(qwen_cpu_oracles_test
