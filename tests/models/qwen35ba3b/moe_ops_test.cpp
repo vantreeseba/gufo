@@ -681,6 +681,32 @@ std::vector<std::uint8_t> RandomExpertWeights(GgmlType type, std::size_t rows,
   return bytes;
 }
 
+float Fp16BitsToFloat(std::uint16_t h) {
+  const std::uint32_t sign = (h & 0x8000U) << 16;
+  std::uint32_t exponent = (h >> 10) & 0x1FU;
+  std::uint32_t mantissa = h & 0x3FFU;
+  std::uint32_t bits = 0;
+  if (exponent == 0x1FU) {
+    bits = sign | 0x7F800000U | (mantissa << 13);
+  } else if (exponent == 0) {
+    if (mantissa == 0) {
+      bits = sign;
+    } else {
+      exponent = 127 - 15 + 1;
+      while ((mantissa & 0x400U) == 0) {
+        mantissa <<= 1;
+        --exponent;
+      }
+      bits = sign | (exponent << 23) | ((mantissa & 0x3FFU) << 13);
+    }
+  } else {
+    bits = sign | ((exponent + 127 - 15) << 23) | (mantissa << 13);
+  }
+  float out;
+  std::memcpy(&out, &bits, sizeof(out));
+  return out;
+}
+
 /// Flash-Next's routed F16 expert GEMM on this model's quantized expert
 /// shapes, against the per-slot GEMV (FP32 activations, same weights). The
 /// difference is the F16 rounding of the activation rows (and, for the K
@@ -789,36 +815,69 @@ void CheckRoutedF16(hipStream_t stream) {
           Expect(non_finite == 0, "routed F16 GEMM left slots unwritten");
           Expect(rel < 1e-2, "routed F16 GEMM disagrees with the slot GEMV");
         }
+        // F16 rows over the narrow tiles and the paired layers' wide tiles:
+        // every row must be byte-identical across tile heights, and agree
+        // with the slot GEMV.
+        std::vector<std::uint16_t> narrow_half;
+        const auto ref = d_ref.CopyToHost();
+        for (const std::uint32_t tile_rows : {48U, 64U, 128U}) {
+          std::vector<std::int32_t> tiles;
+          for (std::uint32_t e = 0; e < kExperts; ++e) {
+            const std::uint32_t padded = (counts[e] + 15U) / 16U * 16U;
+            for (std::uint32_t j = 0; j * tile_rows < padded; ++j) {
+              tiles.push_back(static_cast<std::int32_t>(e | (j << 16)));
+            }
+          }
+          gufo::test::DeviceBuffer<std::int32_t> d_tiles(tiles);
+          gufo::test::DeviceBuffer<std::uint16_t> d_half(
+              std::vector<std::uint16_t>(ref.size(), 0x7E00U));  // F16 NaN
+          const auto* rows_in =
+              shape.per_slot_input ? d_rows_slot.data() : d_rows_token.data();
+          Expect(routed::RoutedF16Gemm(
+                     d_w.data(), weight_type,
+                     reinterpret_cast<const __half*>(d_x_half.data()),
+                     d_tiles.data(), static_cast<std::uint32_t>(tiles.size()),
+                     tile_rows, d_bounds.data(), rows_in, d_rows_slot.data(),
+                     nullptr, nullptr, reinterpret_cast<__half*>(d_half.data()),
+                     shape.m, shape.k, stream),
+                 "routed F16 GEMM rejected the F16 shape");
+          HIP_CHECK(hipStreamSynchronize(stream));
+          const auto got = d_half.CopyToHost();
+          double max_abs = 0.0;
+          double magnitude = 0.0;
+          std::size_t non_finite = 0;
+          for (std::size_t i = 0; i < ref.size(); ++i) {
+            const float value = Fp16BitsToFloat(got[i]);
+            if (!std::isfinite(value)) {
+              ++non_finite;
+              continue;
+            }
+            max_abs = std::max(max_abs, std::fabs(static_cast<double>(value) -
+                                                  static_cast<double>(ref[i])));
+            magnitude =
+                std::max(magnitude, std::fabs(static_cast<double>(ref[i])));
+          }
+          const double rel = magnitude > 0.0 ? max_abs / magnitude : max_abs;
+          std::size_t differ = 0;
+          if (tile_rows == 48U) {
+            narrow_half = got;
+          } else {
+            for (std::size_t i = 0; i < got.size(); ++i) {
+              differ += got[i] != narrow_half[i] ? 1 : 0;
+            }
+          }
+          std::cout << "routed F16 " << type_name << " " << shape.name
+                    << " tokens=" << tokens << " tile_rows=" << tile_rows
+                    << " (F16 out): rel=" << rel << " non_finite=" << non_finite
+                    << " differ=" << differ << "\n";
+          Expect(non_finite == 0, "routed F16 GEMM left F16 slots unwritten");
+          Expect(rel < 1e-2, "routed F16 rows disagree with the slot GEMV");
+          Expect(differ == 0, "routed F16 rows depend on the tile height");
+        }
       }
     }
   }
   std::cout << "routed F16 experts: OK\n";
-}
-
-float Fp16BitsToFloat(std::uint16_t h) {
-  const std::uint32_t sign = (h & 0x8000U) << 16;
-  std::uint32_t exponent = (h >> 10) & 0x1FU;
-  std::uint32_t mantissa = h & 0x3FFU;
-  std::uint32_t bits = 0;
-  if (exponent == 0x1FU) {
-    bits = sign | 0x7F800000U | (mantissa << 13);
-  } else if (exponent == 0) {
-    if (mantissa == 0) {
-      bits = sign;
-    } else {
-      exponent = 127 - 15 + 1;
-      while ((mantissa & 0x400U) == 0) {
-        mantissa <<= 1;
-        --exponent;
-      }
-      bits = sign | (exponent << 23) | ((mantissa & 0x3FFU) << 13);
-    }
-  } else {
-    bits = sign | ((exponent + 127 - 15) << 23) | (mantissa << 13);
-  }
-  float out;
-  std::memcpy(&out, &bits, sizeof(out));
-  return out;
 }
 
 /// Paired routed gate/up (SwiGLU in the epilogue, F16 out) against
