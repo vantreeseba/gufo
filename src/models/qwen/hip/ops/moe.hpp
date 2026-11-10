@@ -20,6 +20,27 @@ void LaunchMoeRouterTopK(const float* logits, std::uint32_t logits_stride,
                          std::uint32_t n_tokens, std::uint32_t n_experts,
                          std::uint32_t n_used, hipStream_t stream = nullptr);
 
+/// Whether LaunchMoeRouterGateTopK covers these router weights and shape:
+/// both GEMVs must take LaunchGEMV's 256-thread FastGEMVBlockKernel route.
+[[nodiscard]] bool IsMoeRouterGateTopKSupported(core::GgmlType router_type,
+                                                core::GgmlType shared_type,
+                                                std::uint32_t n_experts,
+                                                std::size_t k,
+                                                std::uint32_t n_used) noexcept;
+
+/// One-token router in one launch: the router GEMV (n_experts x k), the
+/// shared-expert gate GEMV (1 x k) and LaunchMoeRouterTopK, each with its
+/// own kernel's arithmetic. `done` is a zeroed device counter, private to
+/// the stream, that the kernel leaves at zero.
+void LaunchMoeRouterGateTopK(const void* router, core::GgmlType router_type,
+                             const void* shared_gate_inp,
+                             core::GgmlType shared_type, const float* x,
+                             float* logits, float* shared_gate,
+                             std::int32_t* ids, float* weights,
+                             std::uint32_t n_experts, std::size_t k,
+                             std::uint32_t n_used, std::uint32_t* done,
+                             hipStream_t stream = nullptr);
+
 /// MoE combine: out[t] = sum_s(weights[t,s] * expert_out[(t*k+s), :]) +
 /// sigmoid(shared_gate[t]) * shared_out[t]. All buffers fp32.
 void LaunchMoeEpilogue(const float* expert_out, const float* weights,
@@ -36,8 +57,20 @@ constexpr bool IsMmqMoeVecType(core::GgmlType type, std::size_t k) {
           k % 256 == 0);
 }
 
+/// Whether the MMQ routed vector kernel (qfn_mmq_moe_vec, ungated) decodes
+/// the down projection's `type` with whole weight blocks over `k` inputs. It
+/// covers more formats than the gated kernel: Q4_K_M keeps Q6_K down
+/// projections on half its layers.
+constexpr bool IsMmqMoeDownVecType(core::GgmlType type, std::size_t k) {
+  return ((type == core::GgmlType::kQ8_0 || type == core::GgmlType::kQ5_1) &&
+          k % 32 == 0) ||
+         ((type == core::GgmlType::kQ4_K || type == core::GgmlType::kQ5_K ||
+           type == core::GgmlType::kQ6_K) &&
+          k % 256 == 0);
+}
+
 /// Routed per-slot GEMV fallback for formats the MMQ MoE kernels do not cover
-/// (BF16/F32/Q6_K and friends, decoded via DecodeQuantSub16). For each slot s
+/// (BF16/F32 and friends, decoded via DecodeQuantSub16). For each slot s
 /// the expert index is ids[s]; out[s, :] = W_e * x_row. With x_per_slot the
 /// input row is s itself (down projection reading per-slot activations);
 /// otherwise it is s / x_token_divisor (gate/up sharing the token's row).

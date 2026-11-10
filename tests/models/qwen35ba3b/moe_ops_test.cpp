@@ -1016,8 +1016,13 @@ void CheckMmqKQuants(hipStream_t stream) {
     Expect(non_finite == 0, "MMQ expert kernel left rows unwritten");
     Expect(rel < 3e-2, "MMQ expert kernel disagrees with the slot GEMV");
   };
-  for (const GgmlType type : {GgmlType::kQ4_K, GgmlType::kQ5_K}) {
-    const char* type_name = type == GgmlType::kQ4_K ? "Q4_K" : "Q5_K";
+  // Q6_K only reaches the down projection: the gated kernel does not take it.
+  for (const GgmlType type :
+       {GgmlType::kQ4_K, GgmlType::kQ5_K, GgmlType::kQ6_K}) {
+    const char* type_name = type == GgmlType::kQ4_K   ? "Q4_K"
+                            : type == GgmlType::kQ5_K ? "Q5_K"
+                                                      : "Q6_K";
+    const bool gated = type != GgmlType::kQ6_K;
     gufo::test::DeviceBuffer<std::uint8_t> d_gate(
         RandomExpertWeights(type, kExperts * kFf, kHidden));
     gufo::test::DeviceBuffer<std::uint8_t> d_up(
@@ -1054,16 +1059,18 @@ void CheckMmqKQuants(hipStream_t stream) {
       gufo::hip::LaunchMoeSlotSwigluGemv(
           d_gate.data(), type, d_up.data(), type, d_x.data(), d_ids.data(),
           d_act_ref.data(), kFf, kHidden, slots, kUsed, stream);
-      Expect(
-          qfn_mmq_moe_gated_vec(
-              static_cast<int>(type), d_gate.data(), d_up.data(), d_x.data(),
-              d_ids.data(), d_act.data(), static_cast<int>(kFf),
-              static_cast<int>(kHidden), static_cast<int>(tokens),
-              static_cast<int>(kExperts), static_cast<int>(kUsed), stream) == 0,
-          "qfn_mmq_moe_gated_vec rejected the K-quant shape");
-      HIP_CHECK(hipStreamSynchronize(stream));
-      compare(d_act_ref.CopyToHost(), d_act.CopyToHost(), "gate/up", type_name,
-              tokens);
+      if (gated) {
+        Expect(qfn_mmq_moe_gated_vec(
+                   static_cast<int>(type), d_gate.data(), d_up.data(),
+                   d_x.data(), d_ids.data(), d_act.data(),
+                   static_cast<int>(kFf), static_cast<int>(kHidden),
+                   static_cast<int>(tokens), static_cast<int>(kExperts),
+                   static_cast<int>(kUsed), stream) == 0,
+               "qfn_mmq_moe_gated_vec rejected the K-quant shape");
+        HIP_CHECK(hipStreamSynchronize(stream));
+        compare(d_act_ref.CopyToHost(), d_act.CopyToHost(), "gate/up",
+                type_name, tokens);
+      }
 
       // Both down routes read the same reference activation rows.
       gufo::hip::LaunchMoeSlotGemv(d_down.data(), type, d_act_ref.data(),
@@ -1275,10 +1282,11 @@ void CheckDecodeBatchInvariance(hipStream_t stream) {
   constexpr std::uint32_t kUsed = 8;
   constexpr std::size_t kFf = 512;
   constexpr std::size_t kHidden = 2048;
-  constexpr std::size_t kGatedVecMaxRows = 8;
-  constexpr int kQ8_0 = static_cast<int>(GgmlType::kQ8_0);
   for (const RoutedFormat& routed_case : kRoutedFormats) {
     const GgmlType type = routed_case.type;
+    const int ggml_type = static_cast<int>(type);
+    // The same row limits LaunchMoeFfn slices the gated kernel by.
+    const std::size_t gated_max_rows = type == GgmlType::kQ4_K ? 64 : 8;
     gufo::test::DeviceBuffer<std::uint8_t> d_gate(
         RandomExpertWeights(type, kExperts * kFf, kHidden));
     gufo::test::DeviceBuffer<std::uint8_t> d_up(
@@ -1287,11 +1295,11 @@ void CheckDecodeBatchInvariance(hipStream_t stream) {
         RandomExpertWeights(type, kExperts * kHidden, kFf));
     const auto gate_up = [&](const float* x, const std::int32_t* ids,
                              float* act, std::size_t rows) {
-      if (type == GgmlType::kQ8_0) {
-        for (std::size_t row = 0; row < rows; row += kGatedVecMaxRows) {
-          const std::size_t n = std::min(kGatedVecMaxRows, rows - row);
+      if (gufo::hip::IsMmqMoeVecType(type, kHidden)) {
+        for (std::size_t row = 0; row < rows; row += gated_max_rows) {
+          const std::size_t n = std::min(gated_max_rows, rows - row);
           Expect(qfn_mmq_moe_gated_vec(
-                     kQ8_0, d_gate.data(), d_up.data(), x + row * kHidden,
+                     ggml_type, d_gate.data(), d_up.data(), x + row * kHidden,
                      ids + row * kUsed, act + row * kUsed * kFf,
                      static_cast<int>(kFf), static_cast<int>(kHidden),
                      static_cast<int>(n), static_cast<int>(kExperts),
@@ -1307,9 +1315,9 @@ void CheckDecodeBatchInvariance(hipStream_t stream) {
     const auto down = [&](const float* act, const std::int32_t* ids, float* out,
                           std::size_t rows) {
       const auto slots = static_cast<std::uint32_t>(rows * kUsed);
-      if (type == GgmlType::kQ8_0) {
+      if (gufo::hip::IsMmqMoeDownVecType(type, kFf)) {
         Expect(
-            qfn_mmq_moe_vec(kQ8_0, d_down.data(), act, ids, out,
+            qfn_mmq_moe_vec(ggml_type, d_down.data(), act, ids, out,
                             static_cast<int>(kHidden), static_cast<int>(kFf),
                             static_cast<int>(slots), static_cast<int>(kExperts),
                             1, stream, nullptr, nullptr) == 0,
