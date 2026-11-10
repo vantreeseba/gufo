@@ -36,8 +36,20 @@ constexpr bool IsMmqMoeVecType(core::GgmlType type, std::size_t k) {
           k % 256 == 0);
 }
 
+/// Whether the MMQ routed vector kernel (qfn_mmq_moe_vec, ungated) decodes
+/// the down projection's `type` with whole weight blocks over `k` inputs. It
+/// covers more formats than the gated kernel: Q4_K_M keeps Q6_K down
+/// projections on half its layers.
+constexpr bool IsMmqMoeDownVecType(core::GgmlType type, std::size_t k) {
+  return ((type == core::GgmlType::kQ8_0 || type == core::GgmlType::kQ5_1) &&
+          k % 32 == 0) ||
+         ((type == core::GgmlType::kQ4_K || type == core::GgmlType::kQ5_K ||
+           type == core::GgmlType::kQ6_K) &&
+          k % 256 == 0);
+}
+
 /// Routed per-slot GEMV fallback for formats the MMQ MoE kernels do not cover
-/// (BF16/F32/Q6_K and friends, decoded via DecodeQuantSub16). For each slot s
+/// (BF16/F32 and friends, decoded via DecodeQuantSub16). For each slot s
 /// the expert index is ids[s]; out[s, :] = W_e * x_row. With x_per_slot the
 /// input row is s itself (down projection reading per-slot activations);
 /// otherwise it is s / x_token_divisor (gate/up sharing the token's row).

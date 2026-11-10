@@ -62,7 +62,7 @@ void ExecuteMoeDecodeStep(hipStream_t stream, const QwenMoeScratch& moe,
                             moe.ids.data(), moe.gate_e.data(), expert_ff,
                             hidden, n_used, n_used, stream);
   }
-  if (IsMmqMoeVecType(view.down_exps.type, expert_ff)) {
+  if (IsMmqMoeDownVecType(view.down_exps.type, expert_ff)) {
     // Each (token, slot) pair carries its own activation row, so the down
     // projection runs as U independent rows with one expert id each.
     if (qfn_mmq_moe_vec(static_cast<int>(view.down_exps.type),
