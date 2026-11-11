@@ -57,6 +57,8 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(self.models(private), {'deepseek4'})
         self.assertEqual(self.models(private, 'src/core/sampling.cpp'), {'deepseek4', 'flash-next-q4'})
         self.assertEqual(self.models('src/models/qwen/hip/attention.hip'), {'qwen27-q4'})
+        self.assertEqual(self.models('src/models/qwen/hip/kernels/moe_routed.hip'), {'qwen36-35b-q4'})
+        self.assertEqual(self.models('tests/models/qwen35ba3b/target_test.cpp'), {'qwen36-35b-q4'})
         self.assertEqual(self.models('src/models/qwen38_flash_next/engine.cpp'), {'flash-next-q4'})
 
     def test_global_changes_cover_one_representative_per_category(self):
@@ -120,10 +122,13 @@ class PlanTest(unittest.TestCase):
 
     def test_generic_llm_commands_keep_drafts_and_capabilities(self):
         assets = {key: '/weights/' + key for key in self.data['assets']}
+        paths = {'qwen27-q4': 'src/models/qwen/engine.cpp',
+                 'qwen36-35b-q4': 'src/models/qwen/modules/moe.cpp',
+                 'deepseek4': 'src/models/deepseek_v4_flash/model.cpp'}
         for key, draft, preset in [('qwen27-q4', '--dflash-model', 'qwen38'),
+                                    ('qwen36-35b-q4', '--mtp-model', 'qwen38'),
                                     ('deepseek4', '--dspark-model', 'deepseek4')]:
-            plan = self.plan('src/models/qwen/engine.cpp' if key.startswith('qwen') else
-                             'src/models/deepseek_v4_flash/model.cpp')
+            plan = self.plan(paths[key])
             args = cluster.command(plan['groups'][0], Path('/gufo'), None, Path('/out'), 'pr', assets)
             self.assertIn(draft, args)
             self.assertEqual(args[args.index('--sampling-preset')+1], preset)

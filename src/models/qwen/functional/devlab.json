@@ -21,6 +21,18 @@
       "required": [
         "Qwen3.8-27B-DFlash2-Q4_K_M.gguf"
       ]
+    },
+    "qwen36-35b": {
+      "repo": "unsloth/Qwen3.6-35B-A3B-MTP-GGUF",
+      "revision": "5bc3e238d916f48a861bac2f8a1990a0e9b7e98d",
+      "patterns": [
+        "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+        "mmproj-BF16.gguf"
+      ],
+      "required": [
+        "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+        "mmproj-BF16.gguf"
+      ]
     }
   },
   "models": {
@@ -34,6 +46,18 @@
       "draft": "Qwen3.8-27B-DFlash2-Q4_K_M.gguf",
       "draft_option": "--dflash-model",
       "mode": "dflash2",
+      "sampling": "qwen38"
+    },
+    "qwen36-35b-q4": {
+      "title": "Qwen3.6 35B-A3B Q4",
+      "category": "llm",
+      "asset": "qwen36-35b",
+      "target": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+      "projector": "mmproj-BF16.gguf",
+      "draft_asset": "qwen36-35b",
+      "draft": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+      "draft_option": "--mtp-model",
+      "mode": "mtp",
       "sampling": "qwen38"
     }
   },
@@ -50,6 +74,21 @@
       ],
       "owners": [
         "qwen27-q4"
+      ]
+    },
+    {
+      "id": "private-qwen36-35b",
+      "priority": 30,
+      "paths": [
+        "src/models/qwen/hip/kernels/moe.hip",
+        "src/models/qwen/hip/kernels/moe_routed.hip",
+        "src/models/qwen/hip/ops/moe.hpp",
+        "src/models/qwen/hip/ops/moe_routed.hpp",
+        "src/models/qwen/modules/moe.*",
+        "tests/models/qwen35ba3b/**"
+      ],
+      "owners": [
+        "qwen36-35b-q4"
       ]
     }
   ]

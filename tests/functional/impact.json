@@ -57,6 +57,16 @@
       "model": "deepseek4",
       "mode": "dspark",
       "vision": false
+    },
+    "qwen36-35b-q4/mtp": {
+      "model": "qwen36-35b-q4",
+      "mode": "mtp",
+      "vision": true
+    },
+    "qwen36-35b-q4/off": {
+      "model": "qwen36-35b-q4",
+      "mode": "off",
+      "vision": true
     }
   },
   "suites": {
@@ -245,7 +255,9 @@
         "qwen27-q8/off",
         "qwen27-q8/dflash2",
         "flash-next-q4/off",
-        "flash-next-q4/mtp"
+        "flash-next-q4/mtp",
+        "qwen36-35b-q4/off",
+        "qwen36-35b-q4/mtp"
       ],
       "configuration": "standard",
       "vision_required": true
@@ -273,7 +285,9 @@
         "qwen27-q8/off",
         "qwen27-q8/dflash2",
         "flash-next-q4/off",
-        "flash-next-q4/mtp"
+        "flash-next-q4/mtp",
+        "qwen36-35b-q4/off",
+        "qwen36-35b-q4/mtp"
       ],
       "configuration": "standard",
       "vision_required": true,
@@ -302,7 +316,9 @@
         "qwen27-q8/off",
         "qwen27-q8/dflash2",
         "flash-next-q4/off",
-        "flash-next-q4/mtp"
+        "flash-next-q4/mtp",
+        "qwen36-35b-q4/off",
+        "qwen36-35b-q4/mtp"
       ],
       "configuration": "standard",
       "vision_required": true,
@@ -328,7 +344,9 @@
         "qwen27-q8/off",
         "qwen27-q8/dflash2",
         "flash-next-q4/off",
-        "flash-next-q4/mtp"
+        "flash-next-q4/mtp",
+        "qwen36-35b-q4/off",
+        "qwen36-35b-q4/mtp"
       ],
       "configuration": "standard",
       "vision_required": true,
@@ -1603,6 +1621,29 @@
       "affects": [],
       "obligations": [
         "Run the changed model family's numerical, functional and speed checks; text suites do not qualify it."
+      ],
+      "ignored": false
+    },
+    {
+      "id": "qwen36-35b-moe",
+      "paths": [
+        "src/models/qwen/hip/kernels/moe.hip",
+        "src/models/qwen/hip/kernels/moe_routed.hip",
+        "src/models/qwen/hip/ops/moe.hpp",
+        "src/models/qwen/hip/ops/moe_routed.hpp",
+        "src/models/qwen/modules/moe.*",
+        "tests/models/qwen35ba3b/**"
+      ],
+      "priority": 20,
+      "profiles": [
+        "qwen36-35b-q4/off",
+        "qwen36-35b-q4/mtp"
+      ],
+      "affects": [
+        "*"
+      ],
+      "obligations": [
+        "35B-A3B routed-expert prefill and decode, with images through the shared encoder."
       ],
       "ignored": false
     }

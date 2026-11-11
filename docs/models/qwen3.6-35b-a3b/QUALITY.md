@@ -133,6 +133,33 @@ The reference's own BF16 run is 6-7.5% from FP32 on this projector, so the
 of three images; it is left unchanged. Served answers about the 2560x1440 image
 match in content before and after.
 
+### Functional image suites
+
+The `qwen36-35b-q4/off` and `qwen36-35b-q4/mtp` profiles run the HTTP image
+suites from [tests/functional](../../../tests/functional/README.md) on
+UD-Q4_K_XL with `mmproj-BF16.gguf`, 32K context and two sessions. Run on
+November 11, 2026 at `3c03cce1` (openai SDK 2.53.0):
+
+| Suite | AR | MTP |
+| --- | --- | --- |
+| `discovery` (`text,image`) | pass | pass |
+| `messages-image-counts` | pass | pass |
+| `image-inputs` | pass | pass |
+| `image-count`, including cancel and disk cancel | pass | pass |
+| `image-detail` | pass | pass |
+| `tool-images` | fail | fail |
+
+Both `tool-images` failures are the same case, `tool_images_two_calls`: two
+function results, each holding one image, with the request "give their
+dominant colors in that order, separated by a comma and no spaces" and a
+32-token cap. The 35B describes each image before giving the answer, so it runs
+out of tokens. With a 256-token cap it names both colors correctly in both
+orders and ends with exactly `red,blue` (or `blue,red` with the images
+swapped). Image order and grouped tool-result rendering are therefore correct;
+the model does not follow the answer format. Every earlier `tool-images` case
+passed; the invalid-input cases after it did not run. The case is left
+unchanged.
+
 ## Reproduce
 
 Build the `gpu-test` preset and run the binaries inside the ROCm container:

@@ -41,6 +41,13 @@ class ImpactTest(unittest.TestCase):
         self.assertNotIn("deepseek4/off", profiles)
         self.assertTrue(result["obligations"])
 
+    def test_private_35b_moe_selects_its_vision_profiles(self):
+        result = impact.plan(self.manifest, ["src/models/qwen/hip/kernels/moe_routed.hip"])
+        self.assertEqual(result["paths"][0]["rules"], ["qwen36-35b-moe"])
+        self.assertEqual({row["profile"] for row in result["selected"]},
+                         {"qwen36-35b-q4/off", "qwen36-35b-q4/mtp"})
+        self.assertIn("image-inputs", {row["suite"] for row in result["selected"]})
+
     def test_multiple_changes_preserve_independent_reasons(self):
         result = impact.plan(self.manifest, ["src/models/qwen38_flash_next/engine.cpp",
                                              "src/models/deepseek_v4_flash/model.cpp"])
